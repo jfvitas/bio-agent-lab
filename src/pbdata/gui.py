@@ -115,8 +115,13 @@ class PbdataGUI:
             "protein_protein": tk.BooleanVar(value=True),
             "mutation_ddg":    tk.BooleanVar(value=False),
         }
+        self._keyword_query_var    = tk.StringVar(value="")
         self._require_protein_var = tk.BooleanVar(value=True)
+        self._require_ligand_var  = tk.BooleanVar(value=False)
+        self._min_protein_entities_var = tk.StringVar(value="")
+        self._max_atom_count_var       = tk.StringVar(value="")
         self._min_year_var        = tk.StringVar(value="")
+        self._max_year_var        = tk.StringVar(value="")
 
         # Pipeline status vars
         all_stages = ["ingest"] + _SUBPROCESS_STAGES
@@ -183,10 +188,44 @@ class PbdataGUI:
                sticky="ew", pady=(8, 0))
 
     def _build_criteria_panel(self, parent: tk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Search Criteria", padding=12)
-        frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        outer = ttk.LabelFrame(parent, text="Search Criteria", padding=8)
+        outer.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        frame = ttk.Frame(canvas, padding=4)
+
+        frame.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(window_id, width=event.width),
+        )
+        window_id = canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
         frame.columnconfigure(1, weight=1)
         row = 0
+
+        ttk.Label(frame, text="Keywords / text search:").grid(
+            row=row, column=0, sticky="w"
+        )
+        ttk.Entry(frame, textvariable=self._keyword_query_var).grid(
+            row=row, column=1, sticky="ew", padx=(6, 0)
+        )
+        row += 1
+
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6
+        )
+        row += 1
 
         # --- Experimental methods ---
         ttk.Label(frame, text="Methods:", font=("Helvetica", 9, "bold")).grid(
@@ -256,10 +295,39 @@ class PbdataGUI:
         ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
+        ttk.Checkbutton(
+            frame, text="Require ligand / non-polymer", variable=self._require_ligand_var
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+
+        ttk.Label(frame, text="Min protein entities:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(frame, textvariable=self._min_protein_entities_var, width=8).grid(
+            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+        row += 1
+
+        ttk.Label(frame, text="Max deposited atoms:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(frame, textvariable=self._max_atom_count_var, width=12).grid(
+            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+        row += 1
+
         ttk.Label(frame, text="Min release year:").grid(
             row=row, column=0, sticky="w", pady=(6, 0)
         )
         ttk.Entry(frame, textvariable=self._min_year_var, width=8).grid(
+            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+        row += 1
+
+        ttk.Label(frame, text="Max release year:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(frame, textvariable=self._max_year_var, width=8).grid(
             row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
         )
         row += 1
@@ -379,25 +447,46 @@ class PbdataGUI:
 
     def _load_criteria_into_ui(self) -> None:
         sc = load_criteria(_CRITERIA_PATH)
+        self._keyword_query_var.set(sc.keyword_query or "")
         for key, var in self._method_vars.items():
             var.set(key in sc.experimental_methods)
         self._resolution_var.set(resolution_value_to_label(sc.max_resolution_angstrom))
         for key, var in self._task_vars.items():
             var.set(key in sc.task_types)
         self._require_protein_var.set(sc.require_protein)
+        self._require_ligand_var.set(sc.require_ligand)
+        self._min_protein_entities_var.set(
+            "" if sc.min_protein_entities is None else str(sc.min_protein_entities)
+        )
+        self._max_atom_count_var.set(
+            "" if sc.max_deposited_atom_count is None else str(sc.max_deposited_atom_count)
+        )
         self._min_year_var.set("" if sc.min_release_year is None else str(sc.min_release_year))
+        self._max_year_var.set("" if sc.max_release_year is None else str(sc.max_release_year))
 
     def _criteria_from_ui(self) -> SearchCriteria:
         methods = [k for k, v in self._method_vars.items() if v.get()]
         task_types = [k for k, v in self._task_vars.items() if v.get()]
+        keyword_query = self._keyword_query_var.get().strip() or None
+        min_protein_str = self._min_protein_entities_var.get().strip()
+        max_atom_str = self._max_atom_count_var.get().strip()
         min_year_str = self._min_year_var.get().strip()
+        max_year_str = self._max_year_var.get().strip()
+        min_protein_entities: int | None = int(min_protein_str) if min_protein_str.isdigit() else None
+        max_deposited_atom_count: int | None = int(max_atom_str) if max_atom_str.isdigit() else None
         min_year: int | None = int(min_year_str) if min_year_str.isdigit() else None
+        max_year: int | None = int(max_year_str) if max_year_str.isdigit() else None
         return SearchCriteria(
+            keyword_query=keyword_query,
             experimental_methods=methods,
             max_resolution_angstrom=resolution_label_to_value(self._resolution_var.get()),
             task_types=task_types,
             require_protein=self._require_protein_var.get(),
+            require_ligand=self._require_ligand_var.get(),
+            min_protein_entities=min_protein_entities,
+            max_deposited_atom_count=max_deposited_atom_count,
             min_release_year=min_year,
+            max_release_year=max_year,
         )
 
     def _save_criteria(self) -> None:

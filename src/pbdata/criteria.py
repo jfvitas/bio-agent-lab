@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Constants exposed to the GUI
@@ -48,6 +48,7 @@ def resolution_value_to_label(value: float | None) -> str:
 class SearchCriteria(BaseModel):
     """Criteria for filtering RCSB entries during ingestion."""
 
+    keyword_query: str | None = None
     experimental_methods: list[str] = Field(
         default_factory=lambda: ["xray", "em"],
         description="Active method keys: xray | em | nmr | neutron",
@@ -58,7 +59,28 @@ class SearchCriteria(BaseModel):
         description="protein_ligand | protein_protein | mutation_ddg",
     )
     require_protein: bool = True
+    require_ligand: bool = False
+    min_protein_entities: int | None = None
+    max_deposited_atom_count: int | None = None
     min_release_year: int | None = None
+    max_release_year: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "SearchCriteria":
+        if self.min_protein_entities is not None and self.min_protein_entities < 0:
+            raise ValueError("min_protein_entities must be >= 0")
+        if (
+            self.max_deposited_atom_count is not None
+            and self.max_deposited_atom_count <= 0
+        ):
+            raise ValueError("max_deposited_atom_count must be > 0")
+        if (
+            self.min_release_year is not None
+            and self.max_release_year is not None
+            and self.min_release_year > self.max_release_year
+        ):
+            raise ValueError("min_release_year cannot be greater than max_release_year")
+        return self
 
     def rcsb_method_labels(self) -> list[str]:
         """Return RCSB API method strings for the active method keys."""

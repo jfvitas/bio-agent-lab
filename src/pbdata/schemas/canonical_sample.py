@@ -51,6 +51,36 @@ class CanonicalBindingSample(BaseModel):
     wildtype_or_mutant: Literal["wildtype", "mutant"] | None = None
     curation_level: str | None = None
 
+    # ------------------------------------------------------------------
+    # Extended structural fields (populated by rcsb_classify)
+    # ------------------------------------------------------------------
+
+    # All bound entities: list of BoundObject.model_dump() dicts.
+    # Covers nonpolymer entities (ligands, metals, cofactors, glycans,
+    # additives) and short peptide polymer entities.  The legacy
+    # ligand_id / ligand_smiles fields still hold the primary ligand
+    # for backward compatibility.
+    bound_objects: list[dict[str, Any]] | None = None
+
+    # Pairwise polymer–polymer interfaces: list of InterfaceInfo.model_dump().
+    interfaces: list[dict[str, Any]] | None = None
+
+    # Biological-assembly metadata: AssemblyInfo.model_dump().
+    assembly_info: dict[str, Any] | None = None
+
+    # Oligomeric state inferred from entity count / chain multiplicity.
+    # Examples: "monomer", "homodimer", "heterodimer", "homo_4mer",
+    #           "hetero_complex_3_entities"
+    oligomeric_state: str | None = None
+
+    # True if all polymer chains belong to the same protein entity.
+    # False if multiple distinct protein entities are present.
+    # None if could not be determined.
+    is_homo_oligomeric: bool | None = None
+
+    # Number of distinct polymer entity types in this entry.
+    polymer_entity_count: int | None = None
+
     provenance: dict[str, Any]
     quality_flags: list[str]
     quality_score: float

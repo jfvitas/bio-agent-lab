@@ -1,6 +1,7 @@
 import json
 import logging
 import statistics
+from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
 from typing import Annotated, Optional
@@ -19,8 +20,18 @@ _PROCESSED_DIR       = Path("data/processed/rcsb")
 _AUDIT_DIR           = Path("data/audit")
 _REPORTS_DIR         = Path("data/reports")
 _SPLITS_DIR          = Path("data/splits")
+_CATALOG_PATH        = Path("data/catalog/download_manifest.csv")
 
 logger = logging.getLogger(__name__)
+
+
+def _count_delimited_rows(path: Path, delimiter: str = ",") -> int | None:
+    try:
+        with path.open(encoding="utf-8", newline="") as f:
+            lines = [line for line in f.read().splitlines() if line.strip()]
+        return max(len(lines) - 1, 0)
+    except OSError:
+        return None
 
 
 @app.callback()
@@ -138,13 +149,29 @@ def _ingest_rcsb(
 def _ingest_skempi(*, dry_run: bool, yes: bool, output: Optional[Path]) -> None:
     import requests
 
+    from pbdata.catalog import summarize_bulk_file, update_download_manifest
     from pbdata.sources.skempi import _SKEMPI_URL
 
     out_dir = output if output is not None else Path("data/raw/skempi")
     csv_path = out_dir / "skempi_v2.csv"
+    downloaded_at = datetime.now(timezone.utc).isoformat()
 
     if csv_path.exists():
         typer.echo(f"SKEMPI CSV already present at {csv_path}.  Skipping download.")
+        row_count = _count_delimited_rows(csv_path, delimiter=";")
+        update_download_manifest([
+            summarize_bulk_file(
+                source_database="SKEMPI",
+                source_record_id="SKEMPI_V2",
+                raw_file_path=csv_path,
+                raw_format="csv",
+                downloaded_at=downloaded_at,
+                title="SKEMPI v2 mutation ddG dataset",
+                task_hint="mutation_ddg",
+                notes=f"rows={row_count}" if row_count is not None else "",
+                status="cached",
+            )
+        ], _CATALOG_PATH)
         return
 
     typer.echo(f"SKEMPI v2 will be downloaded from {_SKEMPI_URL}")
@@ -162,7 +189,21 @@ def _ingest_skempi(*, dry_run: bool, yes: bool, output: Optional[Path]) -> None:
     resp = requests.get(_SKEMPI_URL, timeout=60)
     resp.raise_for_status()
     csv_path.write_text(resp.text, encoding="utf-8")
+    row_count = _count_delimited_rows(csv_path, delimiter=";")
+    update_download_manifest([
+        summarize_bulk_file(
+            source_database="SKEMPI",
+            source_record_id="SKEMPI_V2",
+            raw_file_path=csv_path,
+            raw_format="csv",
+            downloaded_at=downloaded_at,
+            title="SKEMPI v2 mutation ddG dataset",
+            task_hint="mutation_ddg",
+            notes=f"rows={row_count}" if row_count is not None else "",
+        )
+    ], _CATALOG_PATH)
     typer.echo(f"SKEMPI CSV saved to {csv_path}")
+    typer.echo(f"Download manifest updated at {_CATALOG_PATH}")
     typer.echo("Run 'normalize --source skempi' to convert to canonical records.")
 
 

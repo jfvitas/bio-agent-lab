@@ -111,6 +111,23 @@ def test_cli_ingest_dry_run_reports_count() -> None:
     assert "1,234" in result.output
 
 
+def test_rcsb_search_count_uses_v2_endpoint() -> None:
+    from unittest.mock import Mock, patch
+
+    from pbdata.criteria import SearchCriteria
+    from pbdata.sources import rcsb_search
+
+    response = Mock()
+    response.json.return_value = {"total_count": 7}
+    response.raise_for_status.return_value = None
+
+    with patch("pbdata.sources.rcsb_search.requests.post", return_value=response) as post:
+        count = rcsb_search.count_entries(SearchCriteria())
+
+    assert count == 7
+    assert post.call_args.args[0] == "https://search.rcsb.org/rcsbsearch/v2/query"
+
+
 def test_cli_missing_config_fails_clearly() -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["--config", "missing.yaml", "ingest"])

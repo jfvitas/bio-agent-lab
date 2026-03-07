@@ -36,6 +36,9 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-p no:tmpdir"
+markers = [
+  "integration: tests that make real network calls (deselect with -m 'not integration')",
+]
 
 [tool.ruff]
 line-length = 100

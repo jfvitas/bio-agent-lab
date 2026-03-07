@@ -1,0 +1,184 @@
+stress_test_panel:
+  version: 1
+  description: >-
+    Compact adversarial structural panel for parser and normalizer refinement.
+    These cases are intended to test difficult biological assemblies, multiple
+    bound objects, metals, glycans, covalent binders, peptide binders,
+    membrane-protein context, and ambiguity handling.
+
+  cases:
+    - pdb_id: 2HHB
+      label: human_deoxyhemoglobin
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: true
+        symmetric_or_repeat_subunits: true
+        polymer_partner_count_min: 4
+        multiple_bound_objects: true
+        heme_like_cofactor_present: true
+        metal_present: true
+        peptide_partner: false
+        glycan_present: false
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Must not flatten the tetramer into a single binary interaction.
+          - Must distinguish protein chains from heme cofactors.
+          - Should preserve repeated cofactor-bearing subunits without double-counting interfaces.
+
+    - pdb_id: 1ATP
+      label: pka_mnatp_inhibitor_peptide_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: false
+        multiple_bound_objects: true
+        peptide_partner: true
+        small_molecule_ligand_present: true
+        metal_present: true
+        metal_expected_min_count: 2
+        cofactor_or_nucleotide_present: true
+        glycan_present: false
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: false
+        notes:
+          - Must distinguish catalytic protein, inhibitor peptide, ATP-like nucleotide, and Mn ions.
+          - Should not collapse peptide + nucleotide + metal into a single ligand concept.
+
+    - pdb_id: 8E1I
+      label: asp1_kinase_atp_metal_inositol_polyphosphate_complex
+      expected_outcomes:
+        oligomer_type: monomeric_or_single_polymer_context
+        multiple_bound_objects: true
+        small_molecule_ligand_present: true
+        metal_present: true
+        cofactor_or_nucleotide_present: true
+        polyphosphate_or_second_ligand_present: true
+        peptide_partner: false
+        glycan_present: false
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: false
+        notes:
+          - Must retain ATP/nucleotide, divalent cation(s), and inositol polyphosphate as distinct bound objects.
+          - Good test that multiple chemically relevant objects can coexist.
+
+    - pdb_id: 4XT1
+      label: us28_gpcr_chemokine_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: false
+        peptide_partner: false
+        protein_partner_present: true
+        membrane_protein_context: true
+        multiple_bound_objects: possible
+        glycan_present: possible
+        metal_present: false
+        covalent_binder: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Must treat the chemokine as a protein partner, not a small molecule.
+          - Must preserve membrane-protein context and avoid soluble-enzyme assumptions.
+
+    - pdb_id: 2XPG
+      label: mhc_class_i_peptide_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: false
+        peptide_partner: true
+        protein_partner_present: true
+        small_molecule_ligand_present: false
+        metal_present: false
+        glycan_present: possible
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Must classify the bound nonamer as peptide, not ordinary small molecule.
+          - Should distinguish the MHC heavy chain / beta-2-microglobulin context from the peptide binder.
+
+    - pdb_id: 4P57
+      label: tcr_mhc_peptide_beryllium_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: true
+        peptide_partner: true
+        protein_partner_present: true
+        multiple_bound_objects: true
+        metal_present: true
+        metal_mediated_binding_possible: true
+        alkali_counterion_possible: true
+        glycan_present: possible
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Must represent a multicomponent immune complex rather than a simple binary pair.
+          - Must flag metal-mediated interaction possibility because Be2+ contributes to the recognized ligand environment.
+
+    - pdb_id: 6EAQ
+      label: glycosylated_fcgr3b_igg1_fc_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: true
+        protein_partner_present: true
+        glycan_present: true
+        multiple_bound_objects: true
+        peptide_partner: false
+        metal_present: false
+        covalent_binder: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Glycans must be detected and preserved distinctly from protein chains.
+          - Good test that carbohydrate involvement is not discarded.
+
+    - pdb_id: 7DTZ
+      label: fgfr4_covalent_inhibitor_complex
+      expected_outcomes:
+        oligomer_type: monomeric_or_single_polymer_context
+        multiple_bound_objects: possible
+        small_molecule_ligand_present: true
+        covalent_binder: true
+        metal_present: false
+        peptide_partner: false
+        glycan_present: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: false
+        notes:
+          - Must trigger covalent-binder logic.
+          - Must remain distinguishable from ordinary noncovalent inhibitor complexes.
+
+    - pdb_id: 1PW8
+      label: r61_dd_peptidase_covalent_acyl_enzyme_complex
+      expected_outcomes:
+        oligomer_type: monomeric_or_single_polymer_context
+        small_molecule_ligand_present: true
+        covalent_binder: true
+        peptide_partner: false
+        metal_present: false
+        glycan_present: false
+        membrane_protein_context: false
+        assembly_or_symmetry_handling_important: false
+        notes:
+          - Must classify as a covalent acyl-enzyme complex.
+          - Useful to ensure acyl-enzyme states are not treated as ordinary reversible noncovalent binders.
+
+    - pdb_id: 6DO1
+      label: at1r_partial_agonist_nanobody_complex
+      expected_outcomes:
+        oligomer_type: heteromeric
+        multimeric_complex: false
+        peptide_partner: true
+        protein_partner_present: true
+        membrane_protein_context: true
+        multiple_bound_objects: true
+        nanobody_or_auxiliary_protein_present: true
+        metal_present: false
+        glycan_present: possible
+        covalent_binder: false
+        assembly_or_symmetry_handling_important: true
+        notes:
+          - Must preserve that the receptor is membrane-associated.
+          - Must distinguish peptide-like agonist from auxiliary stabilizing protein partner.
