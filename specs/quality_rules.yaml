@@ -1,0 +1,16 @@
+hard_exclusions:
+  - missing_structure_file
+  - ambiguous_chain_assignment
+  - no_interpretable_assay_value
+  - impossible_affinity_value
+  - unresolved_partner_for_ppi
+  - unparseable_mutation_notation
+
+soft_penalties:
+  - low_resolution
+  - missing_interface_residues
+  - alternate_conformers_at_interface
+  - ic50_without_context
+  - missing_metal_annotation
+  - covalent_noncovalent_task_mismatch
+  - heavy_homolog_redundancy

@@ -1,0 +1,11 @@
+sources:
+  rcsb:
+    enabled: true
+  bindingdb:
+    enabled: false
+  pdbbind:
+    enabled: false
+  biolip:
+    enabled: false
+  skempi:
+    enabled: false

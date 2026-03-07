@@ -1,0 +1,142 @@
+canonical_binding_sample:
+  description: Unified record for protein binding ML datasets
+  fields:
+    sample_id:
+      type: str
+      required: true
+      description: Globally unique internal sample identifier
+
+    task_type:
+      type: str
+      required: true
+      allowed:
+        - protein_ligand
+        - protein_protein
+        - mutation_ddg
+
+    source_database:
+      type: str
+      required: true
+
+    source_record_id:
+      type: str
+      required: true
+
+    pdb_id:
+      type: str
+      required: false
+
+    assembly_id:
+      type: str
+      required: false
+
+    chain_ids_receptor:
+      type: list[str]
+      required: false
+
+    chain_ids_partner:
+      type: list[str]
+      required: false
+
+    uniprot_ids:
+      type: list[str]
+      required: false
+
+    sequence_receptor:
+      type: str
+      required: false
+
+    sequence_partner:
+      type: str
+      required: false
+
+    taxonomy_ids:
+      type: list[int]
+      required: false
+
+    ligand_id:
+      type: str
+      required: false
+
+    ligand_smiles:
+      type: str
+      required: false
+
+    ligand_inchi_key:
+      type: str
+      required: false
+
+    experimental_method:
+      type: str
+      required: false
+
+    structure_resolution:
+      type: float
+      required: false
+
+    assay_type:
+      type: str
+      required: false
+
+    assay_value:
+      type: float
+      required: false
+
+    assay_unit:
+      type: str
+      required: false
+
+    assay_value_standardized:
+      type: float
+      required: false
+
+    assay_value_log10:
+      type: float
+      required: false
+
+    temperature_c:
+      type: float
+      required: false
+
+    ph:
+      type: float
+      required: false
+
+    buffer:
+      type: str
+      required: false
+
+    ionic_strength:
+      type: float
+      required: false
+
+    cofactors:
+      type: list[str]
+      required: false
+
+    mutation_string:
+      type: str
+      required: false
+
+    wildtype_or_mutant:
+      type: str
+      required: false
+      allowed:
+        - wildtype
+        - mutant
+
+    curation_level:
+      type: str
+      required: false
+
+    provenance:
+      type: dict
+      required: true
+
+    quality_flags:
+      type: list[str]
+      required: true
+
+    quality_score:
+      type: float
+      required: true

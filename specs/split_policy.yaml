@@ -1,0 +1,8 @@
+split_strategies:
+  - random
+  - sequence_cluster
+  - time_split
+  - source_split
+  - scaffold_split
+  - family_split
+  - mutation_split

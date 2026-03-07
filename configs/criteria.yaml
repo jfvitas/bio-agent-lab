@@ -1,0 +1,9 @@
+experimental_methods:
+  - xray
+  - em
+max_resolution_angstrom: 3.0
+task_types:
+  - protein_ligand
+  - protein_protein
+require_protein: true
+min_release_year: null

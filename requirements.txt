@@ -1,4 +1,6 @@
-pytest
-pandas
-requests
 gemmi
+pydantic>=2.7
+pyyaml>=6.0.1
+rich>=13.7
+typer>=0.12
+pytest>=8.2
