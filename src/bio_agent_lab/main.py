@@ -3,8 +3,9 @@ import gemmi
 
 def classify_structure(cif_path: str) -> dict:
     """
-    Very simple starter classifier for mmCIF files.
-    Returns a rough classification based on polymer / non-polymer presence.
+    Classify an mmCIF structure into one of:
+      multi_polymer_complex, protein_ligand, polymer_only, unknown.
+    Returns a dict with all intermediate flags for caller inspection.
     """
     path = Path(cif_path)
     if not path.exists():
@@ -13,27 +14,59 @@ def classify_structure(cif_path: str) -> dict:
     doc = gemmi.cif.read_file(str(path))
     block = doc.sole_block()
 
-    entity_types = []
+    poly_subtypes = {}
+    if block.find_mmcif_category("_entity_poly."):
+        poly_ids = block.find_values("_entity_poly.entity_id")
+        poly_type_vals = block.find_values("_entity_poly.type")
+        for eid, ptype in zip(poly_ids, poly_type_vals):
+            poly_subtypes[gemmi.cif.as_string(eid)] = gemmi.cif.as_string(ptype)
+
+    entities = []
     if block.find_mmcif_category("_entity."):
         ids = block.find_values("_entity.id")
         types = block.find_values("_entity.type")
-        entity_types = list(zip(ids, types))
+        for eid, etype in zip(ids, types):
+            eid = gemmi.cif.as_string(eid)
+            entities.append({
+                "id": eid,
+                "entity_type": gemmi.cif.as_string(etype),
+                "poly_subtype": poly_subtypes.get(eid),
+            })
 
-    has_polymer = any(t == "polymer" for _, t in entity_types)
-    has_nonpolymer = any(t == "non-polymer" for _, t in entity_types)
-
-    if has_polymer and has_nonpolymer:
-        kind = "protein_or_nucleic_acid_plus_ligand_or_other_nonpolymer"
-    elif has_polymer:
+    polymer_entities = [e for e in entities if e["entity_type"] == "polymer"]
+    ligand_entities  = [e for e in entities if e["entity_type"] == "non-polymer"]
+    n_polymer_entities = len(polymer_entities)
+    distinct_poly_subtypes = {e["poly_subtype"] for e in polymer_entities if e["poly_subtype"]}
+    has_protein = any(
+        e["poly_subtype"] in {"polypeptide(L)", "polypeptide(D)"}
+        for e in polymer_entities
+    )
+    has_nucleic_acid = any(
+        e["poly_subtype"] in {
+            "polyribonucleotide",
+            "polydeoxyribonucleotide",
+            "polydeoxyribonucleotide/polyribonucleotide hybrid",
+        }
+        for e in polymer_entities
+    )
+    if n_polymer_entities > 1:
+        kind = "multi_polymer_complex"
+    elif has_protein and ligand_entities:
+        kind = "protein_ligand"
+    elif n_polymer_entities >= 1 and not ligand_entities:
         kind = "polymer_only"
-    elif has_nonpolymer:
-        kind = "nonpolymer_only"
     else:
         kind = "unknown"
 
     return {
         "file": str(path),
-        "entity_types": entity_types,
+        "entities": entities,
+        "polymer_entities": polymer_entities,
+        "n_polymer_entities": n_polymer_entities,
+        "distinct_poly_subtypes": sorted(distinct_poly_subtypes),
+        "has_protein": has_protein,
+        "has_nucleic_acid": has_nucleic_acid,
+        "ligand_entities": ligand_entities,
         "classification": kind,
     }
 
