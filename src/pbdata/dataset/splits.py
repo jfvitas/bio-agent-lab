@@ -53,6 +53,17 @@ class SplitResult:
         return {"train": len(self.train), "val": len(self.val), "test": len(self.test)}
 
 
+def _validate_split_fractions(train_frac: float, val_frac: float) -> None:
+    if not 0.0 <= train_frac <= 1.0:
+        raise ValueError(f"train_frac must be in [0.0, 1.0], got {train_frac}")
+    if not 0.0 <= val_frac <= 1.0:
+        raise ValueError(f"val_frac must be in [0.0, 1.0], got {val_frac}")
+    if train_frac + val_frac > 1.0:
+        raise ValueError(
+            f"train_frac + val_frac must be <= 1.0, got {train_frac + val_frac}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Hash-based fallback
 # ---------------------------------------------------------------------------
@@ -65,6 +76,7 @@ def assign_split(
     seed:       int   = 42,
 ) -> str:
     """Deterministic hash-based split assignment for a single sample_id."""
+    _validate_split_fractions(train_frac, val_frac)
     digest = hashlib.md5(f"{seed}:{sample_id}".encode()).hexdigest()
     val = int(digest[:8], 16) / 0xFFFF_FFFF
     if val < train_frac:
@@ -82,6 +94,7 @@ def build_splits(
     seed:       int   = 42,
 ) -> SplitResult:
     """Pure hash-based split — fast but not sequence-identity-aware."""
+    _validate_split_fractions(train_frac, val_frac)
     result = SplitResult()
     for sid in sample_ids:
         split = assign_split(sid, train_frac=train_frac, val_frac=val_frac, seed=seed)
@@ -193,6 +206,7 @@ def cluster_aware_split(
         max_candidates: Candidate cap per record (limits runtime).
         log_fn:         Progress callback.
     """
+    _validate_split_fractions(train_frac, val_frac)
     log_fn(
         f"Clustering {len(sample_ids):,} sequences "
         f"(k={k}, threshold={threshold})..."
@@ -211,7 +225,11 @@ def cluster_aware_split(
 
     sorted_clusters = sorted(
         cluster_to_ids.values(),
-        key=lambda ids: (-len(ids), ids[0]),
+        key=lambda ids: (
+            -len(ids),
+            hashlib.md5(f"{seed}:{ids[0]}".encode()).hexdigest(),
+            ids[0],
+        ),
     )
 
     total = len(sample_ids)

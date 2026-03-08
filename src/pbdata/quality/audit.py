@@ -42,6 +42,7 @@ _METALLO_COFACTOR_COMP_IDS: frozenset[str] = frozenset({
     "CLA", "BCL",                                  # chlorophyll (Mg)
     "B12", "CBL",                                  # cobalamin (Co)
 })
+_ALKALI_COUNTERION_COMP_IDS: frozenset[str] = frozenset({"LI", "NA", "K", "RB", "CS"})
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +125,18 @@ def compute_flags(record: CanonicalBindingSample) -> list[str]:
 
     # Metal: free metal ions OR metallocofactors
     free_metals = [b for b in bound_objects if b.get("binder_type") == "metal_ion"]
+    non_alkali_free_metals = [
+        b for b in free_metals if (b.get("comp_id") or "").upper() not in _ALKALI_COUNTERION_COMP_IDS
+    ]
     metallo_cofactors = [
         b for b in bound_objects
         if b.get("binder_type") == "cofactor"
         and (b.get("comp_id") or "") in _METALLO_COFACTOR_COMP_IDS
     ]
-    if free_metals or metallo_cofactors:
+    if non_alkali_free_metals or metallo_cofactors:
         flags.append("metal_present")
 
-    if free_metals and non_artifact:
+    if non_alkali_free_metals and non_artifact:
         # A free metal co-exists with other bound objects → possible bridging
         flags.append("metal_mediated_binding_possible")
 

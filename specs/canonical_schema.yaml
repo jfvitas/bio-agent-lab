@@ -129,6 +129,30 @@ canonical_binding_sample:
       type: str
       required: false
 
+    bound_objects:
+      type: list[dict]
+      required: false
+
+    interfaces:
+      type: list[dict]
+      required: false
+
+    assembly_info:
+      type: dict
+      required: false
+
+    oligomeric_state:
+      type: str
+      required: false
+
+    is_homo_oligomeric:
+      type: bool
+      required: false
+
+    polymer_entity_count:
+      type: int
+      required: false
+
     provenance:
       type: dict
       required: true

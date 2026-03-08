@@ -4,6 +4,10 @@ import logging
 from pathlib import Path
 from uuid import uuid4
 
+import json
+from pathlib import Path
+from uuid import uuid4
+
 import pytest
 from typer.testing import CliRunner
 
@@ -89,6 +93,10 @@ def test_setup_logging_invalid_yaml_raises() -> None:
 # Base adapter contract
 # ---------------------------------------------------------------------------
 
+_LOCAL_TMP = Path(__file__).parent / "_tmp"
+_LOCAL_TMP.mkdir(exist_ok=True)
+
+
 def test_base_adapter_cannot_be_instantiated() -> None:
     from pbdata.sources.base import BaseAdapter
     with pytest.raises(TypeError):
@@ -99,6 +107,40 @@ def test_rcsb_adapter_has_correct_source_name() -> None:
     from pbdata.sources.rcsb import RCSBAdapter
     adapter = RCSBAdapter()
     assert adapter.source_name == "RCSB"
+
+
+def test_rcsb_adapter_falls_back_to_cached_json_when_live_fetch_fails() -> None:
+    from pbdata.sources.rcsb import RCSBAdapter
+    from unittest.mock import patch
+
+    pdb_id = "1ABC"
+    cache_dir = _LOCAL_TMP / f"{uuid4().hex}_rcsb_raw"
+    cache_dir.mkdir(parents=True)
+    payload = {"rcsb_id": pdb_id, "polymer_entities": [], "nonpolymer_entities": []}
+    (cache_dir / f"{pdb_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    adapter = RCSBAdapter()
+    with patch("pbdata.sources.rcsb._DEFAULT_RAW_DIR", cache_dir), patch(
+        "pbdata.sources.rcsb_search.fetch_entries_batch",
+        side_effect=RuntimeError("blocked"),
+    ), patch("pbdata.sources.rcsb.fetch_mmcif_supplement", return_value=None):
+        raw = adapter.fetch_metadata(pdb_id)
+
+    assert raw["rcsb_id"] == pdb_id
+
+
+def test_rcsb_adapter_raises_clear_error_when_live_and_cache_fail() -> None:
+    from pbdata.sources.rcsb import RCSBAdapter
+    from unittest.mock import patch
+
+    adapter = RCSBAdapter()
+    missing_cache_dir = _LOCAL_TMP / f"{uuid4().hex}_missing_rcsb_raw"
+    with patch("pbdata.sources.rcsb._DEFAULT_RAW_DIR", missing_cache_dir), patch(
+        "pbdata.sources.rcsb_search.fetch_entries_batch",
+        side_effect=RuntimeError("blocked"),
+    ):
+        with pytest.raises(RuntimeError, match="no cached JSON was found"):
+            adapter.fetch_metadata("1ABC")
 
 
 def test_cli_ingest_dry_run_reports_count() -> None:

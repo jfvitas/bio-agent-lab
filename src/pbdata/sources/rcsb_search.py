@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ _TIMEOUT = 60
 _BATCH_SIZE = 100
 _CC_BATCH_SIZE = 200
 _PAGE_SIZE = 10_000
+
+logger = logging.getLogger(__name__)
 
 _ENTRY_GQL = """
 query BatchEntries($ids: [String!]!) {
@@ -54,6 +57,9 @@ query BatchEntries($ids: [String!]!) {
     }
     polymer_entities {
       rcsb_id
+      rcsb_polymer_entity {
+        pdbx_description
+      }
       entity_poly {
         pdbx_seq_one_letter_code_can
         type
@@ -364,10 +370,12 @@ def search_and_download(
         if to_fetch:
             try:
                 entries = fetch_entries_batch(to_fetch)
+                received_ids: set[str] = set()
                 for entry in entries:
                     pid = str(entry.get("rcsb_id") or "")
                     if not pid:
                         continue
+                    received_ids.add(pid)
                     raw_path = output_dir / f"{pid}.json"
                     raw_path.write_text(json.dumps(entry, indent=2), encoding="utf-8")
                     downloaded.append(pid)
@@ -378,6 +386,14 @@ def search_and_download(
                             downloaded_at=datetime.now(timezone.utc).isoformat(),
                             status="downloaded",
                         )
+                    )
+                missing_ids = [pid for pid in to_fetch if pid not in received_ids]
+                if missing_ids:
+                    failed.extend(missing_ids)
+                    log_fn(
+                        f"  WARN batch starting at {batch_start} returned "
+                        f"{len(entries)} entries for {len(to_fetch)} requested; "
+                        f"missing IDs: {missing_ids[:20]}"
                     )
             except Exception as exc:
                 log_fn(f"  WARN batch starting at {batch_start}: {exc}")
@@ -432,7 +448,12 @@ def fetch_chemcomp_descriptors(comp_ids: list[str]) -> dict[str, dict[str, str]]
                         descriptors[str(dtype)] = str(dval)
                 if cid:
                     result[cid] = descriptors
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Chem-comp descriptor fetch failed for batch starting at %s (%s IDs): %s",
+                batch_start,
+                len(batch),
+                exc,
+            )
 
     return result

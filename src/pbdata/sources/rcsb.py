@@ -12,10 +12,13 @@ entity-level logic separated from the adapter plumbing.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
+from pbdata.parsing.mmcif_supplement import fetch_mmcif_supplement
 from pbdata.sources.base import BaseAdapter
 from pbdata.sources.rcsb_classify import (
     _polymer_chain_ids,
@@ -24,6 +27,7 @@ from pbdata.sources.rcsb_classify import (
 )
 
 _ADAPTER_VERSION = "0.2.0"
+_DEFAULT_RAW_DIR = Path("data/raw/rcsb")
 
 # Re-export for backward compat (callers may import _EXCLUDED_COMPS from here)
 from pbdata.sources.rcsb_classify import _EXCLUDED_COMPS  # noqa: F401
@@ -85,6 +89,16 @@ def _resolution(entry_info: dict[str, Any]) -> float | None:
         return None
 
 
+def _polymer_partner_count_from_classified(classified: dict[str, Any]) -> int:
+    """Count polymer partners by chain instances, not just entity count."""
+    total = 0
+    for group_name in ("protein_entities", "peptide_entities", "other_poly"):
+        for ent in classified.get(group_name, []):
+            chains = _polymer_chain_ids(ent) or []
+            total += len(chains) if chains else 1
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -99,10 +113,42 @@ class RCSBAdapter(BaseAdapter):
     def fetch_metadata(self, record_id: str) -> dict[str, Any]:
         """Fetch entry metadata for a single PDB ID."""
         from pbdata.sources.rcsb_search import fetch_entries_batch
-        results = fetch_entries_batch([record_id.upper()])
-        if not results:
-            raise ValueError(f"No RCSB entry found for {record_id!r}")
-        return results[0]
+        pdb_id = record_id.upper()
+        try:
+            results = fetch_entries_batch([pdb_id])
+        except Exception as exc:
+            cached = self._load_cached_metadata(pdb_id)
+            if cached is None:
+                raise RuntimeError(
+                    f"RCSB live fetch failed for {pdb_id} and no cached JSON was found in {_DEFAULT_RAW_DIR}"
+                ) from exc
+            raw = cached
+        else:
+            if not results:
+                raise ValueError(f"No RCSB entry found for {record_id!r}")
+            raw = results[0]
+            self._write_cached_metadata(pdb_id, raw)
+        try:
+            supplement = fetch_mmcif_supplement(pdb_id)
+        except Exception:
+            supplement = None
+        if supplement:
+            raw["mmcif_supplement"] = supplement
+        return raw
+
+    def _cache_path(self, pdb_id: str) -> Path:
+        return _DEFAULT_RAW_DIR / f"{pdb_id}.json"
+
+    def _load_cached_metadata(self, pdb_id: str) -> dict[str, Any] | None:
+        path = self._cache_path(pdb_id)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _write_cached_metadata(self, pdb_id: str, raw: dict[str, Any]) -> None:
+        path = self._cache_path(pdb_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
 
     def normalize_record(
         self,
@@ -214,7 +260,7 @@ class RCSBAdapter(BaseAdapter):
             assembly_info=assembly_info.model_dump()               if assembly_info else None,
             oligomeric_state=oligo_state,
             is_homo_oligomeric=is_homo,
-            polymer_entity_count=len(protein_entities) + len(peptide_entities),
+            polymer_entity_count=_polymer_partner_count_from_classified(classified),
             provenance=provenance,
             quality_flags=[],
             quality_score=0.0,

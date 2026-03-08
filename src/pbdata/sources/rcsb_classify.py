@@ -184,6 +184,20 @@ _MEMBRANE_KEYWORDS: tuple[str, ...] = (
     "lipid bilayer",
     "detergent",
     "micelle",
+    # Photosynthetic membrane complexes (thylakoid-embedded)
+    "photosystem",
+    "thylakoid",
+    "photosynthesis",
+    "light harvesting",
+    # DHHC-family palmitoyltransferases and lipid-modifying enzymes
+    "dhhc",
+    "palmitoyl",
+    "palmitoyltransferase",
+    # Other common membrane-embedded enzyme families
+    "cytochrome bc1",
+    "cytochrome c oxidase",
+    "nadh dehydrogenase",
+    "atp synthase",
 )
 
 # ---------------------------------------------------------------------------
@@ -202,6 +216,19 @@ _WARHEAD_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"C=C[^(].*C=O"),   # enone (Knoevenagel-type)
     re.compile(r"\[N\+\].*\[O-\]"), # N-oxide (some boronic acids use this)
 ]
+
+_COVALENT_TITLE_KEYWORDS: tuple[str, ...] = (
+    "covalent inhibitor",
+    "covalent complex",
+    "acyl-enzyme",
+    "acyl enzyme",
+    "covalent adduct",
+    "irreversible inhibitor",
+    "irreversibly inhibited",  # e.g. "irreversibly inhibited by 2-bromopalmitate"
+    "irreversibly inactivated",
+    "covalently bound",
+    "covalently modified",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -226,12 +253,103 @@ def _polymer_chain_ids(entity: dict[str, Any]) -> list[str] | None:
     return list(ids) if ids else None
 
 
+def _entity_suffix(entity: dict[str, Any]) -> str | None:
+    entity_id = entity.get("entity_id")
+    if entity_id:
+        return str(entity_id)
+    rcsb_id = str(entity.get("rcsb_id") or "")
+    if "_" in rcsb_id:
+        return rcsb_id.rsplit("_", 1)[-1]
+    return None
+
+
 def _nonpolymer_chain_ids(entity: dict[str, Any]) -> list[str] | None:
     ids = (
         (entity.get("rcsb_nonpolymer_entity_container_identifiers") or {})
         .get("auth_asym_ids")
     )
     return list(ids) if ids else None
+
+
+def _apply_mmcif_supplement(
+    raw_entry: dict[str, Any],
+    poly_entities: list[dict[str, Any]],
+    nonpoly_entities: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Augment GraphQL entities with coordinate-derived mmCIF supplement data."""
+    supplement = raw_entry.get("mmcif_supplement") or {}
+    if not supplement:
+        return poly_entities, nonpoly_entities
+
+    polymer_by_id: dict[str, dict[str, Any]] = {
+        eid: entity for entity in poly_entities if (eid := _entity_suffix(entity))
+    }
+    merged_poly = list(poly_entities)
+    for extra in supplement.get("polymer_entities") or []:
+        entity_id = str(extra.get("entity_id") or "")
+        if not entity_id:
+            continue
+        chains = list(extra.get("chain_ids") or [])
+        seq = extra.get("sequence")
+        if entity_id in polymer_by_id:
+            entity = polymer_by_id[entity_id]
+            poly = entity.setdefault("entity_poly", {})
+            if seq and not poly.get("pdbx_seq_one_letter_code_can"):
+                poly["pdbx_seq_one_letter_code_can"] = seq
+            if extra.get("poly_type") and not poly.get("type"):
+                poly["type"] = extra["poly_type"]
+            ids = entity.setdefault("rcsb_polymer_entity_container_identifiers", {})
+            if chains and not ids.get("auth_asym_ids"):
+                ids["auth_asym_ids"] = chains
+            continue
+        merged_poly.append({
+            "rcsb_id": f"{raw_entry.get('rcsb_id', 'SUPP')}_{entity_id}",
+            "entity_id": entity_id,
+            "entity_poly": {
+                "type": extra.get("poly_type") or "other",
+                "pdbx_seq_one_letter_code_can": seq,
+            },
+            "rcsb_polymer_entity_container_identifiers": {"auth_asym_ids": chains},
+        })
+
+    # Represent branched carbohydrate entities as glycan-like polymers so they survive normalization.
+    for extra in supplement.get("branched_entities") or []:
+        entity_id = str(extra.get("entity_id") or "")
+        if not entity_id or entity_id in polymer_by_id:
+            continue
+        merged_poly.append({
+            "rcsb_id": f"{raw_entry.get('rcsb_id', 'SUPP')}_{entity_id}",
+            "entity_id": entity_id,
+            "entity_poly": {
+                "type": "polysaccharide(D)",
+                "pdbx_seq_one_letter_code_can": None,
+            },
+            "rcsb_polymer_entity_container_identifiers": {
+                "auth_asym_ids": list(extra.get("chain_ids") or []),
+            },
+        })
+
+    supplement_instances = supplement.get("nonpolymer_instances") or []
+    if not supplement_instances:
+        return merged_poly, nonpoly_entities
+
+    expanded_nonpoly: list[dict[str, Any]] = []
+    for inst in supplement_instances:
+        comp_id = str(inst.get("comp_id") or "")
+        if not comp_id:
+            continue
+        chain_id = str(inst.get("chain_id") or "")
+        residue_id = str(inst.get("residue_id") or "")
+        entity_id = str(inst.get("entity_id") or "")
+        expanded_nonpoly.append({
+            "rcsb_id": "_".join(
+                part for part in (raw_entry.get("rcsb_id"), entity_id, comp_id, chain_id, residue_id) if part
+            ),
+            "entity_id": entity_id,
+            "nonpolymer_comp": {"chem_comp": {"id": comp_id, "name": comp_id}},
+            "rcsb_nonpolymer_entity_container_identifiers": {"auth_asym_ids": [chain_id] if chain_id else []},
+        })
+    return merged_poly, expanded_nonpoly or nonpoly_entities
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +458,7 @@ def infer_oligomeric_state(
 def build_bound_objects(
     nonpoly_entities: list[dict[str, Any]],
     poly_entities: list[dict[str, Any]],
+    other_poly_entities: list[dict[str, Any]] | None = None,
     chem_descriptors: dict[str, dict[str, str]] | None = None,
 ) -> list[BoundObject]:
     """Build a typed BoundObject for every bound entity in the structure.
@@ -347,11 +466,13 @@ def build_bound_objects(
     Includes:
     - All nonpolymer entities (metals, cofactors, ligands, additives, glycan sugars)
     - Short polypeptide polymer entities (peptide partners)
+    - Polymer glycans / nucleic-acid partners as typed bound objects
 
     Full-length protein entities are NOT included; they appear in
     InterfaceInfo instead.
     """
     objects: list[BoundObject] = []
+    other_poly_entities = other_poly_entities or []
 
     # --- Nonpolymer entities ---
     for ent in nonpoly_entities:
@@ -403,6 +524,29 @@ def build_bound_objects(
                 f"Polypeptide with {rcount} residues "
                 f"(threshold ≤ {PEPTIDE_MAX_RESIDUES})"
             ),
+        ))
+
+    # --- Other polymer binders (glycans / nucleic acids) ---
+    for ent in other_poly_entities:
+        kind = classify_polymer_entity(ent)
+        if kind not in {"glycan", "nucleic_acid"}:
+            continue
+        seq = _sequence(ent)
+        chain_ids = _polymer_chain_ids(ent)
+        residue_count = len(seq) if seq else None
+        role = "co_ligand" if kind == "glycan" else "unknown"
+        rationale = (
+            "Polymer glycan preserved as a distinct bound object"
+            if kind == "glycan"
+            else "Nucleic-acid polymer preserved as a distinct bound object"
+        )
+        objects.append(BoundObject(
+            entity_id=ent.get("rcsb_id") or None,
+            chain_ids=chain_ids,
+            binder_type=kind,
+            role=role,
+            residue_count=residue_count,
+            classification_rationale=rationale,
         ))
 
     return objects
@@ -584,6 +728,40 @@ def detect_membrane_context(raw_entry: dict[str, Any]) -> bool:
     return False
 
 
+def _apply_covalent_context_heuristic(
+    raw_entry: dict[str, Any],
+    bound_objects: list[BoundObject],
+) -> list[BoundObject]:
+    """Promote a likely bound object to covalent when entry metadata is explicit.
+
+    This is intentionally conservative: it only triggers when the entry title
+    contains clear covalent-context language and no object is already marked
+    covalent from a warhead/descriptor signal.
+    """
+    if any(obj.is_covalent is True for obj in bound_objects):
+        return bound_objects
+
+    title = ((raw_entry.get("struct") or {}).get("title") or "").lower()
+    if not any(keyword in title for keyword in _COVALENT_TITLE_KEYWORDS):
+        return bound_objects
+
+    updated: list[BoundObject] = []
+    promoted = False
+    for obj in bound_objects:
+        if not promoted and obj.binder_type in {"small_molecule", "cofactor"}:
+            rationale = obj.classification_rationale
+            if rationale:
+                rationale += "; "
+            rationale += "entry title indicates explicit covalent context"
+            obj = obj.model_copy(update={
+                "is_covalent": True,
+                "classification_rationale": rationale,
+            })
+            promoted = True
+        updated.append(obj)
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # Top-level per-entry classify function
 # ---------------------------------------------------------------------------
@@ -609,6 +787,11 @@ def classify_entry(
     """
     poly_entities:    list[dict[str, Any]] = raw_entry.get("polymer_entities") or []
     nonpoly_entities: list[dict[str, Any]] = raw_entry.get("nonpolymer_entities") or []
+    poly_entities, nonpoly_entities = _apply_mmcif_supplement(
+        raw_entry,
+        poly_entities,
+        nonpoly_entities,
+    )
 
     protein_entities: list[dict[str, Any]] = []
     peptide_entities: list[dict[str, Any]] = []
@@ -623,8 +806,39 @@ def classify_entry(
         else:
             other_poly.append(ent)
 
-    bound_objects = build_bound_objects(nonpoly_entities, peptide_entities, chem_descriptors)
+    bound_objects = build_bound_objects(
+        nonpoly_entities,
+        peptide_entities,
+        other_poly_entities=other_poly,
+        chem_descriptors=chem_descriptors,
+    )
     bound_objects = disambiguate_roles(bound_objects)
+    bound_objects = _apply_covalent_context_heuristic(raw_entry, bound_objects)
+
+    # Detect fusion-construct peptides: a protein-length entity whose
+    # pdbx_description mentions "peptide" alongside another protein name
+    # (e.g. "mim2 peptide,HLA class II histocompatibility antigen, DP beta 1
+    # chain" in 4P57).  If no peptide was already found, emit a virtual one.
+    if not peptide_entities and not any(b.binder_type == "peptide" for b in bound_objects):
+        for ent in protein_entities:
+            desc = (
+                (ent.get("rcsb_polymer_entity") or {}).get("pdbx_description") or ""
+            ).lower()
+            if not desc:
+                continue
+            parts = [p.strip() for p in desc.split(",")]
+            has_peptide_part = any("peptide" in p for p in parts)
+            has_nonpeptide_part = any(p and "peptide" not in p for p in parts)
+            if has_peptide_part and has_nonpeptide_part:
+                bound_objects.append(BoundObject(
+                    entity_id=ent.get("rcsb_id"),
+                    binder_type="peptide",
+                    role="primary_ligand",
+                    classification_rationale=(
+                        f"Peptide embedded in fusion construct: {desc}"
+                    ),
+                ))
+                break  # only emit one virtual peptide
 
     interfaces = build_interfaces(protein_entities, peptide_entities)
     assembly_info = build_assembly_info(raw_entry)

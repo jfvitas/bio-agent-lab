@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
@@ -59,6 +59,8 @@ _HEADER_FG = "#ffffff"
 _LOG_BG    = "#1e1e1e"
 _LOG_FG    = "#d4d4d4"
 
+_T = TypeVar("_T")
+
 
 # ---------------------------------------------------------------------------
 # Sources config helpers (read/write sources.yaml)
@@ -85,6 +87,26 @@ def _save_sources_enabled(enabled: dict[str, bool]) -> None:
         sources.setdefault(src, {})["enabled"] = val
     with _SOURCES_CFG.open("w") as f:
         yaml.safe_dump(raw, f, default_flow_style=False)
+
+
+def _call_on_tk_thread(root: Any, fn: Callable[[], _T]) -> _T:
+    """Run a callable on the Tk event thread and return its result."""
+    result: dict[str, Any] = {}
+    event = threading.Event()
+
+    def _invoke() -> None:
+        try:
+            result["value"] = fn()
+        except Exception as exc:  # pragma: no cover - exercised via re-raise path
+            result["error"] = exc
+        finally:
+            event.set()
+
+    root.after(0, _invoke)
+    event.wait()
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +593,7 @@ class PbdataGUI:
         self._root.after(0, self._log_line, "\n─── Search & Download (RCSB) ───")
 
         # Save current criteria first
-        sc = self._criteria_from_ui()
+        sc = _call_on_tk_thread(self._root, self._criteria_from_ui)
         save_criteria(sc, _CRITERIA_PATH)
 
         # -- Step 1: count --

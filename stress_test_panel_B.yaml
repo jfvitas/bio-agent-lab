@@ -1,0 +1,214 @@
+panel_name: panel_b_adversarial_structural_complexity
+version: 1
+purpose: >-
+  Adversarial structural stress-test panel for parser and normalizer robustness.
+  These entries are intended for evaluation only, not training-target supervision.
+usage_policy:
+  do_not_train_on_expected_outcomes: true
+  use_for_parser_and_normalizer_validation_only: true
+  require_machine_checkable_flags: true
+entries:
+  - test_case_id: panel_b_01
+    pdb_id: "6PFY"
+    title: "Photosystem I"
+    categories:
+      - membrane_protein
+      - giant_multimer
+      - many_cofactors
+      - assembly_complexity
+    expected_outcomes:
+      min_polymer_chain_count: 20
+      expected_multimeric: true
+      expected_membrane_complex: true
+      expected_multiple_bound_objects: true
+      expected_many_bound_objects: true
+      expected_cofactor_present: true
+      expected_metal_present: true
+      expected_single_primary_ligand_confidence: low
+      expected_flags:
+        - multiple_bound_objects
+        - cofactor_present
+        - metal_present
+    notes: >-
+      Parser should preserve a large object inventory and must not collapse the structure
+      into a simple one-ligand record.
+
+  - test_case_id: panel_b_02
+    pdb_id: "3WU2"
+    title: "Photosystem II"
+    categories:
+      - membrane_protein
+      - giant_multimer
+      - many_cofactors
+      - metal_cluster_context
+    expected_outcomes:
+      min_polymer_chain_count: 10
+      expected_multimeric: true
+      expected_membrane_complex: true
+      expected_multiple_bound_objects: true
+      expected_cofactor_present: true
+      expected_metal_present: true
+      expected_single_primary_ligand_confidence: low
+      expected_flags:
+        - multiple_bound_objects
+        - cofactor_present
+        - metal_present
+    notes: >-
+      Must handle many cofactors and metal-containing components without flattening them.
+
+  - test_case_id: panel_b_03
+    pdb_id: "7O7Q"
+    title: "Trypsin-activated alpha-2-macroglobulin tetramer"
+    categories:
+      - giant_multimer
+      - protein_protein
+      - conformational_trap
+      - assembly_complexity
+    expected_outcomes:
+      min_polymer_chain_count: 4
+      expected_multimeric: true
+      expected_multiple_protein_partners: true
+      expected_protein_partner: true
+      expected_single_primary_ligand_confidence: low
+      expected_flags:
+        - multiple_bound_objects
+      disallow_default_pairwise_fragmentation: true
+    notes: >-
+      Code should avoid naively splitting into unrelated pairwise records without an
+      explicit interface policy.
+
+  - test_case_id: panel_b_04
+    pdb_id: "9IU1"
+    title: "SARS-CoV-2 JN.1 spike RBD with ACE2"
+    categories:
+      - glycoprotein
+      - protein_protein
+      - receptor_viral_complex
+      - conformational_heterogeneity
+    expected_outcomes:
+      min_polymer_chain_count: 2
+      expected_multiple_protein_partners: true
+      expected_protein_partner: true
+      expected_glycan_present: true
+      expected_glycan_biological_relevance: true
+      expected_flags:
+        - glycan_present
+        - heteromeric_interface
+    notes: >-
+      Glycans should be preserved as meaningful objects and not discarded as noise.
+
+  - test_case_id: panel_b_05
+    pdb_id: "5XJE"
+    title: "Fucosylated IgG1 Fc with bis-glycosylated FcγRIIIa"
+    categories:
+      - glycoprotein
+      - immune_complex
+      - glycan_mediated_binding
+      - protein_protein
+    expected_outcomes:
+      min_polymer_chain_count: 2
+      expected_multiple_protein_partners: true
+      expected_glycan_present: true
+      expected_glycan_biological_relevance: true
+      expected_flags:
+        - glycan_present
+        - heteromeric_interface
+    notes: >-
+      Must preserve glycans distinctly from protein chains and from ordinary ligands.
+
+  - test_case_id: panel_b_06
+    pdb_id: "4X4M"
+    title: "FcγRI-Fc complex with glycan recognition relevance"
+    categories:
+      - glycoprotein
+      - immune_complex
+      - protein_protein
+      - glycan_mediated_binding
+    expected_outcomes:
+      min_polymer_chain_count: 2
+      expected_multiple_protein_partners: true
+      expected_glycan_present: true
+      expected_glycan_biological_relevance: true
+      expected_flags:
+        - glycan_present
+        - heteromeric_interface
+    notes: >-
+      Good check that glycan-mediated recognition can be represented in normalized output.
+
+  - test_case_id: panel_b_07
+    pdb_id: "6BML"
+    title: "DHHC20 palmitoyltransferase with covalent intermediate mimic"
+    categories:
+      - membrane_protein
+      - covalent_binder
+      - enzyme_complex
+    expected_outcomes:
+      min_polymer_chain_count: 1
+      expected_membrane_complex: true
+      expected_multiple_bound_objects: true
+      expected_covalent_binder: true
+      expected_flags:
+        - covalent_binder
+        - multiple_bound_objects
+    notes: >-
+      Must be separable from ordinary noncovalent ligand records.
+
+  - test_case_id: panel_b_08
+    pdb_id: "1DY9"
+    title: "NS3/4A protease with NS4A cofactor and reversible covalent inhibitors"
+    categories:
+      - protein_peptide_or_cofactor_mix
+      - inhibitor_complex
+      - covalent_like_chemistry
+    expected_outcomes:
+      min_polymer_chain_count: 1
+      expected_multiple_bound_objects: true
+      expected_cofactor_present: true
+      expected_covalent_or_reactive_binder_logic: true
+      expected_flags:
+        - multiple_bound_objects
+        - cofactor_present
+    notes: >-
+      Accept either explicit covalent/reactive-binder flagging or a clearly documented
+      reactive chemistry ambiguity flag, depending on implementation details.
+
+  - test_case_id: panel_b_09
+    pdb_id: "2VKE"
+    title: "Tet repressor class D with tetracycline and cobalt"
+    categories:
+      - metal_chelate_binding
+      - protein_small_molecule
+      - metal_mediated_recognition
+    expected_outcomes:
+      min_polymer_chain_count: 1
+      expected_multiple_bound_objects: true
+      expected_metal_present: true
+      expected_metal_chelate_or_mediated_logic: true
+      expected_flags:
+        - metal_present
+        - multiple_bound_objects
+        - metal_mediated_binding_possible
+    notes: >-
+      Parser should not reduce this to a plain ligand plus unrelated ion.
+
+  - test_case_id: panel_b_10
+    pdb_id: "4H26"
+    title: "Ni(II)-dependent TCR/MHC II/peptide recognition complex"
+    categories:
+      - immune_complex
+      - metal_mediated_recognition
+      - protein_peptide_complex
+    expected_outcomes:
+      min_polymer_chain_count: 3
+      expected_multiple_protein_partners: true
+      expected_peptide_partner: true
+      expected_metal_present: true
+      expected_metal_mediated_binding_possible: true
+      expected_flags:
+        - metal_present
+        - metal_mediated_binding_possible
+        - peptide_partner
+        - heteromeric_interface
+    notes: >-
+      Metal changes recognition context; code should preserve that ambiguity rather than
+      treat the metal as an incidental ion.
