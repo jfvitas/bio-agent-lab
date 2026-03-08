@@ -3,6 +3,8 @@ sources:
     enabled: true
   bindingdb:
     enabled: false
+  chembl:
+    enabled: false
   pdbbind:
     enabled: false
   biolip:

@@ -69,9 +69,20 @@ class BoundObject(BaseModel):
     smiles:    str | None = None
     inchi_key: str | None = None
 
+    # Extended chemistry (spec group 6)
+    formula: str | None = None
+    iupac_name: str | None = None
+    molecular_weight: float | None = None
+    formal_charge: int | None = None
+    component_count: int | None = None
+
     # Covalent-binding flags
     is_covalent:           bool | None = None  # None = not determined from metadata
     covalent_warhead_flag: bool = False         # SMILES contains a known reactive group
+
+    # Metal-specific (spec group 6)
+    metal_elements: list[str] | None = None
+    metal_roles: list[str] | None = None
 
     # Polymer-only
     residue_count: int | None = None  # sequence length for peptide partners

@@ -32,8 +32,22 @@ class CanonicalBindingSample(BaseModel):
     ligand_smiles: str | None = None
     ligand_inchi_key: str | None = None
 
+    title: str | None = None
     experimental_method: str | None = None
     structure_resolution: float | None = None
+    release_date: str | None = None
+    deposit_date: str | None = None
+    deposited_atom_count: int | None = None
+
+    # File provenance (per spec file download policy)
+    structure_file_cif_path: str | None = None
+    structure_file_cif_size_bytes: int | None = None
+    structure_file_pdb_path: str | None = None
+    structure_file_pdb_size_bytes: int | None = None
+    parsed_structure_format: str | None = None
+    structure_download_url: str | None = None
+    structure_downloaded_at: str | None = None
+    structure_file_hash_sha256: str | None = None
 
     assay_type: str | None = None
     assay_value: float | None = None

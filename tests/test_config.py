@@ -40,6 +40,7 @@ def test_load_config_rcsb_enabled(sources_config_path: Path) -> None:
 def test_load_config_other_sources_disabled(sources_config_path: Path) -> None:
     cfg = load_config(sources_config_path)
     assert cfg.sources.bindingdb.enabled is False
+    assert cfg.sources.chembl.enabled is False
     assert cfg.sources.pdbbind.enabled is False
     assert cfg.sources.biolip.enabled is False
     assert cfg.sources.skempi.enabled is False

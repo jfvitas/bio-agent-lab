@@ -6,21 +6,31 @@ This module augments the GraphQL metadata with coordinate-derived signals:
 - polymer entity chain IDs / residue counts when GraphQL is incomplete
 
 The goal is conservative enrichment, not a full structural parser.
+
+It also handles permanent storage of downloaded mmCIF files with SHA-256
+hashing and file provenance metadata per the structure extraction spec.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import gemmi
 import requests
 
+logger = logging.getLogger(__name__)
+
 _MMCIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
+_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 _TIMEOUT = 60
 _MISSING = {"", ".", "?"}
 _DEFAULT_RAW_DIR = Path("data/raw/rcsb")
+_DEFAULT_STRUCTURES_DIR = Path("data/structures/rcsb")
 
 
 def _clean(value: Any) -> str:
@@ -43,18 +53,116 @@ def _read_pairs(block: gemmi.cif.Block, left: str, right: str) -> list[tuple[str
     return list(zip(a, b))
 
 
-def fetch_mmcif_supplement(pdb_id: str) -> dict[str, Any] | None:
-    """Fetch and parse a compact mmCIF supplement for one PDB entry."""
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def download_structure_files(
+    pdb_id: str,
+    structures_dir: Path | None = None,
+    download_pdb: bool = False,
+) -> dict[str, Any]:
+    """Download mmCIF (and optionally PDB) files, save permanently, return provenance.
+
+    Returns a dict with file provenance fields per the spec:
+    - structure_file_cif_path, structure_file_cif_size_bytes
+    - structure_file_pdb_path, structure_file_pdb_size_bytes (if downloaded)
+    - parsed_structure_format, structure_download_url
+    - structure_downloaded_at, structure_file_hash_sha256
+    """
     pdb_id = pdb_id.upper()
+    out_dir = structures_dir or _DEFAULT_STRUCTURES_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    provenance: dict[str, Any] = {
+        "parsed_structure_format": "mmCIF",
+    }
+
+    # ── mmCIF (required primary format) ──────────────────────────────
+    cif_path = out_dir / f"{pdb_id}.cif"
+    cif_url = _MMCIF_URL.format(pdb_id=pdb_id)
+
+    if cif_path.exists():
+        cif_bytes = cif_path.read_bytes()
+        provenance["structure_file_cif_path"] = str(cif_path)
+        provenance["structure_file_cif_size_bytes"] = len(cif_bytes)
+        provenance["structure_file_hash_sha256"] = _sha256(cif_bytes)
+        provenance["structure_download_url"] = cif_url
+        provenance["structure_downloaded_at"] = "cached"
+    else:
+        try:
+            resp = requests.get(cif_url, timeout=_TIMEOUT)
+            resp.raise_for_status()
+            cif_bytes = resp.content
+            cif_path.write_bytes(cif_bytes)
+            provenance["structure_file_cif_path"] = str(cif_path)
+            provenance["structure_file_cif_size_bytes"] = len(cif_bytes)
+            provenance["structure_file_hash_sha256"] = _sha256(cif_bytes)
+            provenance["structure_download_url"] = cif_url
+            provenance["structure_downloaded_at"] = datetime.now(timezone.utc).isoformat()
+        except Exception as exc:
+            logger.warning("mmCIF download failed for %s: %s", pdb_id, exc)
+            provenance["structure_file_cif_path"] = None
+            provenance["structure_download_url"] = cif_url
+
+    # ── PDB (optional compatibility fallback) ────────────────────────
+    if download_pdb:
+        pdb_path = out_dir / f"{pdb_id}.pdb"
+        pdb_url = _PDB_URL.format(pdb_id=pdb_id)
+        if pdb_path.exists():
+            pdb_bytes = pdb_path.read_bytes()
+            provenance["structure_file_pdb_path"] = str(pdb_path)
+            provenance["structure_file_pdb_size_bytes"] = len(pdb_bytes)
+        else:
+            try:
+                resp = requests.get(pdb_url, timeout=_TIMEOUT)
+                resp.raise_for_status()
+                pdb_bytes = resp.content
+                pdb_path.write_bytes(pdb_bytes)
+                provenance["structure_file_pdb_path"] = str(pdb_path)
+                provenance["structure_file_pdb_size_bytes"] = len(pdb_bytes)
+            except Exception as exc:
+                logger.warning("PDB download failed for %s: %s", pdb_id, exc)
+                provenance["structure_file_pdb_path"] = None
+
+    return provenance
+
+
+def fetch_mmcif_supplement(
+    pdb_id: str,
+    structures_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Fetch and parse a compact mmCIF supplement for one PDB entry.
+
+    If a saved mmCIF file exists in structures_dir (or the default
+    location), it is read from disk.  Otherwise it is downloaded and
+    saved permanently.
+    """
+    pdb_id = pdb_id.upper()
+    struct_dir = structures_dir or _DEFAULT_STRUCTURES_DIR
+    saved_path = struct_dir / f"{pdb_id}.cif"
+
+    # Try saved structure file first
+    if saved_path.exists():
+        text = saved_path.read_text(encoding="utf-8")
+        return parse_mmcif_supplement(text)
+
+    # Fall back to legacy cache location
+    legacy_path = _DEFAULT_RAW_DIR / f"{pdb_id}.cif"
+    if legacy_path.exists():
+        text = legacy_path.read_text(encoding="utf-8")
+        return parse_mmcif_supplement(text)
+
+    # Download fresh
     try:
         response = requests.get(_MMCIF_URL.format(pdb_id=pdb_id), timeout=_TIMEOUT)
         response.raise_for_status()
         text = response.text
     except Exception:
-        cache_path = _DEFAULT_RAW_DIR / f"{pdb_id}.cif"
-        if not cache_path.exists():
-            raise
-        text = cache_path.read_text(encoding="utf-8")
+        raise
+    # Save to structures dir for future use
+    struct_dir.mkdir(parents=True, exist_ok=True)
+    saved_path.write_text(text, encoding="utf-8")
     return parse_mmcif_supplement(text)
 
 
@@ -155,8 +263,75 @@ def parse_mmcif_supplement(text: str) -> dict[str, Any]:
             "residue_id": residue_id,
         })
 
+    # ── Water entity count ──────────────────────────────────────────
+    water_count = 0
+    for entity_id, entity_type in entity_types.items():
+        if _norm(entity_type) == "water":
+            # Count unique water residues via struct_asym chain count
+            water_count += len(chains_by_entity.get(entity_id, set()))
+
+    # ── Branched entity count ────────────────────────────────────────
+    branched_entity_count = len(branched_entities)
+
     return {
         "polymer_entities": polymer_entities,
         "branched_entities": branched_entities,
+        "branched_entity_count": branched_entity_count,
         "nonpolymer_instances": nonpolymer_instances,
+        "water_count": water_count,
+        "entity_types": entity_types,
+        "chains_by_entity": {k: sorted(v) for k, v in chains_by_entity.items()},
     }
+
+
+def parse_structure_quality(text: str) -> dict[str, Any]:
+    """Extract structure quality fields from mmCIF text (spec group 13).
+
+    Reads _refine, _pdbx_struct_oper_list, _pdbx_unobs_or_zero_occ_residues,
+    and _atom_site alternate conformer / occupancy columns.
+    """
+    block = gemmi.cif.read_string(text).sole_block()
+    result: dict[str, Any] = {}
+
+    # R-work / R-free from _refine
+    for tag, key in [
+        ("_refine.ls_R_factor_R_work", "r_work"),
+        ("_refine.ls_R_factor_R_free", "r_free"),
+        ("_refine.ls_d_res_high", "refinement_resolution_high"),
+    ]:
+        vals = _read_column(block, tag)
+        if vals and vals[0] not in _MISSING:
+            try:
+                result[key] = round(float(vals[0]), 4)
+            except (TypeError, ValueError):
+                pass
+
+    # Model count from _pdbx_struct_oper_list or _atom_site.pdbx_PDB_model_num
+    model_nums = _read_column(block, "_atom_site.pdbx_PDB_model_num")
+    if model_nums:
+        result["model_count"] = len(set(model_nums) - _MISSING)
+
+    # Alternate conformers
+    alt_ids = _read_column(block, "_atom_site.label_alt_id")
+    non_trivial_alt = {a for a in alt_ids if a not in _MISSING and a != "."}
+    result["contains_alternate_locations"] = len(non_trivial_alt) > 0
+
+    # Partial occupancy
+    occupancies = _read_column(block, "_atom_site.occupancy")
+    has_partial = False
+    for occ in occupancies:
+        if occ not in _MISSING:
+            try:
+                if float(occ) < 1.0:
+                    has_partial = True
+                    break
+            except (TypeError, ValueError):
+                pass
+    result["contains_partial_occupancy"] = has_partial
+
+    # Missing residues (from _pdbx_unobs_or_zero_occ_residues)
+    missing_ids = _read_column(block, "_pdbx_unobs_or_zero_occ_residues.auth_seq_id")
+    result["missing_residue_count"] = len([m for m in missing_ids if m not in _MISSING])
+    result["contains_missing_residues"] = result["missing_residue_count"] > 0
+
+    return result

@@ -1,0 +1,161 @@
+
+panel_name: Panel_C_extended_stress_tests
+description: >
+  Extended structural extraction validation panel for pbdata.
+  Designed to test multi-source extraction (RCSB, BindingDB, PDBbind, BioLiP, SKEMPI, literature).
+  Expectations focus on categories of extracted information rather than exact numeric values.
+
+structures:
+  - pdb_id: 2HHB
+    categories: [multimeric, cofactor, metal, symmetric_complex]
+    expected_flags:
+      homomeric_or_heteromeric: heteromeric
+      metal_present: true
+      cofactor_present: true
+    source_expectations:
+      rcsb:
+        provide:
+          - chain_ids
+          - polymer_sequences
+          - assembly_information
+          - ligand_ids
+          - metal_atoms
+      bindingdb:
+        provide_if_available:
+          - binding_affinity
+      biolip:
+        provide_if_available:
+          - binding_site_annotations
+
+  - pdb_id: 1ATP
+    categories: [protein_peptide_complex, nucleotide_ligand, metal]
+    expected_flags:
+      peptide_partner: true
+      metal_present: true
+      multiple_bound_objects: true
+    source_expectations:
+      rcsb:
+        provide:
+          - chain_ids
+          - ligand_ids
+          - ligand_names
+          - assembly_information
+      pdbbind:
+        provide_if_available:
+          - affinity_annotation
+
+  - pdb_id: 6EAQ
+    categories: [glycosylated_protein_complex, immune_complex]
+    expected_flags:
+      glycan_present: true
+      heteromeric_interface: true
+    source_expectations:
+      rcsb:
+        provide:
+          - glycan_entities
+          - chain_ids
+          - taxonomy
+      biolip:
+        provide_if_available:
+          - biological_ligand_annotations
+
+  - pdb_id: 7DTZ
+    categories: [covalent_inhibitor, enzyme_ligand]
+    expected_flags:
+      covalent_binder: true
+    source_expectations:
+      rcsb:
+        provide:
+          - ligand_ids
+          - chemical_component_dictionary_entries
+      pdbbind:
+        provide_if_available:
+          - affinity_values
+
+  - pdb_id: 4P57
+    categories: [immune_complex, metal_mediated_binding]
+    expected_flags:
+      metal_present: true
+      heteromeric_interface: true
+    source_expectations:
+      rcsb:
+        provide:
+          - chain_ids
+          - metal_atoms
+          - assembly_information
+
+  - pdb_id: 1PW8
+    categories: [covalent_enzyme_intermediate]
+    expected_flags:
+      covalent_binder: true
+    source_expectations:
+      rcsb:
+        provide:
+          - ligand_ids
+          - ligand_names
+
+  - pdb_id: 6PFY
+    categories: [very_large_complex, membrane_protein, multiple_cofactors]
+    expected_flags:
+      large_assembly: true
+      cofactor_present: true
+    source_expectations:
+      rcsb:
+        provide:
+          - assembly_information
+          - cofactor_entities
+          - chain_ids
+
+  - pdb_id: 3WU2
+    categories: [membrane_complex, metal, cofactors]
+    expected_flags:
+      membrane_complex: true
+      metal_present: true
+    source_expectations:
+      rcsb:
+        provide:
+          - metal_atoms
+          - cofactors
+          - chain_ids
+
+  - pdb_id: 2VKE
+    categories: [metal_chelate_ligand]
+    expected_flags:
+      metal_present: true
+      metal_mediated_binding_possible: true
+    source_expectations:
+      rcsb:
+        provide:
+          - ligand_ids
+          - metal_atoms
+
+  - pdb_id: 4X4M
+    categories: [glycan_binding]
+    expected_flags:
+      glycan_present: true
+    source_expectations:
+      rcsb:
+        provide:
+          - glycan_entities
+          - chain_ids
+
+  - pdb_id: 6DO1
+    categories: [membrane_receptor, peptide_ligand]
+    expected_flags:
+      peptide_partner: true
+      membrane_complex: true
+    source_expectations:
+      rcsb:
+        provide:
+          - ligand_ids
+          - chain_ids
+
+  - pdb_id: 7O7Q
+    categories: [large_oligomer, conformational_complex]
+    expected_flags:
+      multimeric_complex: true
+    source_expectations:
+      rcsb:
+        provide:
+          - assembly_information
+          - chain_ids

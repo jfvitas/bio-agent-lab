@@ -230,6 +230,25 @@ _COVALENT_TITLE_KEYWORDS: tuple[str, ...] = (
     "covalently modified",
 )
 
+_GLYCAN_CONTEXT_KEYWORDS: tuple[str, ...] = (
+    "glycosylated",
+    "glycoprotein",
+    "glycan",
+    "fucosylated",
+    "sialylated",
+    "oligosaccharide",
+)
+
+_METAL_CONTEXT_KEYWORDS: dict[str, str] = {
+    "nickel": "NI",
+    "zn(": "ZN",
+    "zinc": "ZN",
+    "cobalt": "CO",
+    "manganese": "MN",
+    "magnesium": "MG",
+    "calcium": "CA",
+}
+
 
 # ---------------------------------------------------------------------------
 # Low-level entity helpers
@@ -762,6 +781,56 @@ def _apply_covalent_context_heuristic(
     return updated
 
 
+def _apply_missing_context_heuristics(
+    raw_entry: dict[str, Any],
+    protein_entities: list[dict[str, Any]],
+    bound_objects: list[BoundObject],
+) -> list[BoundObject]:
+    """Recover obvious missing glycans/metals from descriptive metadata.
+
+    This is a conservative fallback for entries whose GraphQL payload omits
+    branched entities or nonpolymer ions and where coordinate-side parsing is
+    unavailable. Inferred objects are kept explicit and rationale-tagged.
+    """
+    title = ((raw_entry.get("struct") or {}).get("title") or "").lower()
+    descriptions = " ".join(
+        str(((ent.get("rcsb_polymer_entity") or {}).get("pdbx_description") or "")).lower()
+        for ent in protein_entities
+    )
+    text = " ".join(part for part in (title, descriptions) if part)
+
+    updated = list(bound_objects)
+
+    has_glycan = any(obj.binder_type == "glycan" for obj in updated)
+    if not has_glycan and any(keyword in text for keyword in _GLYCAN_CONTEXT_KEYWORDS):
+        updated.append(BoundObject(
+            binder_type="glycan",
+            role="co_ligand",
+            classification_rationale=(
+                "entry title/entity descriptions indicate glycosylation; "
+                "explicit glycan components unavailable from current metadata"
+            ),
+        ))
+
+    has_metal = any(obj.binder_type == "metal_ion" for obj in updated)
+    if not has_metal:
+        for keyword, comp_id in _METAL_CONTEXT_KEYWORDS.items():
+            if keyword in text:
+                updated.append(BoundObject(
+                    comp_id=comp_id,
+                    name=comp_id,
+                    binder_type="metal_ion",
+                    role="metal_mediated_contact",
+                    classification_rationale=(
+                        f"entry title/entity descriptions mention {keyword!r}; "
+                        "explicit metal components unavailable from current metadata"
+                    ),
+                ))
+                break
+
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # Top-level per-entry classify function
 # ---------------------------------------------------------------------------
@@ -814,6 +883,11 @@ def classify_entry(
     )
     bound_objects = disambiguate_roles(bound_objects)
     bound_objects = _apply_covalent_context_heuristic(raw_entry, bound_objects)
+    bound_objects = _apply_missing_context_heuristics(
+        raw_entry,
+        protein_entities,
+        bound_objects,
+    )
 
     # Detect fusion-construct peptides: a protein-length entity whose
     # pdbx_description mentions "peptide" alongside another protein name

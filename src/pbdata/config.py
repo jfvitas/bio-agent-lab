@@ -22,6 +22,7 @@ class SourcesConfig(BaseModel):
 
     rcsb: SourceConfig = SourceConfig()
     bindingdb: SourceConfig = SourceConfig()
+    chembl: SourceConfig = SourceConfig()
     pdbbind: SourceConfig = SourceConfig()
     biolip: SourceConfig = SourceConfig()
     skempi: SourceConfig = SourceConfig()

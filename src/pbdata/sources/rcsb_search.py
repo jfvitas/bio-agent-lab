@@ -112,6 +112,28 @@ def _build_query(criteria: SearchCriteria) -> dict[str, Any]:
             "parameters": {"value": criteria.keyword_query},
         })
 
+    if criteria.organism_name_query:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entity_source_organism.ncbi_scientific_name",
+                "operator": "contains_phrase",
+                "value": criteria.organism_name_query,
+            },
+        })
+
+    if criteria.taxonomy_id is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entity_source_organism.ncbi_taxonomy_id",
+                "operator": "exact_match",
+                "value": criteria.taxonomy_id,
+            },
+        })
+
     methods = criteria.rcsb_method_labels()
     if methods:
         nodes.append({

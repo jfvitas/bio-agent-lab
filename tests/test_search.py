@@ -17,6 +17,8 @@ def _tmp_dir(name: str) -> Path:
 def test_build_query_includes_high_level_filters() -> None:
     criteria = SearchCriteria(
         keyword_query="kinase inhibitor",
+        organism_name_query="Homo sapiens",
+        taxonomy_id=9606,
         require_ligand=True,
         min_protein_entities=2,
         max_deposited_atom_count=50000,
@@ -30,6 +32,14 @@ def test_build_query_includes_high_level_filters() -> None:
 
     nodes = query["nodes"]
     assert any(node["service"] == "full_text" for node in nodes)
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entity_source_organism.ncbi_scientific_name"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entity_source_organism.ncbi_taxonomy_id"
+        for node in nodes
+    )
     assert any(
         node.get("parameters", {}).get("attribute") == "rcsb_entry_info.nonpolymer_entity_count"
         for node in nodes

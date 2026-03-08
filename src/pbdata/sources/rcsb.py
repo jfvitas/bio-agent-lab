@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
-from pbdata.parsing.mmcif_supplement import fetch_mmcif_supplement
+from pbdata.parsing.mmcif_supplement import (
+    download_structure_files,
+    fetch_mmcif_supplement,
+)
 from pbdata.sources.base import BaseAdapter
 from pbdata.sources.rcsb_classify import (
     _polymer_chain_ids,
@@ -26,8 +29,9 @@ from pbdata.sources.rcsb_classify import (
     classify_entry,
 )
 
-_ADAPTER_VERSION = "0.2.0"
+_ADAPTER_VERSION = "0.3.0"
 _DEFAULT_RAW_DIR = Path("data/raw/rcsb")
+_DEFAULT_STRUCTURES_DIR = Path("data/structures/rcsb")
 
 # Re-export for backward compat (callers may import _EXCLUDED_COMPS from here)
 from pbdata.sources.rcsb_classify import _EXCLUDED_COMPS  # noqa: F401
@@ -110,8 +114,16 @@ class RCSBAdapter(BaseAdapter):
     def source_name(self) -> str:
         return "RCSB"
 
-    def fetch_metadata(self, record_id: str) -> dict[str, Any]:
-        """Fetch entry metadata for a single PDB ID."""
+    def fetch_metadata(
+        self,
+        record_id: str,
+        download_structures: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch entry metadata for a single PDB ID.
+
+        Also downloads mmCIF structure files to data/structures/rcsb/
+        and attaches file provenance to the raw dict.
+        """
         from pbdata.sources.rcsb_search import fetch_entries_batch
         pdb_id = record_id.upper()
         try:
@@ -134,6 +146,15 @@ class RCSBAdapter(BaseAdapter):
             supplement = None
         if supplement:
             raw["mmcif_supplement"] = supplement
+        # Download and save structure files with provenance
+        if download_structures:
+            try:
+                file_prov = download_structure_files(
+                    pdb_id, structures_dir=_DEFAULT_STRUCTURES_DIR,
+                )
+                raw["structure_file_provenance"] = file_prov
+            except Exception:
+                pass
         return raw
 
     def _cache_path(self, pdb_id: str) -> Path:
@@ -215,6 +236,17 @@ class RCSBAdapter(BaseAdapter):
         method: str | None = exptl[0].get("method") if exptl else None
 
         # ------------------------------------------------------------------
+        # File provenance
+        # ------------------------------------------------------------------
+        file_prov: dict[str, Any] = raw.get("structure_file_provenance") or {}
+
+        # ------------------------------------------------------------------
+        # Entry metadata
+        # ------------------------------------------------------------------
+        struct_title = (raw.get("struct") or {}).get("title")
+        accession: dict[str, Any] = raw.get("rcsb_accession_info") or {}
+
+        # ------------------------------------------------------------------
         # Provenance
         # ------------------------------------------------------------------
         provenance: dict[str, Any] = {
@@ -226,10 +258,6 @@ class RCSBAdapter(BaseAdapter):
             "membrane_protein_context": membrane_context,
         }
 
-        # ------------------------------------------------------------------
-        # Struct title (for provenance / manifest)
-        # ------------------------------------------------------------------
-        struct_title = (raw.get("struct") or {}).get("title")
         if struct_title:
             provenance["struct_title"] = struct_title
 
@@ -242,8 +270,21 @@ class RCSBAdapter(BaseAdapter):
             source_database="RCSB",
             source_record_id=pdb_id,
             pdb_id=pdb_id,
+            title=struct_title,
             experimental_method=method,
             structure_resolution=_resolution(entry_info),
+            release_date=accession.get("initial_release_date"),
+            deposit_date=accession.get("deposit_date"),
+            deposited_atom_count=entry_info.get("deposited_atom_count"),
+            # File provenance
+            structure_file_cif_path=file_prov.get("structure_file_cif_path"),
+            structure_file_cif_size_bytes=file_prov.get("structure_file_cif_size_bytes"),
+            structure_file_pdb_path=file_prov.get("structure_file_pdb_path"),
+            structure_file_pdb_size_bytes=file_prov.get("structure_file_pdb_size_bytes"),
+            parsed_structure_format=file_prov.get("parsed_structure_format"),
+            structure_download_url=file_prov.get("structure_download_url"),
+            structure_downloaded_at=file_prov.get("structure_downloaded_at"),
+            structure_file_hash_sha256=file_prov.get("structure_file_hash_sha256"),
             chain_ids_receptor=_chain_ids(receptor),
             chain_ids_partner=_chain_ids(partner),
             sequence_receptor=_sequence(receptor) if receptor else None,

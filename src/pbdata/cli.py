@@ -3,6 +3,7 @@ import logging
 import statistics
 from datetime import datetime, timezone
 from collections import Counter
+from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -23,6 +24,121 @@ _SPLITS_DIR          = Path("data/splits")
 _CATALOG_PATH        = Path("data/catalog/download_manifest.csv")
 
 logger = logging.getLogger(__name__)
+
+
+def _load_external_assay_samples(config: AppConfig) -> dict[str, list]:
+    """Load locally available affinity sources for extract-time attachment."""
+    grouped: dict[str, list] = defaultdict(list)
+
+    if config.sources.skempi.enabled:
+        from pbdata.sources.skempi import load_skempi_csv
+
+        raw_path = config.sources.skempi.extra.get("local_path") or str(Path("data/raw/skempi/skempi_v2.csv"))
+        path = Path(raw_path)
+        if path.exists():
+            for sample in load_skempi_csv(path, download=False):
+                if sample.pdb_id:
+                    grouped[sample.pdb_id].append(sample)
+        else:
+            logger.warning("SKEMPI enabled but file not found: %s", path)
+
+    if config.sources.pdbbind.enabled:
+        from pbdata.sources.pdbbind import PDBbindAdapter
+
+        local_dir_raw = config.sources.pdbbind.extra.get("local_dir")
+        if local_dir_raw:
+            local_dir = Path(str(local_dir_raw))
+            if local_dir.exists():
+                for sample in PDBbindAdapter(local_dir=local_dir).fetch_all():
+                    if sample.pdb_id:
+                        grouped[sample.pdb_id].append(sample)
+            else:
+                logger.warning("PDBbind enabled but local_dir not found: %s", local_dir)
+
+    if config.sources.biolip.enabled:
+        from pbdata.sources.biolip import BioLiPAdapter
+
+        local_dir_raw = config.sources.biolip.extra.get("local_dir")
+        if local_dir_raw:
+            local_dir = Path(str(local_dir_raw))
+            if local_dir.exists():
+                for sample in BioLiPAdapter(local_dir=local_dir).fetch_all():
+                    if sample.pdb_id:
+                        grouped[sample.pdb_id].append(sample)
+            else:
+                logger.warning("BioLiP enabled but local_dir not found: %s", local_dir)
+
+    return dict(grouped)
+
+
+def _raw_uniprot_ids(raw: dict) -> list[str]:
+    seen: dict[str, None] = {}
+    for ent in raw.get("polymer_entities") or []:
+        ids = (
+            (ent.get("rcsb_polymer_entity_container_identifiers") or {})
+            .get("uniprot_ids") or []
+        )
+        for uniprot_id in ids:
+            if uniprot_id:
+                seen[str(uniprot_id)] = None
+    return list(seen)
+
+
+def _raw_ligand_inchikeys(
+    raw: dict,
+    chem_descriptors: dict[str, dict[str, str]],
+) -> list[str]:
+    seen: dict[str, None] = {}
+    for ent in raw.get("nonpolymer_entities") or []:
+        comp_id = (
+            ((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {})
+            .get("id", "")
+        )
+        if not comp_id:
+            continue
+        desc = chem_descriptors.get(str(comp_id), {})
+        inchikey = desc.get("InChIKey")
+        if inchikey:
+            seen[str(inchikey)] = None
+    return list(seen)
+
+
+def _fetch_chembl_samples_for_raw(
+    raw: dict,
+    chem_descriptors: dict[str, dict[str, str]],
+    config: AppConfig,
+) -> list:
+    if not config.sources.chembl.enabled:
+        return []
+
+    from pbdata.sources.chembl import ChEMBLAdapter
+
+    accession_ids = _raw_uniprot_ids(raw)
+    inchikeys = _raw_ligand_inchikeys(raw, chem_descriptors)
+    if not accession_ids or not inchikeys:
+        return []
+
+    adapter = ChEMBLAdapter()
+    results: list = []
+    seen: set[str] = set()
+    for accession in accession_ids:
+        for inchikey in inchikeys:
+            try:
+                samples = adapter.fetch_by_uniprot_and_inchikey(accession, inchikey)
+            except Exception as exc:
+                logger.warning(
+                    "ChEMBL lookup failed for accession=%s inchikey=%s: %s",
+                    accession,
+                    inchikey,
+                    exc,
+                )
+                continue
+            for sample in samples:
+                if sample.sample_id in seen:
+                    continue
+                seen.add(sample.sample_id)
+                results.append(sample)
+    return results
 
 
 def _count_delimited_rows(path: Path, delimiter: str = ",") -> int | None:
@@ -225,10 +341,13 @@ def normalize_cmd(ctx: typer.Context) -> None:
     out_dir = _PROCESSED_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(raw_dir.glob("*.json")) if raw_dir.exists() else []
+    files = sorted(raw_dir.glob("*.json"))
     if not files:
         typer.echo(f"No raw files found in {raw_dir}. Run 'ingest' first.")
         return
+
+    cfg: AppConfig = ctx.obj.get("config", AppConfig())
+    assay_samples_by_pdb = _load_external_assay_samples(cfg)
 
     # Collect all unique ligand comp_ids in one pass before normalizing
     typer.echo(f"Scanning {len(files):,} RCSB records for ligand IDs...")
@@ -492,6 +611,120 @@ def build_splits_cmd(
     sizes = result.sizes()
     typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
     typer.echo(f"Splits written to {_SPLITS_DIR}/")
+
+
+# ---------------------------------------------------------------------------
+# extract (multi-table output per spec)
+# ---------------------------------------------------------------------------
+
+_EXTRACT_DIR = Path("data/extracted")
+_STRUCTURES_DIR = Path("data/structures/rcsb")
+
+
+@app.command("extract")
+def extract_cmd(
+    ctx: typer.Context,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Override default output directory."),
+    ] = None,
+    structures: Annotated[
+        Optional[Path],
+        typer.Option("--structures", help="Override default structures directory."),
+    ] = None,
+    download_pdb: Annotated[
+        bool,
+        typer.Option("--download-pdb", help="Also download PDB format files."),
+    ] = False,
+    download_structures: Annotated[
+        bool,
+        typer.Option("--download-structures/--no-download-structures",
+                     help="Download mmCIF structure files."),
+    ] = True,
+) -> None:
+    """Extract multi-table records from raw RCSB data.
+
+    Produces six output tables per the structure extraction spec:
+      entry/       - one record per PDB entry
+      chains/      - one record per chain/entity assignment
+      bound_objects/ - one record per bound object
+      interfaces/  - one record per interface
+      assays/      - one record per assay measurement
+      provenance/  - per-field provenance trail
+
+    Also downloads mmCIF files to data/structures/rcsb/ (unless --no-download-structures).
+    """
+    from pbdata.pipeline.extract import extract_rcsb_entry, write_records_json
+    from pbdata.sources.rcsb_search import fetch_chemcomp_descriptors
+
+    raw_dir = Path("data/raw/rcsb")
+    out_dir = output if output is not None else _EXTRACT_DIR
+    struct_dir = structures if structures is not None else _STRUCTURES_DIR
+
+    files = sorted(raw_dir.glob("*.json"))
+    if not files:
+        typer.echo(f"No raw files found in {raw_dir}. Run 'ingest' first.")
+        return
+
+    cfg: AppConfig = ctx.obj.get("config", AppConfig())
+    assay_samples_by_pdb = _load_external_assay_samples(cfg)
+
+    # Collect ligand comp_ids for batch descriptor fetch
+    typer.echo(f"Scanning {len(files):,} RCSB records for ligand IDs...")
+    comp_ids: list[str] = []
+    raw_data: list[tuple[Path, dict]] = []
+    for f in files:
+        try:
+            raw = json.loads(f.read_text())
+            raw_data.append((f, raw))
+            for ent in (raw.get("nonpolymer_entities") or []):
+                cid = (
+                    ((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {})
+                    .get("id", "")
+                )
+                if cid:
+                    comp_ids.append(cid)
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", f.name, exc)
+
+    chem_descriptors: dict[str, dict[str, str]] = {}
+    if comp_ids:
+        unique = list(dict.fromkeys(comp_ids))
+        typer.echo(f"Fetching chem-comp descriptors for {len(unique):,} ligands...")
+        try:
+            chem_descriptors = fetch_chemcomp_descriptors(unique)
+            typer.echo(f"  Got descriptors for {len(chem_descriptors):,} ligands.")
+        except Exception as exc:
+            logger.warning("Chem-comp fetch failed: %s", exc)
+
+    typer.echo(f"Extracting {len(raw_data):,} entries to multi-table records...")
+    ok = failed = 0
+
+    for f, raw in raw_data:
+        try:
+            pdb_id = str(raw.get("rcsb_id") or "").upper()
+            chembl_samples = _fetch_chembl_samples_for_raw(raw, chem_descriptors, cfg)
+            records = extract_rcsb_entry(
+                raw,
+                chem_descriptors=chem_descriptors,
+                assay_samples=assay_samples_by_pdb.get(pdb_id, []) + chembl_samples,
+                structures_dir=struct_dir if download_structures else None,
+                download_structures=download_structures,
+                download_pdb=download_pdb,
+            )
+            write_records_json(records, out_dir)
+            ok += 1
+        except Exception as exc:
+            logger.warning("Failed to extract %s: %s", f.name, exc)
+            failed += 1
+
+        if (ok + failed) % 100 == 0:
+            typer.echo(f"  {ok + failed:,}/{len(raw_data):,} processed...")
+
+    typer.echo(f"Extraction complete. OK: {ok:,}, Failed: {failed:,}")
+    typer.echo(f"Output: {out_dir}/")
+    if download_structures:
+        typer.echo(f"Structures: {struct_dir}/")
 
 
 if __name__ == "__main__":

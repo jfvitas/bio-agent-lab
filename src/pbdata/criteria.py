@@ -49,6 +49,8 @@ class SearchCriteria(BaseModel):
     """Criteria for filtering RCSB entries during ingestion."""
 
     keyword_query: str | None = None
+    organism_name_query: str | None = None
+    taxonomy_id: int | None = None
     experimental_methods: list[str] = Field(
         default_factory=lambda: ["xray", "em"],
         description="Active method keys: xray | em | nmr | neutron",
@@ -67,6 +69,8 @@ class SearchCriteria(BaseModel):
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> "SearchCriteria":
+        if self.taxonomy_id is not None and self.taxonomy_id <= 0:
+            raise ValueError("taxonomy_id must be > 0")
         if self.min_protein_entities is not None and self.min_protein_entities < 0:
             raise ValueError("min_protein_entities must be >= 0")
         if (

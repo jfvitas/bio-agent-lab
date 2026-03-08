@@ -39,10 +39,15 @@ from pbdata.criteria import (
 # Constants
 # ---------------------------------------------------------------------------
 
-_SOURCES = ["rcsb", "bindingdb", "pdbbind", "biolip", "skempi"]
+_SOURCES = ["rcsb", "bindingdb", "chembl", "pdbbind", "biolip", "skempi"]
+_SOURCE_PATH_FIELDS = {
+    "pdbbind": "local_dir",
+    "biolip": "local_dir",
+    "skempi": "local_path",
+}
 
 # Stages that run via subprocess (ingest is special-cased)
-_SUBPROCESS_STAGES = ["normalize", "audit", "report", "build-splits"]
+_SUBPROCESS_STAGES = ["extract", "normalize", "audit", "report", "build-splits"]
 
 _CRITERIA_PATH = Path("configs/criteria.yaml")
 _SOURCES_CFG   = Path("configs/sources.yaml")
@@ -66,16 +71,24 @@ _T = TypeVar("_T")
 # Sources config helpers (read/write sources.yaml)
 # ---------------------------------------------------------------------------
 
-def _load_sources_enabled() -> dict[str, bool]:
+def _load_sources_config() -> tuple[dict[str, bool], dict[str, str]]:
     if not _SOURCES_CFG.exists():
-        return {s: False for s in _SOURCES}
+        return (
+            {s: False for s in _SOURCES},
+            {s: "" for s in _SOURCE_PATH_FIELDS},
+        )
     with _SOURCES_CFG.open() as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
     sources = raw.get("sources", {})
-    return {s: bool(sources.get(s, {}).get("enabled", False)) for s in _SOURCES}
+    enabled = {s: bool(sources.get(s, {}).get("enabled", False)) for s in _SOURCES}
+    paths = {
+        src: str((sources.get(src, {}).get("extra", {}) or {}).get(field, "") or "")
+        for src, field in _SOURCE_PATH_FIELDS.items()
+    }
+    return enabled, paths
 
 
-def _save_sources_enabled(enabled: dict[str, bool]) -> None:
+def _save_sources_config(enabled: dict[str, bool], paths: dict[str, str]) -> None:
     _SOURCES_CFG.parent.mkdir(parents=True, exist_ok=True)
     if _SOURCES_CFG.exists():
         with _SOURCES_CFG.open() as f:
@@ -84,7 +97,16 @@ def _save_sources_enabled(enabled: dict[str, bool]) -> None:
         raw = {}
     sources: dict[str, Any] = raw.setdefault("sources", {})
     for src, val in enabled.items():
-        sources.setdefault(src, {})["enabled"] = val
+        src_cfg = sources.setdefault(src, {})
+        src_cfg["enabled"] = val
+        if src in _SOURCE_PATH_FIELDS:
+            extra = src_cfg.setdefault("extra", {})
+            field = _SOURCE_PATH_FIELDS[src]
+            path_value = paths.get(src, "").strip()
+            if path_value:
+                extra[field] = path_value
+            else:
+                extra.pop(field, None)
     with _SOURCES_CFG.open("w") as f:
         yaml.safe_dump(raw, f, default_flow_style=False)
 
@@ -126,6 +148,9 @@ class PbdataGUI:
         self._src_enabled: dict[str, tk.BooleanVar] = {
             s: tk.BooleanVar() for s in _SOURCES
         }
+        self._src_path_vars: dict[str, tk.StringVar] = {
+            s: tk.StringVar(value="") for s in _SOURCE_PATH_FIELDS
+        }
 
         # Criteria vars
         self._method_vars: dict[str, tk.BooleanVar] = {
@@ -138,6 +163,8 @@ class PbdataGUI:
             "mutation_ddg":    tk.BooleanVar(value=False),
         }
         self._keyword_query_var    = tk.StringVar(value="")
+        self._organism_name_var    = tk.StringVar(value="")
+        self._taxonomy_id_var      = tk.StringVar(value="")
         self._require_protein_var = tk.BooleanVar(value=True)
         self._require_ligand_var  = tk.BooleanVar(value=False)
         self._min_protein_entities_var = tk.StringVar(value="")
@@ -197,6 +224,7 @@ class PbdataGUI:
     def _build_sources_panel(self, parent: tk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Data Sources", padding=12)
         frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        frame.columnconfigure(1, weight=1)
 
         cols = 2
         for i, src in enumerate(_SOURCES):
@@ -204,9 +232,23 @@ class PbdataGUI:
                 frame, text=src.upper(), variable=self._src_enabled[src]
             ).grid(row=i // cols, column=i % cols, sticky="w", padx=4, pady=2)
 
+        row = (len(_SOURCES) + cols - 1) // cols + 1
+        for src, label in [
+            ("pdbbind", "PDBbind dir"),
+            ("biolip", "BioLiP dir"),
+            ("skempi", "SKEMPI file"),
+        ]:
+            ttk.Label(frame, text=f"{label}:").grid(
+                row=row, column=0, sticky="w", padx=4, pady=(6, 0)
+            )
+            ttk.Entry(frame, textvariable=self._src_path_vars[src]).grid(
+                row=row, column=1, sticky="ew", padx=4, pady=(6, 0)
+            )
+            row += 1
+
         ttk.Button(
             frame, text="Save Config", command=self._save_sources
-        ).grid(row=(len(_SOURCES) + 1) // cols + 1, column=0, columnspan=2,
+        ).grid(row=row, column=0, columnspan=2,
                sticky="ew", pady=(8, 0))
 
     def _build_criteria_panel(self, parent: tk.Frame) -> None:
@@ -241,6 +283,22 @@ class PbdataGUI:
         )
         ttk.Entry(frame, textvariable=self._keyword_query_var).grid(
             row=row, column=1, sticky="ew", padx=(6, 0)
+        )
+        row += 1
+
+        ttk.Label(frame, text="Organism name:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(frame, textvariable=self._organism_name_var).grid(
+            row=row, column=1, sticky="ew", padx=(6, 0), pady=(6, 0)
+        )
+        row += 1
+
+        ttk.Label(frame, text="NCBI taxonomy ID:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(frame, textvariable=self._taxonomy_id_var, width=12).grid(
+            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
         )
         row += 1
 
@@ -459,17 +517,24 @@ class PbdataGUI:
     # ------------------------------------------------------------------
 
     def _load_sources_into_ui(self) -> None:
-        enabled = _load_sources_enabled()
+        enabled, paths = _load_sources_config()
         for src, var in self._src_enabled.items():
             var.set(enabled.get(src, False))
+        for src, var in self._src_path_vars.items():
+            var.set(paths.get(src, ""))
 
     def _save_sources(self) -> None:
-        _save_sources_enabled({s: v.get() for s, v in self._src_enabled.items()})
+        _save_sources_config(
+            {s: v.get() for s, v in self._src_enabled.items()},
+            {s: v.get() for s, v in self._src_path_vars.items()},
+        )
         self._log_line("Source config saved.")
 
     def _load_criteria_into_ui(self) -> None:
         sc = load_criteria(_CRITERIA_PATH)
         self._keyword_query_var.set(sc.keyword_query or "")
+        self._organism_name_var.set(sc.organism_name_query or "")
+        self._taxonomy_id_var.set("" if sc.taxonomy_id is None else str(sc.taxonomy_id))
         for key, var in self._method_vars.items():
             var.set(key in sc.experimental_methods)
         self._resolution_var.set(resolution_value_to_label(sc.max_resolution_angstrom))
@@ -490,16 +555,21 @@ class PbdataGUI:
         methods = [k for k, v in self._method_vars.items() if v.get()]
         task_types = [k for k, v in self._task_vars.items() if v.get()]
         keyword_query = self._keyword_query_var.get().strip() or None
+        organism_name_query = self._organism_name_var.get().strip() or None
+        taxonomy_str = self._taxonomy_id_var.get().strip()
         min_protein_str = self._min_protein_entities_var.get().strip()
         max_atom_str = self._max_atom_count_var.get().strip()
         min_year_str = self._min_year_var.get().strip()
         max_year_str = self._max_year_var.get().strip()
+        taxonomy_id: int | None = int(taxonomy_str) if taxonomy_str.isdigit() else None
         min_protein_entities: int | None = int(min_protein_str) if min_protein_str.isdigit() else None
         max_deposited_atom_count: int | None = int(max_atom_str) if max_atom_str.isdigit() else None
         min_year: int | None = int(min_year_str) if min_year_str.isdigit() else None
         max_year: int | None = int(max_year_str) if max_year_str.isdigit() else None
         return SearchCriteria(
             keyword_query=keyword_query,
+            organism_name_query=organism_name_query,
+            taxonomy_id=taxonomy_id,
             experimental_methods=methods,
             max_resolution_angstrom=resolution_label_to_value(self._resolution_var.get()),
             task_types=task_types,

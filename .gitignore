@@ -14,8 +14,15 @@ data/interim/*
 data/processed/*
 data/external/*
 data/reports/*
+data/structures/*
+data/extracted/*
+data/splits/*
+data/audit/*
+data/catalog/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
 !data/external/.gitkeep
 !data/reports/.gitkeep
+!data/structures/.gitkeep
+!data/extracted/.gitkeep
