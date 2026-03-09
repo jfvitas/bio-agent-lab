@@ -1,14 +1,20 @@
 """Tests for the multi-table extraction pipeline."""
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
 from unittest.mock import patch
+from unittest.mock import Mock
 
+import gemmi
 from typer.testing import CliRunner
 
 from pbdata.cli import app
 from pbdata.gui import _SUBPROCESS_STAGES
+from pbdata.gui import PbdataGUI
+from pbdata.gui import build_filtered_review_rows
+from pbdata.gui import build_review_health_summary
 from pbdata.pipeline.assay_merge import pair_identity_key
 from pbdata.pipeline.extract import extract_rcsb_entry
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
@@ -29,6 +35,44 @@ def _tmp_dir(name: str) -> Path:
     path = _LOCAL_TMP / f"{uuid4().hex}_{name}"
     path.mkdir(exist_ok=True)
     return path
+
+
+def _write_minimal_microstate_cif(path: Path) -> None:
+    structure = gemmi.Structure()
+    structure.name = "1ABC"
+    model = gemmi.Model("1")
+
+    chain = gemmi.Chain("A")
+    for seq_num, residue_name, atom_name, element, pos in [
+        (10, "ASP", "CG", "C", (0.0, 0.0, 0.0)),
+        (11, "GLU", "CD", "C", (3.1, 0.0, 0.0)),
+        (12, "LYS", "NZ", "N", (5.0, 0.0, 0.0)),
+    ]:
+        residue = gemmi.Residue()
+        residue.name = residue_name
+        residue.seqid = gemmi.SeqId(str(seq_num))
+        atom = gemmi.Atom()
+        atom.name = atom_name
+        atom.element = gemmi.Element(element)
+        atom.pos = gemmi.Position(*pos)
+        residue.add_atom(atom)
+        chain.add_residue(residue)
+    model.add_chain(chain)
+
+    metal_chain = gemmi.Chain("Z")
+    residue = gemmi.Residue()
+    residue.name = "ZN"
+    residue.seqid = gemmi.SeqId("1")
+    atom = gemmi.Atom()
+    atom.name = "ZN"
+    atom.element = gemmi.Element("Zn")
+    atom.pos = gemmi.Position(0.8, 0.0, 0.0)
+    residue.add_atom(atom)
+    metal_chain.add_residue(residue)
+    model.add_chain(metal_chain)
+
+    structure.add_model(model)
+    structure.make_mmcif_document().write_file(str(path))
 
 
 def _mock_entry(pdb_id="1ABC"):
@@ -136,6 +180,10 @@ def test_entry_record_fields(mock_download):
     assert entry.parsed_structure_format == "mmCIF"
     assert entry.resolution_bin == "medium_res_1.5-2.5"
     assert entry.membrane_vs_soluble == "soluble"
+    assert entry.field_provenance is not None
+    assert entry.field_confidence is not None
+    assert entry.field_provenance["taxonomy_ids"]["method"] == "GraphQL_batch_API_entity_organism"
+    assert entry.field_confidence["metal_present"] == "medium"
 
 
 @patch("pbdata.pipeline.extract.download_structure_files")
@@ -240,6 +288,290 @@ def test_extract_can_skip_structure_downloads(mock_download):
 def test_gui_pipeline_includes_extract_stage() -> None:
     assert _SUBPROCESS_STAGES[0] == "extract"
     assert "extract" in _SUBPROCESS_STAGES
+    assert "build-graph" in _SUBPROCESS_STAGES
+    assert "build-microstates" in _SUBPROCESS_STAGES
+    assert "build-physics-features" in _SUBPROCESS_STAGES
+    assert "build-features" in _SUBPROCESS_STAGES
+    assert "build-training-examples" in _SUBPROCESS_STAGES
+    assert "build-splits" in _SUBPROCESS_STAGES
+    assert "build-custom-training-set" in _SUBPROCESS_STAGES
+    assert "build-release" in _SUBPROCESS_STAGES
+
+
+def test_gui_stage_command_includes_storage_root_and_workers() -> None:
+    class _Var:
+        def __init__(self, value):
+            self._value = value
+
+        def get(self):
+            return self._value
+
+        def set(self, value):
+            self._value = value
+
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._storage_root_var = _Var(r"C:\tmp\pbdata-root")
+    gui._workers_var = _Var("4")
+    gui._split_mode_var = _Var("pair-aware")
+    gui._download_structures_var = _Var(True)
+    gui._download_pdb_var = _Var(True)
+    gui._train_frac_var = _Var("0.70")
+    gui._val_frac_var = _Var("0.15")
+    gui._split_seed_var = _Var("42")
+    gui._hash_only_var = _Var(False)
+    gui._jaccard_threshold_var = _Var("0.30")
+    gui._release_tag_var = _Var("release-20260308")
+    gui._custom_set_mode_var = _Var("generalist")
+    gui._custom_set_target_size_var = _Var("250")
+    gui._custom_set_seed_var = _Var("9")
+    gui._custom_set_cluster_cap_var = _Var("2")
+    cmd = gui._build_stage_cmd("extract")
+
+    assert "--storage-root" in cmd
+    assert r"C:\tmp\pbdata-root" in cmd
+    assert "--workers" in cmd
+    assert "4" in cmd
+    assert "--download-pdb" in cmd
+
+    microstate_cmd = gui._build_stage_cmd("build-microstates")
+    assert "--storage-root" in microstate_cmd
+    assert r"C:\tmp\pbdata-root" in microstate_cmd
+    physics_cmd = gui._build_stage_cmd("build-physics-features")
+    assert "--storage-root" in physics_cmd
+    assert r"C:\tmp\pbdata-root" in physics_cmd
+    split_cmd = gui._build_stage_cmd("build-splits")
+    assert "--split-mode" in split_cmd
+    assert "pair-aware" in split_cmd
+    release_cmd = gui._build_stage_cmd("build-release")
+    assert "--tag" in release_cmd
+    assert "release-20260308" in release_cmd
+    custom_cmd = gui._build_stage_cmd("build-custom-training-set")
+    assert "--mode" in custom_cmd
+    assert "generalist" in custom_cmd
+    assert "--target-size" in custom_cmd
+    assert "250" in custom_cmd
+    assert "--per-receptor-cluster-cap" in custom_cmd
+    assert "2" in custom_cmd
+
+
+def test_cli_build_microstates_and_physics_features() -> None:
+    runner = CliRunner()
+    storage_root = _tmp_dir("cli_microstates")
+    extracted = storage_root / "data" / "extracted"
+    for name in ["entry", "assays"]:
+        (extracted / name).mkdir(parents=True, exist_ok=True)
+
+    cif_path = storage_root / "data" / "structures" / "rcsb" / "1ABC.cif"
+    cif_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_minimal_microstate_cif(cif_path)
+
+    (extracted / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "structure_file_cif_path": str(cif_path),
+    }), encoding="utf-8")
+    (extracted / "assays" / "1ABC.json").write_text(json.dumps([{
+        "pdb_id": "1ABC",
+        "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+        "binding_affinity_type": "Kd",
+    }]), encoding="utf-8")
+
+    result = runner.invoke(app, ["--storage-root", str(storage_root), "build-microstates"])
+    assert result.exit_code == 0
+    assert (storage_root / "data" / "features" / "microstates" / "microstate_records.json").exists()
+
+    result = runner.invoke(app, ["--storage-root", str(storage_root), "build-physics-features"])
+    assert result.exit_code == 0
+    assert (storage_root / "data" / "features" / "physics" / "physics_feature_records.json").exists()
+
+
+def test_gui_criteria_from_ui_includes_branched_and_assembly_filters() -> None:
+    class _Var:
+        def __init__(self, value):
+            self._value = value
+
+        def get(self):
+            return self._value
+
+        def set(self, value):
+            self._value = value
+
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._method_vars = {"xray": _Var(True), "em": _Var(False), "nmr": _Var(False), "neutron": _Var(False)}
+    gui._task_vars = {
+        "protein_ligand": _Var(True),
+        "protein_protein": _Var(False),
+        "mutation_ddg": _Var(False),
+    }
+    gui._pdb_ids_var = _Var("1abc, 2def")
+    gui._keyword_query_var = _Var("")
+    gui._organism_name_var = _Var("")
+    gui._taxonomy_id_var = _Var("")
+    gui._resolution_var = _Var("3.0 Å")
+    gui._membrane_only_var = _Var(False)
+    gui._require_multimer_var = _Var(False)
+    gui._require_protein_var = _Var(True)
+    gui._require_ligand_var = _Var(True)
+    gui._require_branched_entities_var = _Var(True)
+    gui._min_protein_entities_var = _Var("1")
+    gui._min_nonpolymer_entities_var = _Var("")
+    gui._max_nonpolymer_entities_var = _Var("")
+    gui._min_branched_entities_var = _Var("1")
+    gui._max_branched_entities_var = _Var("3")
+    gui._min_assembly_count_var = _Var("1")
+    gui._max_assembly_count_var = _Var("4")
+    gui._max_atom_count_var = _Var("")
+    gui._min_year_var = _Var("")
+    gui._max_year_var = _Var("")
+
+    criteria = gui._criteria_from_ui()
+
+    assert criteria.direct_pdb_ids == ["1ABC", "2DEF"]
+    assert criteria.require_branched_entities is True
+    assert criteria.min_branched_entities == 1
+    assert criteria.max_branched_entities == 3
+    assert criteria.min_assembly_count == 1
+    assert criteria.max_assembly_count == 4
+
+
+def test_gui_refresh_review_exports_logs_conflict_csv() -> None:
+    class _Var:
+        def __init__(self, value):
+            self._value = value
+
+        def get(self):
+            return self._value
+
+        def set(self, value):
+            self._value = value
+
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._storage_root_var = _Var(r"C:\tmp\pbdata-root")
+    gui._log_line = Mock()
+    gui._refresh_overview = Mock()
+    gui._storage_layout = Mock(return_value=Mock())
+
+    with patch("pbdata.master_export.refresh_master_exports", return_value={
+        "master_csv": "C:/repo/master_pdb_repository.csv",
+        "pair_csv": "C:/repo/master_pdb_pairs.csv",
+        "issue_csv": "C:/repo/master_pdb_issues.csv",
+        "conflict_csv": "C:/repo/master_pdb_conflicts.csv",
+        "source_state_csv": "C:/repo/master_source_state.csv",
+        "model_ready_pairs_csv": "C:/repo/model_ready_pairs.csv",
+        "release_manifest_json": "C:/repo/dataset_release_manifest.json",
+        "split_summary_csv": "C:/repo/split_summary.csv",
+        "scientific_coverage_json": "C:/repo/scientific_coverage_summary.json",
+    }):
+        gui._refresh_review_exports()
+
+    logged = " ".join(call.args[0] for call in gui._log_line.call_args_list)
+    assert "master_pdb_conflicts.csv" in logged
+    assert "master_source_state.csv" in logged
+    assert "model_ready_pairs.csv" in logged
+    assert "dataset_release_manifest.json" in logged
+    assert "scientific_coverage_summary.json" in logged
+    gui._refresh_overview.assert_called_once()
+
+
+def test_build_filtered_review_rows_applies_conflict_and_flag_filters() -> None:
+    master_rows = [{
+        "pdb_id": "1ABC",
+        "title": "Example",
+        "metal_present": "true",
+        "cofactor_present": "false",
+        "glycan_present": "true",
+        "membrane_vs_soluble": "membrane",
+        "quality_flags": "glycan_present",
+        "field_confidence_json": "{\"membrane_vs_soluble\": \"medium\"}",
+    }]
+    pair_rows = [{
+        "pdb_id": "1ABC",
+        "pair_identity_key": "protein_ligand|1ABC|A|ATP|mutation_unknown:1",
+        "source_conflict_flag": "true",
+        "source_conflict_summary": "high_conflict_spread=1.200",
+        "source_agreement_band": "low",
+        "selected_preferred_source": "PDBbind",
+        "binding_affinity_type": "Kd",
+        "assay_field_confidence_json": "{\"binding_affinity_value\": \"low\"}",
+    }]
+    issue_rows = [{
+        "pdb_id": "1ABC",
+        "pair_identity_key": "protein_ligand|1ABC|A|ATP|mutation_unknown:1",
+        "issue_type": "ambiguous_mutation_context",
+        "details": "mutation_unknown",
+    }]
+
+    rows = build_filtered_review_rows(
+        master_rows,
+        pair_rows,
+        issue_rows,
+        conflict_only=True,
+        mutation_ambiguous_only=True,
+        metal_only=True,
+        glycan_only=True,
+        confidence_filter="Low",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["pdb_id"] == "1ABC"
+    assert row["source_conflict_flag"] == "true"
+    assert "ambiguous_mutation_context" in row["issue_types"]
+
+
+def test_build_filtered_review_rows_supports_entry_only_non_high_filter() -> None:
+    master_rows = [{
+        "pdb_id": "2DEF",
+        "title": "Entry only",
+        "metal_present": "false",
+        "cofactor_present": "true",
+        "glycan_present": "false",
+        "membrane_vs_soluble": "soluble",
+        "quality_flags": "",
+        "field_confidence_json": "{\"oligomeric_state\": \"medium\"}",
+    }]
+
+    rows = build_filtered_review_rows(
+        master_rows,
+        [],
+        [{
+            "pdb_id": "2DEF",
+            "pair_identity_key": "",
+            "issue_type": "non_high_confidence_fields",
+            "details": "oligomeric_state",
+        }],
+        confidence_filter="Non-high",
+        cofactor_only=True,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["scope"] == "entry"
+    assert rows[0]["pdb_id"] == "2DEF"
+
+
+def test_build_review_health_summary_prioritizes_conflicts() -> None:
+    summary = build_review_health_summary({
+        "counts": {
+            "entry_count": 12,
+            "pair_count": 20,
+            "model_ready_pair_count": 8,
+            "pairs_with_source_conflicts": 3,
+            "entries_with_structure_file": 11,
+        },
+        "coverage": {
+            "issue_types": {
+                "missing_structure_file": 1,
+                "non_high_confidence_fields": 2,
+                "non_high_confidence_assay_fields": 4,
+            },
+        },
+        "release": {
+            "model_ready_exclusion_count": 5,
+        },
+    })
+
+    assert summary["readiness"] == "Partially ready"
+    assert "3 conflicted pairs" in summary["quality"]
+    assert "master_pdb_conflicts.csv" in summary["next_action"]
 
 
 def test_cli_extract_no_download_structures_passes_flag() -> None:
@@ -276,6 +608,67 @@ def test_cli_extract_no_download_structures_passes_flag() -> None:
 
     assert result.exit_code == 0
     assert captured == [False]
+
+
+def test_cli_extract_respects_storage_root() -> None:
+    tmp_root = _tmp_dir("extract_storage_root")
+    storage_root = tmp_root / "custom-root"
+    raw_dir = storage_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "1ABC.json").write_text('{"rcsb_id":"1ABC","nonpolymer_entities":[]}', encoding="utf-8")
+
+    written_outputs: list[Path] = []
+
+    def _fake_extract_rcsb_entry(*_args, **_kwargs):
+        return {
+            "entry": EntryRecord(source_database="RCSB", source_record_id="1ABC", pdb_id="1ABC"),
+            "chains": [],
+            "bound_objects": [],
+            "interfaces": [],
+            "assays": [],
+            "provenance": [],
+        }
+
+    def _fake_write_records_json(_records, output_dir):
+        written_outputs.append(output_dir)
+
+    runner = CliRunner()
+    original_cwd = Path.cwd()
+    os.chdir(tmp_root)
+    try:
+        with patch(
+            "pbdata.cli._load_external_assay_samples", return_value={}
+        ), patch(
+            "pbdata.pipeline.extract.extract_rcsb_entry", side_effect=_fake_extract_rcsb_entry
+        ), patch(
+            "pbdata.pipeline.extract.write_records_json", side_effect=_fake_write_records_json
+        ):
+            result = runner.invoke(
+                app,
+                ["--storage-root", str(storage_root), "extract", "--no-download-structures"],
+                catch_exceptions=False,
+            )
+    finally:
+        os.chdir(original_cwd)
+
+    assert result.exit_code == 0
+    assert written_outputs == [storage_root / "data" / "extracted"]
+
+
+def test_gui_close_terminates_active_processes() -> None:
+    proc = Mock()
+    proc.poll.side_effect = [None, 0, 0]
+    root = Mock()
+
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._root = root
+    gui._active_processes = {proc}
+    gui._closing = False
+
+    gui._on_close()
+
+    proc.terminate.assert_called_once()
+    root.destroy.assert_called_once()
 
 
 @patch("pbdata.pipeline.extract.download_structure_files")

@@ -57,6 +57,7 @@ def test_load_config_empty_yaml() -> None:
     empty.write_text("")
     cfg = load_config(empty)
     assert isinstance(cfg, AppConfig)
+    assert cfg.storage_root is None
 
 
 # ---------------------------------------------------------------------------

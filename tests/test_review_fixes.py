@@ -3,7 +3,11 @@ from uuid import uuid4
 
 import pytest
 
-from pbdata.dataset.splits import build_splits, cluster_aware_split
+import json
+from typer.testing import CliRunner
+
+from pbdata.cli import app
+from pbdata.dataset.splits import PairSplitItem, build_pair_aware_splits, build_splits, cluster_aware_split
 from pbdata.gui import _call_on_tk_thread
 from pbdata.sources import rcsb_search
 
@@ -140,3 +144,87 @@ def test_call_on_tk_thread_reraises_exceptions() -> None:
 
     with pytest.raises(RuntimeError, match="ui failure"):
         _call_on_tk_thread(RootStub(), lambda: (_ for _ in ()).throw(RuntimeError("ui failure")))
+
+
+def test_pair_aware_splits_keep_wildtype_and_mutant_together() -> None:
+    items = [
+        PairSplitItem(
+            item_id="ex1",
+            pair_identity_key="protein_ligand|1ABC|A|ATP|wt",
+            affinity_type="Kd",
+            receptor_sequence="M" * 250,
+            receptor_identity="P12345",
+            representation_key="protein_ligand|Kd|wildtype|has_sequence",
+            hard_group_key="protein_ligand|P12345|ATP",
+        ),
+        PairSplitItem(
+            item_id="ex2",
+            pair_identity_key="protein_ligand|2DEF|A|ATP|A42V",
+            affinity_type="Kd",
+            receptor_sequence="M" * 249 + "A",
+            receptor_identity="P12345",
+            representation_key="protein_ligand|Kd|mutant|has_sequence",
+            hard_group_key="protein_ligand|P12345|ATP",
+        ),
+        PairSplitItem(
+            item_id="ex3",
+            pair_identity_key="protein_ligand|3GHI|A|GTP|wt",
+            affinity_type="Ki",
+            receptor_sequence="Q" * 240,
+            receptor_identity="Q99999",
+            representation_key="protein_ligand|Ki|wildtype|has_sequence",
+            hard_group_key="protein_ligand|Q99999|GTP",
+        ),
+    ]
+
+    result, metadata = build_pair_aware_splits(
+        items,
+        train_frac=0.5,
+        val_frac=0.25,
+        seed=42,
+        log_fn=lambda _msg: None,
+    )
+
+    placements = {
+        "train": set(result.train),
+        "val": set(result.val),
+        "test": set(result.test),
+    }
+    assert any({"ex1", "ex2"}.issubset(ids) for ids in placements.values())
+    assert metadata["hard_group_count"] == 2
+
+
+def test_build_splits_auto_uses_pair_aware_training_examples() -> None:
+    tmp_root = _tmp_dir("pair_aware_cli")
+    extracted = tmp_root / "data" / "extracted"
+    training = tmp_root / "data" / "training_examples"
+    for name in ["assays", "chains"]:
+        (extracted / name).mkdir(parents=True, exist_ok=True)
+    training.mkdir(parents=True, exist_ok=True)
+
+    (extracted / "chains" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "chain_id": "A", "polymer_sequence": "M" * 220, "uniprot_id": "P12345"},
+        {"pdb_id": "2DEF", "chain_id": "A", "polymer_sequence": "M" * 219 + "A", "uniprot_id": "P12345"},
+    ]), encoding="utf-8")
+    (extracted / "assays" / "pairs.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt", "binding_affinity_type": "Kd"},
+        {"pdb_id": "2DEF", "pair_identity_key": "protein_ligand|2DEF|A|ATP|A42V", "binding_affinity_type": "Kd"},
+    ]), encoding="utf-8")
+    (training / "training_examples.json").write_text(json.dumps([
+        {"example_id": "ex1", "provenance": {"pair_identity_key": "protein_ligand|1ABC|A|ATP|wt"}, "labels": {"affinity_type": "Kd"}},
+        {"example_id": "ex2", "provenance": {"pair_identity_key": "protein_ligand|2DEF|A|ATP|A42V"}, "labels": {"affinity_type": "Kd"}},
+    ]), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "build-splits"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["strategy"] == "pair_aware_grouped"
+    train_ids = set((tmp_root / "data" / "splits" / "train.txt").read_text(encoding="utf-8").split())
+    val_ids = set((tmp_root / "data" / "splits" / "val.txt").read_text(encoding="utf-8").split())
+    test_ids = set((tmp_root / "data" / "splits" / "test.txt").read_text(encoding="utf-8").split())
+    assert any({"ex1", "ex2"}.issubset(ids) for ids in (train_ids, val_ids, test_ids))

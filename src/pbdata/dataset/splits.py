@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from pbdata.pairing import ParsedPairKey, parse_pair_identity_key
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -53,6 +54,17 @@ class SplitResult:
         return {"train": len(self.train), "val": len(self.val), "test": len(self.test)}
 
 
+@dataclass(frozen=True)
+class PairSplitItem:
+    item_id: str
+    pair_identity_key: str
+    affinity_type: str | None
+    receptor_sequence: str | None
+    receptor_identity: str
+    representation_key: str
+    hard_group_key: str
+
+
 def _validate_split_fractions(train_frac: float, val_frac: float) -> None:
     if not 0.0 <= train_frac <= 1.0:
         raise ValueError(f"train_frac must be in [0.0, 1.0], got {train_frac}")
@@ -62,6 +74,27 @@ def _validate_split_fractions(train_frac: float, val_frac: float) -> None:
         raise ValueError(
             f"train_frac + val_frac must be <= 1.0, got {train_frac + val_frac}"
         )
+
+
+def _normalize_mutation_key(parsed_pair: ParsedPairKey | None) -> str:
+    raw = (parsed_pair.mutation_key if parsed_pair is not None else None) or "wt_or_unspecified"
+    value = raw.strip().lower()
+    if value in {"wt", "wildtype", "wt_or_unspecified"}:
+        return "wildtype_family"
+    if value.startswith("mutation_unknown"):
+        return "mutation_unknown_family"
+    return "mutant_family"
+
+
+def _bucket_sequence_length(seq: str | None) -> str:
+    if not seq:
+        return "seq_unknown"
+    n = len(seq)
+    if n < 150:
+        return "seq_short"
+    if n < 400:
+        return "seq_medium"
+    return "seq_long"
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +283,129 @@ def cluster_aware_split(
             result.test.extend(ids)
 
     return result
+
+
+def build_pair_aware_splits(
+    items: list[PairSplitItem],
+    *,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+    seed: int = 42,
+    k: int = 5,
+    threshold: float = 0.30,
+    max_candidates: int = 500,
+    log_fn: object = print,
+) -> tuple[SplitResult, dict[str, object]]:
+    """Hierarchical split with hard leakage groups first, sequence clusters second.
+
+    Method:
+    1. Collapse rows into hard groups that keep the same biological pair family
+       together. Mutation variants of the same pair stay in the same hard group.
+    2. Cluster hard groups by receptor-sequence similarity.
+    3. Assign whole sequence clusters to train/val/test while roughly balancing
+       representation buckets.
+    """
+    _validate_split_fractions(train_frac, val_frac)
+    if not items:
+        return SplitResult(), {
+            "mode": "pair_aware",
+            "hard_group_count": 0,
+            "sequence_cluster_count": 0,
+            "representation_counts": {},
+        }
+
+    hard_groups: dict[str, list[PairSplitItem]] = defaultdict(list)
+    for item in items:
+        hard_groups[item.hard_group_key].append(item)
+
+    group_ids = sorted(hard_groups)
+    group_sequences: list[str | None] = []
+    group_representation: dict[str, str] = {}
+    group_sizes: dict[str, int] = {}
+    for group_id in group_ids:
+        rows = hard_groups[group_id]
+        representative = max(rows, key=lambda row: len(row.receptor_sequence or ""))
+        group_sequences.append(representative.receptor_sequence)
+        group_representation[group_id] = representative.representation_key
+        group_sizes[group_id] = len(rows)
+
+    log_fn(
+        f"Pair-aware grouping: {len(items):,} rows -> {len(group_ids):,} hard groups "
+        f"(threshold={threshold}, k={k})."
+    )
+    group_cluster_map = _cluster_sequences(
+        group_ids,
+        group_sequences,
+        k=k,
+        threshold=threshold,
+        max_candidates=max_candidates,
+    )
+
+    cluster_to_group_ids: dict[int, list[str]] = defaultdict(list)
+    for group_id, cluster_id in group_cluster_map.items():
+        cluster_to_group_ids[cluster_id].append(group_id)
+
+    total_items = len(items)
+    train_target = int(total_items * train_frac)
+    val_target = int(total_items * val_frac)
+    target_sizes = {"train": train_target, "val": val_target, "test": total_items - train_target - val_target}
+
+    representation_counts_total: Counter[str] = Counter(item.representation_key for item in items)
+    split_repr_counts: dict[str, Counter[str]] = {
+        "train": Counter(),
+        "val": Counter(),
+        "test": Counter(),
+    }
+    split_sizes = {"train": 0, "val": 0, "test": 0}
+    result = SplitResult()
+
+    ordered_clusters = sorted(
+        cluster_to_group_ids.values(),
+        key=lambda ids: (
+            -sum(group_sizes[group_id] for group_id in ids),
+            hashlib.md5(f"{seed}:{ids[0]}".encode()).hexdigest(),
+            ids[0],
+        ),
+    )
+
+    def _cluster_items(group_id_list: list[str]) -> list[PairSplitItem]:
+        rows: list[PairSplitItem] = []
+        for group_id in group_id_list:
+            rows.extend(hard_groups[group_id])
+        return rows
+
+    def _cluster_score(split_name: str, cluster_rows: list[PairSplitItem]) -> tuple[float, float, str]:
+        size_after = split_sizes[split_name] + len(cluster_rows)
+        size_target = max(target_sizes[split_name], 1)
+        size_penalty = size_after / size_target
+
+        repr_penalty = 0.0
+        cluster_repr = Counter(row.representation_key for row in cluster_rows)
+        for rep_key, count in cluster_repr.items():
+            total_for_key = max(representation_counts_total.get(rep_key, 1), 1)
+            after = split_repr_counts[split_name][rep_key] + count
+            target = max(int(round(total_for_key * (target_sizes[split_name] / max(total_items, 1)))), 1)
+            repr_penalty += after / target
+        return (size_penalty, repr_penalty, split_name)
+
+    for cluster_group_ids in ordered_clusters:
+        cluster_rows = _cluster_items(cluster_group_ids)
+        split_name = min(
+            ("train", "val", "test"),
+            key=lambda name: _cluster_score(name, cluster_rows),
+        )
+        getattr(result, split_name).extend(row.item_id for row in cluster_rows)
+        split_sizes[split_name] += len(cluster_rows)
+        split_repr_counts[split_name].update(row.representation_key for row in cluster_rows)
+
+    metadata = {
+        "mode": "pair_aware",
+        "hard_group_count": len(group_ids),
+        "sequence_cluster_count": len(cluster_to_group_ids),
+        "representation_counts": dict(representation_counts_total),
+        "targets": target_sizes,
+    }
+    return result, metadata
 
 
 # ---------------------------------------------------------------------------

@@ -138,7 +138,7 @@ def _activity_to_sample(
     }
     if mutation_string is None and wt_or_mutant is None and assay_chembl_id:
         provenance["pair_grouping_override"] = (
-            f"protein_ligand|{target_chembl_id}|{molecule_chembl_id}|mutation_unknown|{assay_chembl_id}"
+            f"protein_ligand|-|-|{inchikey}|mutation_unknown:{assay_chembl_id}"
         )
 
     return CanonicalBindingSample(

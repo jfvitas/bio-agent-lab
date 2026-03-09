@@ -23,6 +23,8 @@ from typing import Any
 import gemmi
 import requests
 
+from pbdata.storage import reuse_existing_file, validate_mmcif_file, validate_pdb_file
+
 logger = logging.getLogger(__name__)
 
 _MMCIF_URL = "https://files.rcsb.org/download/{pdb_id}.cif"
@@ -82,7 +84,7 @@ def download_structure_files(
     cif_path = out_dir / f"{pdb_id}.cif"
     cif_url = _MMCIF_URL.format(pdb_id=pdb_id)
 
-    if cif_path.exists():
+    if reuse_existing_file(cif_path, validator=validate_mmcif_file):
         cif_bytes = cif_path.read_bytes()
         provenance["structure_file_cif_path"] = str(cif_path)
         provenance["structure_file_cif_size_bytes"] = len(cif_bytes)
@@ -109,7 +111,7 @@ def download_structure_files(
     if download_pdb:
         pdb_path = out_dir / f"{pdb_id}.pdb"
         pdb_url = _PDB_URL.format(pdb_id=pdb_id)
-        if pdb_path.exists():
+        if reuse_existing_file(pdb_path, validator=validate_pdb_file):
             pdb_bytes = pdb_path.read_bytes()
             provenance["structure_file_pdb_path"] = str(pdb_path)
             provenance["structure_file_pdb_size_bytes"] = len(pdb_bytes)
@@ -143,13 +145,13 @@ def fetch_mmcif_supplement(
     saved_path = struct_dir / f"{pdb_id}.cif"
 
     # Try saved structure file first
-    if saved_path.exists():
+    if reuse_existing_file(saved_path, validator=validate_mmcif_file):
         text = saved_path.read_text(encoding="utf-8")
         return parse_mmcif_supplement(text)
 
     # Fall back to legacy cache location
     legacy_path = _DEFAULT_RAW_DIR / f"{pdb_id}.cif"
-    if legacy_path.exists():
+    if reuse_existing_file(legacy_path, validator=validate_mmcif_file):
         text = legacy_path.read_text(encoding="utf-8")
         return parse_mmcif_supplement(text)
 

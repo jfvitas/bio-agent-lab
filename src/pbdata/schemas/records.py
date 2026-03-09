@@ -321,6 +321,11 @@ class AssayRecord(BaseModel):
     measurement_source_publication: str | None = None
     measurement_source_doi: str | None = None
     measurement_source_pubmed_id: str | None = None
+    source_conflict_flag: bool | None = None
+    source_conflict_summary: str | None = None
+    source_agreement_band: str | None = None
+    selected_preferred_source: str | None = None
+    selected_preferred_source_rationale: str | None = None
 
     # Mutation annotations (spec group 12)
     mutation_strings: list[str] | None = None
@@ -329,6 +334,10 @@ class AssayRecord(BaseModel):
     mutation_wt_residues: list[str] | None = None
     mutation_mut_residues: list[str] | None = None
     mutation_count: int | None = None
+
+    # Per-field provenance support for merged assay data
+    field_provenance: dict[str, Any] | None = None
+    field_confidence: dict[str, Any] | None = None
 
 
 # ── 6. Provenance record ─────────────────────────────────────────────

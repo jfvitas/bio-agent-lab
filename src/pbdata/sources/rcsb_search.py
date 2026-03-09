@@ -13,6 +13,7 @@ import requests
 
 from pbdata.catalog import DEFAULT_MANIFEST_PATH, summarize_rcsb_entry, update_download_manifest
 from pbdata.criteria import SearchCriteria
+from pbdata.storage import reuse_existing_file, validate_rcsb_raw_json
 
 _SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 _GRAPHQL_URL = "https://data.rcsb.org/graphql"
@@ -92,8 +93,18 @@ _CHEMCOMP_GQL = """
 query BatchChemComps($ids: [String!]!) {
   chem_comps(comp_ids: $ids) {
     rcsb_id
+    chem_comp {
+      formula
+      formula_weight
+      name
+    }
     rcsb_chem_comp_descriptor {
+      InChI
+      InChIKey
+    }
+    pdbx_chem_comp_descriptor {
       type
+      program
       descriptor
     }
   }
@@ -104,6 +115,25 @@ query BatchChemComps($ids: [String!]!) {
 def _build_query(criteria: SearchCriteria) -> dict[str, Any]:
     """Translate SearchCriteria into an RCSB Search API request body."""
     nodes: list[dict[str, Any]] = []
+
+    if criteria.direct_pdb_ids:
+        id_nodes = [{
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_container_identifiers.entry_id",
+                "operator": "exact_match",
+                "value": pdb_id,
+            },
+        } for pdb_id in criteria.direct_pdb_ids]
+        if len(id_nodes) == 1:
+            nodes.append(id_nodes[0])
+        else:
+            nodes.append({
+                "type": "group",
+                "logical_operator": "or",
+                "nodes": id_nodes,
+            })
 
     if criteria.keyword_query:
         nodes.append({
@@ -147,6 +177,32 @@ def _build_query(criteria: SearchCriteria) -> dict[str, Any]:
             },
         })
 
+    if criteria.membrane_only:
+        nodes.append({
+            "type": "group",
+            "logical_operator": "or",
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "struct_keywords.pdbx_keywords",
+                        "operator": "contains_phrase",
+                        "value": "membrane",
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "struct_keywords.text",
+                        "operator": "contains_phrase",
+                        "value": "membrane",
+                    },
+                },
+            ],
+        })
+
     if criteria.max_resolution_angstrom is not None:
         nodes.append({
             "type": "terminal",
@@ -179,6 +235,17 @@ def _build_query(criteria: SearchCriteria) -> dict[str, Any]:
             },
         })
 
+    if criteria.require_multimer and criteria.min_protein_entities is None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.polymer_entity_count_protein",
+                "operator": "greater_or_equal",
+                "value": 2,
+            },
+        })
+
     if criteria.require_ligand:
         nodes.append({
             "type": "terminal",
@@ -187,6 +254,83 @@ def _build_query(criteria: SearchCriteria) -> dict[str, Any]:
                 "attribute": "rcsb_entry_info.nonpolymer_entity_count",
                 "operator": "greater",
                 "value": 0,
+            },
+        })
+
+    if criteria.require_branched_entities:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.branched_entity_count",
+                "operator": "greater",
+                "value": 0,
+            },
+        })
+
+    if criteria.min_nonpolymer_entities is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.nonpolymer_entity_count",
+                "operator": "greater_or_equal",
+                "value": criteria.min_nonpolymer_entities,
+            },
+        })
+
+    if criteria.max_nonpolymer_entities is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.nonpolymer_entity_count",
+                "operator": "less_or_equal",
+                "value": criteria.max_nonpolymer_entities,
+            },
+        })
+
+    if criteria.min_branched_entities is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.branched_entity_count",
+                "operator": "greater_or_equal",
+                "value": criteria.min_branched_entities,
+            },
+        })
+
+    if criteria.max_branched_entities is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.branched_entity_count",
+                "operator": "less_or_equal",
+                "value": criteria.max_branched_entities,
+            },
+        })
+
+    if criteria.min_assembly_count is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.assembly_count",
+                "operator": "greater_or_equal",
+                "value": criteria.min_assembly_count,
+            },
+        })
+
+    if criteria.max_assembly_count is not None:
+        nodes.append({
+            "type": "terminal",
+            "service": "text",
+            "parameters": {
+                "attribute": "rcsb_entry_info.assembly_count",
+                "operator": "less_or_equal",
+                "value": criteria.max_assembly_count,
             },
         })
 
@@ -369,7 +513,15 @@ def search_and_download(
 
     for batch_start in range(0, total, _BATCH_SIZE):
         batch = pdb_ids[batch_start : batch_start + _BATCH_SIZE]
-        existing_ids = [pid for pid in batch if (output_dir / f"{pid}.json").exists()]
+        existing_ids = [
+            pid for pid in batch
+            if reuse_existing_file(
+                output_dir / f"{pid}.json",
+                validator=lambda path, expected=pid: validate_rcsb_raw_json(
+                    path, expected_pdb_id=expected,
+                ),
+            )
+        ]
         to_fetch = [pid for pid in batch if pid not in existing_ids]
         already_have = len(existing_ids)
         downloaded.extend(existing_ids)
@@ -463,11 +615,26 @@ def fetch_chemcomp_descriptors(comp_ids: list[str]) -> dict[str, dict[str, str]]
             for entry in body.get("data", {}).get("chem_comps") or []:
                 cid = str(entry.get("rcsb_id") or "")
                 descriptors: dict[str, str] = {}
-                for descriptor in entry.get("rcsb_chem_comp_descriptor") or []:
-                    dtype = descriptor.get("type", "")
-                    dval = descriptor.get("descriptor", "")
-                    if dtype and dval:
-                        descriptors[str(dtype)] = str(dval)
+                chem_comp = entry.get("chem_comp") or {}
+                if chem_comp.get("formula"):
+                    descriptors["formula"] = str(chem_comp["formula"])
+                if chem_comp.get("formula_weight") is not None:
+                    descriptors["formula_weight"] = str(chem_comp["formula_weight"])
+
+                rcsb_descriptor = entry.get("rcsb_chem_comp_descriptor") or {}
+                if rcsb_descriptor.get("InChI"):
+                    descriptors["InChI"] = str(rcsb_descriptor["InChI"])
+                if rcsb_descriptor.get("InChIKey"):
+                    descriptors["InChIKey"] = str(rcsb_descriptor["InChIKey"])
+
+                for descriptor in entry.get("pdbx_chem_comp_descriptor") or []:
+                    dtype = str(descriptor.get("type") or "")
+                    dval = str(descriptor.get("descriptor") or "")
+                    if not dtype or not dval:
+                        continue
+                    descriptors[dtype] = dval
+                    if dtype == "SMILES_CANONICAL" and "SMILES" not in descriptors:
+                        descriptors["SMILES"] = dval
                 if cid:
                     result[cid] = descriptors
         except Exception as exc:

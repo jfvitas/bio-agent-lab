@@ -12,14 +12,62 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict
 
+from pbdata.pairing import chain_group_key
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
 from pbdata.schemas.records import AssayRecord
 
+_SOURCE_PRIORITY = {
+    "SKEMPI": 1,
+    "PDBbind": 2,
+    "BioLiP": 3,
+    "BindingDB": 4,
+    "ChEMBL": 5,
+}
 
-def _chain_group_key(chains: list[str] | None) -> str:
-    if not chains:
-        return "-"
-    return ",".join(sorted({c.strip() for c in chains if c and c.strip()}))
+
+def _preferred_source(rows: list[AssayRecord]) -> str | None:
+    ordered = sorted(
+        {
+            row.source_database
+            for row in rows
+            if row.source_database
+        },
+        key=lambda name: (_SOURCE_PRIORITY.get(str(name), 99), str(name)),
+    )
+    return ordered[0] if ordered else None
+
+
+def _preferred_source_rationale(
+    rows: list[AssayRecord],
+    preferred_source: str | None,
+) -> str | None:
+    if not preferred_source:
+        return None
+    source_names = sorted({str(row.source_database) for row in rows if row.source_database})
+    if len(source_names) <= 1:
+        return f"single_source:{preferred_source}"
+    priority = _SOURCE_PRIORITY.get(preferred_source, 99)
+    return (
+        f"priority_policy:selected={preferred_source};priority={priority};"
+        f"candidates={','.join(source_names)}"
+    )
+
+
+def _conflict_metadata(rows: list[AssayRecord]) -> tuple[bool, str | None, str | None]:
+    log10_values = [
+        float(row.binding_affinity_log10_standardized)
+        for row in rows
+        if row.binding_affinity_log10_standardized is not None
+    ]
+    if len(log10_values) < 2:
+        return False, None, None
+
+    spread = max(log10_values) - min(log10_values)
+    if spread < 0.3:
+        return False, "agreement_within_0.3_log10", "high"
+    if spread < 1.0:
+        return True, f"moderate_conflict_spread={spread:.3f}", "medium"
+    return True, f"high_conflict_spread={spread:.3f}", "low"
 
 
 def pair_identity_key(sample: CanonicalBindingSample) -> str:
@@ -36,15 +84,15 @@ def pair_identity_key(sample: CanonicalBindingSample) -> str:
         return "|".join([
             sample.task_type,
             sample.pdb_id or "-",
-            _chain_group_key(sample.chain_ids_receptor),
+            chain_group_key(sample.chain_ids_receptor),
             ligand_key,
             mutation_key,
         ])
 
     if sample.task_type == "protein_protein":
         groups = sorted([
-            _chain_group_key(sample.chain_ids_receptor),
-            _chain_group_key(sample.chain_ids_partner),
+            chain_group_key(sample.chain_ids_receptor),
+            chain_group_key(sample.chain_ids_partner),
         ])
         return "|".join([
             sample.task_type,
@@ -67,6 +115,13 @@ def canonical_sample_to_assay_record(sample: CanonicalBindingSample) -> AssayRec
     delta_g = sample.assay_value if assay_type == "dG" else None
     delta_delta_g = sample.assay_value if assay_type == "ddG" else None
     provenance = sample.provenance or {}
+    source_name = sample.source_database
+    source_ref = sample.source_record_id
+    affinity_confidence = (
+        "medium"
+        if (sample.wildtype_or_mutant is None and sample.mutation_string is None)
+        else "high"
+    )
     return AssayRecord(
         pdb_id=sample.pdb_id,
         source_database=sample.source_database,
@@ -89,6 +144,41 @@ def canonical_sample_to_assay_record(sample: CanonicalBindingSample) -> AssayRec
         assay_notes=provenance.get("target_name") or provenance.get("raw_affinity_text"),
         mutation_strings=[sample.mutation_string] if sample.mutation_string else None,
         mutation_count=1 if sample.mutation_string else 0,
+        field_provenance={
+            "pair_identity_key": {
+                "source": source_name,
+                "source_record_id": source_ref,
+                "method": "pair_identity_key_builder",
+                "override_used": bool(provenance.get("pair_grouping_override")),
+            },
+            "binding_affinity_value": {
+                "source": source_name,
+                "source_record_id": source_ref,
+                "method": "canonical_sample_direct",
+            },
+            "binding_affinity_type": {
+                "source": source_name,
+                "source_record_id": source_ref,
+                "method": "canonical_sample_direct",
+            },
+            "binding_affinity_log10_standardized": {
+                "source": source_name,
+                "source_record_id": source_ref,
+                "method": "canonical_sample_direct",
+            },
+            "binding_affinity_is_mutant_measurement": {
+                "source": source_name,
+                "source_record_id": source_ref,
+                "method": "mutation_annotation_projection",
+            },
+        },
+        field_confidence={
+            "pair_identity_key": "medium" if provenance.get("pair_grouping_override") else "high",
+            "binding_affinity_value": affinity_confidence,
+            "binding_affinity_type": "high" if sample.assay_type else "unknown",
+            "binding_affinity_log10_standardized": "high" if sample.assay_value_log10 is not None else "unknown",
+            "binding_affinity_is_mutant_measurement": affinity_confidence,
+        },
     )
 
 
@@ -117,11 +207,96 @@ def merge_assay_samples(samples: list[CanonicalBindingSample]) -> list[AssayReco
         ]
         summary_text = "; ".join(value_summaries) if value_summaries else None
         mean_value = round(statistics.mean(log10_values), 6) if log10_values else None
+        source_refs = sorted(
+            {
+                row.measurement_source_reference
+                for row in rows
+                if row.measurement_source_reference
+            }
+        )
+        source_dbs = sorted(
+            {
+                row.source_database
+                for row in rows
+                if row.source_database
+            }
+        )
+        conflict_flag, conflict_summary, agreement_band = _conflict_metadata(rows)
+        preferred_source = _preferred_source(rows)
+        preferred_source_rationale = _preferred_source_rationale(rows, preferred_source)
 
         for row in rows:
+            field_provenance = dict(row.field_provenance or {})
+            field_confidence = dict(row.field_confidence or {})
+            field_provenance.update({
+                "reported_measurements_text": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_summary_concat",
+                },
+                "reported_measurement_mean_log10_standardized": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_summary_mean_log10",
+                    "input_count": len(log10_values),
+                },
+                "reported_measurement_count": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_summary_count",
+                },
+                "source_conflict_flag": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_conflict_detection_log10_spread",
+                },
+                "source_conflict_summary": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_conflict_detection_log10_spread",
+                },
+                "source_agreement_band": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "pair_group_conflict_detection_log10_spread",
+                },
+                "selected_preferred_source": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "explicit_source_priority_policy",
+                    "priority_order": _SOURCE_PRIORITY,
+                },
+                "selected_preferred_source_rationale": {
+                    "sources": source_dbs,
+                    "source_record_ids": source_refs,
+                    "method": "explicit_source_priority_policy",
+                    "priority_order": _SOURCE_PRIORITY,
+                },
+            })
+            field_confidence.update({
+                "reported_measurements_text": "high" if summary_text else "unknown",
+                "reported_measurement_mean_log10_standardized": (
+                    "high" if len(log10_values) == len(rows) and log10_values else
+                    "medium" if log10_values else
+                    "unknown"
+                ),
+                "reported_measurement_count": "high",
+                "source_conflict_flag": "high" if len(log10_values) >= 2 else "unknown",
+                "source_conflict_summary": "high" if conflict_summary else "unknown",
+                "source_agreement_band": "high" if agreement_band else "unknown",
+                "selected_preferred_source": "medium" if preferred_source else "unknown",
+                "selected_preferred_source_rationale": "high" if preferred_source_rationale else "unknown",
+            })
             merged.append(row.model_copy(update={
                 "reported_measurements_text": summary_text,
                 "reported_measurement_mean_log10_standardized": mean_value,
                 "reported_measurement_count": len(rows),
+                "source_conflict_flag": conflict_flag,
+                "source_conflict_summary": conflict_summary,
+                "source_agreement_band": agreement_band,
+                "selected_preferred_source": preferred_source,
+                "selected_preferred_source_rationale": preferred_source_rationale,
+                "field_provenance": field_provenance,
+                "field_confidence": field_confidence,
             }))
     return merged

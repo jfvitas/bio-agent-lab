@@ -311,6 +311,50 @@ def extract_rcsb_entry(
         multiligand_entry=sm_count > 1,
         mutation_present=None,  # requires UniProt enrichment
         quality_flags=quality_flags,
+        field_provenance={
+            "title": {"source": "RCSB", "method": "GraphQL_batch_API"},
+            "experimental_method": {"source": "RCSB", "method": "GraphQL_batch_API"},
+            "structure_resolution": {"source": "RCSB", "method": "GraphQL_batch_API"},
+            "taxonomy_ids": {"source": "RCSB", "method": "GraphQL_batch_API_entity_organism"},
+            "organism_names": {"source": "RCSB", "method": "GraphQL_batch_API_entity_organism"},
+            "oligomeric_state": {
+                "source": "RCSB",
+                "method": "assembly_classifier",
+                "assembly_id": assembly_info.preferred_id if assembly_info else None,
+            },
+            "homomer_or_heteromer": {
+                "source": "RCSB",
+                "method": "assembly_classifier",
+            },
+            "metal_present": {"source": "pbdata_rcsb_classify", "method": "bound_object_classification"},
+            "cofactor_present": {"source": "pbdata_rcsb_classify", "method": "bound_object_classification"},
+            "glycan_present": {"source": "pbdata_rcsb_classify", "method": "bound_object_classification"},
+            "covalent_binder_present": {"source": "pbdata_rcsb_classify", "method": "bound_object_classification"},
+            "peptide_partner_present": {"source": "pbdata_rcsb_classify", "method": "bound_object_classification"},
+            "quality_flags": {"source": "pbdata_extract", "method": "quality_flag_aggregation"},
+            "membrane_vs_soluble": {"source": "RCSB", "method": "keyword_heuristic"},
+            "structure_file_cif_path": {
+                "source": "RCSB",
+                "method": "HTTP_download" if file_prov.get("structure_file_cif_path") else None,
+            },
+        },
+        field_confidence={
+            "title": "high",
+            "experimental_method": "high",
+            "structure_resolution": "high",
+            "taxonomy_ids": "high" if tax_ids else "unknown",
+            "organism_names": "high" if org_names else "unknown",
+            "oligomeric_state": "medium" if oligo_state else "unknown",
+            "homomer_or_heteromer": "medium" if is_homo is not None else "unknown",
+            "metal_present": "medium",
+            "cofactor_present": "medium",
+            "glycan_present": "medium",
+            "covalent_binder_present": "medium",
+            "peptide_partner_present": "medium",
+            "quality_flags": "medium" if quality_flags else "unknown",
+            "membrane_vs_soluble": "medium",
+            "structure_file_cif_path": "high" if file_prov.get("structure_file_cif_path") else None,
+        },
     )
 
     # ── 2. ChainRecords ──────────────────────────────────────────────
@@ -373,6 +417,12 @@ def extract_rcsb_entry(
     # ── 3. BoundObjectRecords ────────────────────────────────────────
     bo_records: list[BoundObjectRecord] = []
     for bo in bound_objects_typed:
+        descriptor_info = chem_descriptors.get(bo.comp_id or "", {}) if chem_descriptors else {}
+        molecular_weight = _safe_float(
+            descriptor_info.get("formula_weight")
+            or descriptor_info.get("FORMULA_WEIGHT")
+            or descriptor_info.get("formulaWeight")
+        )
         # Map binder_type to spec component_type
         type_map = {
             "small_molecule": "small_molecule",
@@ -401,6 +451,7 @@ def extract_rcsb_entry(
             component_name=bo.name,
             component_smiles=bo.smiles,
             component_inchikey=bo.inchi_key,
+            component_molecular_weight=molecular_weight,
             component_type=type_map.get(bo.binder_type, "unknown"),
             component_role=role_map.get(bo.role, "unknown"),
             component_count=1,

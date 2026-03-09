@@ -31,6 +31,7 @@ class SourcesConfig(BaseModel):
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
+    storage_root: str | None = None
     sources: SourcesConfig = SourcesConfig()
 
 

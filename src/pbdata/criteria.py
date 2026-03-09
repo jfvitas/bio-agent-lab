@@ -48,6 +48,7 @@ def resolution_value_to_label(value: float | None) -> str:
 class SearchCriteria(BaseModel):
     """Criteria for filtering RCSB entries during ingestion."""
 
+    direct_pdb_ids: list[str] = Field(default_factory=list)
     keyword_query: str | None = None
     organism_name_query: str | None = None
     taxonomy_id: int | None = None
@@ -60,30 +61,81 @@ class SearchCriteria(BaseModel):
         default_factory=lambda: ["protein_ligand", "protein_protein"],
         description="protein_ligand | protein_protein | mutation_ddg",
     )
+    membrane_only: bool = False
+    require_multimer: bool = False
     require_protein: bool = True
     require_ligand: bool = False
+    require_branched_entities: bool = False
     min_protein_entities: int | None = None
+    min_nonpolymer_entities: int | None = None
+    max_nonpolymer_entities: int | None = None
+    min_branched_entities: int | None = None
+    max_branched_entities: int | None = None
+    min_assembly_count: int | None = None
+    max_assembly_count: int | None = None
     max_deposited_atom_count: int | None = None
     min_release_year: int | None = None
     max_release_year: int | None = None
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> "SearchCriteria":
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for pdb_id in self.direct_pdb_ids:
+            value = str(pdb_id).strip().upper()
+            if not value:
+                continue
+            if len(value) != 4 or not value.isalnum():
+                raise ValueError(f"direct_pdb_ids must contain 4-character PDB IDs, got {pdb_id!r}")
+            if value not in seen_ids:
+                seen_ids.add(value)
+                normalized_ids.append(value)
+        self.direct_pdb_ids = normalized_ids
         if self.taxonomy_id is not None and self.taxonomy_id <= 0:
             raise ValueError("taxonomy_id must be > 0")
         if self.min_protein_entities is not None and self.min_protein_entities < 0:
             raise ValueError("min_protein_entities must be >= 0")
+        if self.min_nonpolymer_entities is not None and self.min_nonpolymer_entities < 0:
+            raise ValueError("min_nonpolymer_entities must be >= 0")
+        if self.max_nonpolymer_entities is not None and self.max_nonpolymer_entities < 0:
+            raise ValueError("max_nonpolymer_entities must be >= 0")
+        if self.min_branched_entities is not None and self.min_branched_entities < 0:
+            raise ValueError("min_branched_entities must be >= 0")
+        if self.max_branched_entities is not None and self.max_branched_entities < 0:
+            raise ValueError("max_branched_entities must be >= 0")
+        if self.min_assembly_count is not None and self.min_assembly_count < 0:
+            raise ValueError("min_assembly_count must be >= 0")
+        if self.max_assembly_count is not None and self.max_assembly_count < 0:
+            raise ValueError("max_assembly_count must be >= 0")
         if (
             self.max_deposited_atom_count is not None
             and self.max_deposited_atom_count <= 0
         ):
             raise ValueError("max_deposited_atom_count must be > 0")
         if (
+            self.min_nonpolymer_entities is not None
+            and self.max_nonpolymer_entities is not None
+            and self.min_nonpolymer_entities > self.max_nonpolymer_entities
+        ):
+            raise ValueError("min_nonpolymer_entities cannot be greater than max_nonpolymer_entities")
+        if (
             self.min_release_year is not None
             and self.max_release_year is not None
             and self.min_release_year > self.max_release_year
         ):
             raise ValueError("min_release_year cannot be greater than max_release_year")
+        if (
+            self.min_branched_entities is not None
+            and self.max_branched_entities is not None
+            and self.min_branched_entities > self.max_branched_entities
+        ):
+            raise ValueError("min_branched_entities cannot be greater than max_branched_entities")
+        if (
+            self.min_assembly_count is not None
+            and self.max_assembly_count is not None
+            and self.min_assembly_count > self.max_assembly_count
+        ):
+            raise ValueError("min_assembly_count cannot be greater than max_assembly_count")
         return self
 
     def rcsb_method_labels(self) -> list[str]:

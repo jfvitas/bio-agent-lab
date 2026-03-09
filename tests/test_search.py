@@ -16,11 +16,21 @@ def _tmp_dir(name: str) -> Path:
 
 def test_build_query_includes_high_level_filters() -> None:
     criteria = SearchCriteria(
+        direct_pdb_ids=["1ABC", "2DEF"],
         keyword_query="kinase inhibitor",
         organism_name_query="Homo sapiens",
         taxonomy_id=9606,
+        membrane_only=True,
+        require_multimer=True,
         require_ligand=True,
+        require_branched_entities=True,
         min_protein_entities=2,
+        min_nonpolymer_entities=1,
+        max_nonpolymer_entities=5,
+        min_branched_entities=1,
+        max_branched_entities=3,
+        min_assembly_count=1,
+        max_assembly_count=4,
         max_deposited_atom_count=50000,
         min_release_year=2015,
         max_release_year=2020,
@@ -31,7 +41,15 @@ def test_build_query_includes_high_level_filters() -> None:
     assert query["type"] == "group"
 
     nodes = query["nodes"]
-    assert any(node["service"] == "full_text" for node in nodes)
+    assert any(node.get("service") == "full_text" for node in nodes)
+    assert any(
+        node.get("logical_operator") == "or"
+        and any(
+            subnode.get("parameters", {}).get("attribute") == "rcsb_entry_container_identifiers.entry_id"
+            for subnode in node.get("nodes", [])
+        )
+        for node in nodes
+    )
     assert any(
         node.get("parameters", {}).get("attribute") == "rcsb_entity_source_organism.ncbi_scientific_name"
         for node in nodes
@@ -42,10 +60,49 @@ def test_build_query_includes_high_level_filters() -> None:
     )
     assert any(
         node.get("parameters", {}).get("attribute") == "rcsb_entry_info.nonpolymer_entity_count"
+        and node.get("parameters", {}).get("operator") == "greater_or_equal"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.nonpolymer_entity_count"
+        and node.get("parameters", {}).get("operator") == "less_or_equal"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.branched_entity_count"
+        and node.get("parameters", {}).get("operator") == "greater"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.branched_entity_count"
+        and node.get("parameters", {}).get("operator") == "greater_or_equal"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.branched_entity_count"
+        and node.get("parameters", {}).get("operator") == "less_or_equal"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.assembly_count"
+        and node.get("parameters", {}).get("operator") == "greater_or_equal"
+        for node in nodes
+    )
+    assert any(
+        node.get("parameters", {}).get("attribute") == "rcsb_entry_info.assembly_count"
+        and node.get("parameters", {}).get("operator") == "less_or_equal"
         for node in nodes
     )
     assert any(
         node.get("parameters", {}).get("attribute") == "rcsb_entry_info.deposited_atom_count"
+        for node in nodes
+    )
+    assert any(
+        node.get("logical_operator") == "or"
+        and any(
+            subnode.get("parameters", {}).get("attribute") == "struct_keywords.text"
+            for subnode in node.get("nodes", [])
+        )
         for node in nodes
     )
     assert any(
@@ -103,3 +160,70 @@ def test_search_and_download_updates_manifest() -> None:
     assert "RCSB" in manifest_text
     assert "1ABC" in manifest_text
     assert "Example complex" in manifest_text
+
+
+def test_search_and_download_replaces_invalid_cached_json() -> None:
+    output_dir = _tmp_dir("rcsb_raw_replace")
+    (output_dir / "1ABC.json").write_text('{"rcsb_id":"WRONG"}', encoding="utf-8")
+
+    entry = {
+        "rcsb_id": "1ABC",
+        "rcsb_entry_info": {},
+        "polymer_entities": [],
+        "nonpolymer_entities": [],
+    }
+
+    original_search_entries = rcsb_search.search_entries
+    original_fetch_entries_batch = rcsb_search.fetch_entries_batch
+    try:
+        rcsb_search.search_entries = lambda _criteria: ["1ABC"]
+        rcsb_search.fetch_entries_batch = lambda _ids: [entry]
+        rcsb_search.search_and_download(
+            SearchCriteria(),
+            output_dir,
+            log_fn=lambda _msg: None,
+            manifest_path=_LOCAL_TMP / f"{uuid4().hex}_manifest.csv",
+        )
+    finally:
+        rcsb_search.search_entries = original_search_entries
+        rcsb_search.fetch_entries_batch = original_fetch_entries_batch
+
+    body = (output_dir / "1ABC.json").read_text(encoding="utf-8")
+    assert '"rcsb_id": "1ABC"' in body
+
+
+def test_fetch_chemcomp_descriptors_parses_current_schema() -> None:
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": {
+                    "chem_comps": [{
+                        "rcsb_id": "ATP",
+                        "chem_comp": {"formula": "C10 H16 N5 O13 P3", "formula_weight": 507.181},
+                        "rcsb_chem_comp_descriptor": {
+                            "InChI": "InChI=1S/...",
+                            "InChIKey": "AAAA-BBBB",
+                        },
+                        "pdbx_chem_comp_descriptor": [{
+                            "type": "SMILES_CANONICAL",
+                            "program": "OpenEye OEToolkits",
+                            "descriptor": "C1=NC",
+                        }],
+                    }]
+                }
+            }
+
+    original_post = rcsb_search.requests.post
+    try:
+        rcsb_search.requests.post = lambda *args, **kwargs: _Response()
+        descriptors = rcsb_search.fetch_chemcomp_descriptors(["ATP"])
+    finally:
+        rcsb_search.requests.post = original_post
+
+    assert descriptors["ATP"]["InChIKey"] == "AAAA-BBBB"
+    assert descriptors["ATP"]["SMILES_CANONICAL"] == "C1=NC"
+    assert descriptors["ATP"]["SMILES"] == "C1=NC"
+    assert descriptors["ATP"]["formula_weight"] == "507.181"

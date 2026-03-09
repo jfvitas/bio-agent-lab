@@ -3,11 +3,15 @@ sources:
     enabled: true
   bindingdb:
     enabled: false
+    extra: {}
+  biolip:
+    enabled: false
+    extra: {}
   chembl:
     enabled: false
   pdbbind:
     enabled: false
-  biolip:
-    enabled: false
+    extra: {}
   skempi:
     enabled: false
+    extra: {}

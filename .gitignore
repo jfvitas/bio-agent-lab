@@ -9,6 +9,17 @@ __pycache__/
 .pytest-tmp-sandbox/
 tests/_cif_tmp/
 tests/_tmp/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Tool-specific
+.claude/
+.codex/
+
+# Data directories (keep .gitkeep sentinels)
 data/raw/*
 data/interim/*
 data/processed/*
@@ -19,6 +30,9 @@ data/extracted/*
 data/splits/*
 data/audit/*
 data/catalog/*
+data/features/*
+data/graph/*
+data/training_examples/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/processed/.gitkeep
@@ -26,3 +40,21 @@ data/catalog/*
 !data/reports/.gitkeep
 !data/structures/.gitkeep
 !data/extracted/.gitkeep
+!data/features/.gitkeep
+!data/graph/.gitkeep
+!data/training_examples/.gitkeep
+
+# Generated output files (root level)
+canonical_entries.csv
+canonical_pairs.csv
+master_pdb_repository.csv
+master_pdb_issues.csv
+master_pdb_pairs.csv
+master_pdb_conflicts.csv
+master_source_state.csv
+model_ready_exclusions.csv
+model_ready_pairs.csv
+dataset_release_manifest.json
+split_summary.csv
+scientific_coverage_summary.json
+master_pdb_review_filtered.csv

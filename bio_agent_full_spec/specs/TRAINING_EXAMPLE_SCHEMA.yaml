@@ -1,0 +1,35 @@
+
+training_example:
+
+  structure:
+    pdb_id: str
+    chain_ids: list
+    assembly: str
+    resolution: float
+
+  protein:
+    uniprot_id: str
+    organism: str
+    gene: str
+    domains: list
+
+  ligand:
+    ligand_id: str
+    smiles: str
+    molecular_weight: float
+
+  interaction:
+    interface_residues: list
+    hydrogen_bonds: int
+    salt_bridges: int
+
+  experiment:
+    affinity_type: str
+    affinity_value: float
+    temperature: float
+    ph: float
+
+  graph_features:
+    network_degree: int
+    pathway_count: int
+

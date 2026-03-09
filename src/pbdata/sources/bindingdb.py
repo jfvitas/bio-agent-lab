@@ -17,6 +17,7 @@ This adapter enforces a 0.35s inter-request delay.
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -47,24 +48,39 @@ _ASSAY_TYPES = {"ki", "kd", "ic50", "ec50"}
 # Unit helpers
 # ---------------------------------------------------------------------------
 
-def _parse_affinity(value_str: str, unit_str: str) -> tuple[float | None, str | None, float | None]:
+def _parse_affinity(
+    value_str: str,
+    unit_str: str,
+) -> tuple[float | None, str | None, float | None, str | None]:
     """Parse raw affinity string and unit.
 
-    Returns (assay_value, assay_unit, assay_value_standardized_nM).
+    Returns (assay_value, assay_unit, assay_value_standardized_nM, relation).
     'assay_value_standardized' is the value converted to nM, or None if
     conversion is not possible.
     """
-    # Strip inequality prefixes: ">", "<", ">=", "<="
-    cleaned = value_str.strip().lstrip("<>=").strip()
+    raw_text = str(value_str or "").strip()
+    relation = None
+    if raw_text.startswith(">="):
+        relation = ">="
+    elif raw_text.startswith("<="):
+        relation = "<="
+    elif raw_text.startswith(">"):
+        relation = ">"
+    elif raw_text.startswith("<"):
+        relation = "<"
+    elif raw_text.startswith("~"):
+        relation = "approx"
+
+    cleaned = raw_text.lstrip("<>~= ").strip()
     try:
         val = float(cleaned)
     except (ValueError, TypeError):
-        return None, None, None
+        return None, None, None, relation
 
     unit = unit_str.strip().lower() if unit_str else ""
     multiplier = _TO_NM.get(unit)
     std = round(val * multiplier, 6) if multiplier is not None else None
-    return val, unit_str.strip() if unit_str else None, std
+    return val, unit_str.strip() if unit_str else None, std, relation
 
 
 # ---------------------------------------------------------------------------
@@ -96,21 +112,49 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
         return results
 
     for aff in affinities:
-        assay_raw   = _first(aff, "affinity", "Affinity") or ""
-        unit_raw    = _first(aff, "affinityUnit", "AffinityUnit") or ""
+        assay_raw   = _first(aff, "affinity", "Affinity", "value", "Value") or ""
+        unit_raw    = _first(aff, "affinityUnit", "AffinityUnit", "unit", "Unit") or ""
         assay_type  = (_first(aff, "affinityType", "AffinityType") or "").lower()
         target_name = _first(aff, "target", "Target", "targetName")
         uniprot     = _first(aff, "uniprotID", "uniprot_primary_id")
+        reference_text = _first(aff, "articleTitle", "ArticleTitle", "referenceText", "ReferenceText")
+        pubmed_id = _first(aff, "pubmedId", "PubMedID", "pmid", "PMID")
+        doi = _first(aff, "doi", "DOI")
+        mutation_string = _first(aff, "mutation", "Mutation", "mutationString", "MutationString")
+        assay_method = _first(aff, "assayMethod", "AssayMethod")
+        temperature_raw = _first(aff, "temperature", "Temperature")
+        ph_raw = _first(aff, "pH", "ph", "PH")
+        chain_ids_raw = _first(aff, "chainIDs", "chainIds", "chainId", "ChainIDs", "ChainId")
 
         if assay_type not in _ASSAY_TYPES:
             assay_type = None  # type: ignore[assignment]
 
-        val, unit, std = _parse_affinity(assay_raw, unit_raw)
-
-        import math
+        val, unit, std, relation = _parse_affinity(assay_raw, unit_raw)
         log10: float | None = None
         if std is not None and std > 0:
             log10 = round(math.log10(std), 6)
+
+        chain_ids_receptor = None
+        if chain_ids_raw:
+            chain_ids_receptor = [
+                token.strip()
+                for token in str(chain_ids_raw).replace(";", ",").split(",")
+                if token.strip()
+            ] or None
+
+        temperature_c = None
+        if temperature_raw not in (None, ""):
+            try:
+                temperature_c = float(temperature_raw)
+            except (TypeError, ValueError):
+                temperature_c = None
+
+        ph = None
+        if ph_raw not in (None, ""):
+            try:
+                ph = float(ph_raw)
+            except (TypeError, ValueError):
+                ph = None
 
         record_id = f"BDB_{pdb_id}_{ligand_id or 'UNK'}_{assay_type or 'aff'}"
 
@@ -120,6 +164,12 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
             "adapter_version": _ADAPTER_VERSION,
             "target_name": target_name,
             "ligand_name": ligand_name,
+            "reference_text": reference_text,
+            "pubmed_id": str(pubmed_id) if pubmed_id not in (None, "") else None,
+            "doi": str(doi) if doi not in (None, "") else None,
+            "raw_affinity_text": str(assay_raw) if assay_raw else None,
+            "standard_relation": relation,
+            "assay_method": assay_method,
         }
 
         results.append(CanonicalBindingSample(
@@ -128,6 +178,7 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
             source_database="BindingDB",
             source_record_id=record_id,
             pdb_id=pdb_id.upper(),
+            chain_ids_receptor=chain_ids_receptor,
             uniprot_ids=[uniprot] if uniprot else None,
             ligand_id=ligand_id,
             ligand_smiles=ligand_smiles,
@@ -136,6 +187,10 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
             assay_unit=unit,
             assay_value_standardized=std,
             assay_value_log10=log10,
+            temperature_c=temperature_c,
+            ph=ph,
+            mutation_string=str(mutation_string) if mutation_string not in (None, "") else None,
+            wildtype_or_mutant="mutant" if mutation_string not in (None, "") else "wildtype",
             provenance=provenance,
             quality_flags=[],
             quality_score=0.0,

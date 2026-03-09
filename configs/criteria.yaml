@@ -1,13 +1,20 @@
+direct_pdb_ids: []
 keyword_query: null
+organism_name_query: null
+taxonomy_id: null
 experimental_methods:
 - xray
 - em
 max_resolution_angstrom: 3.0
 task_types:
 - protein_protein
+membrane_only: false
+require_multimer: false
 require_protein: true
 require_ligand: false
 min_protein_entities: null
+min_nonpolymer_entities: null
+max_nonpolymer_entities: null
 max_deposited_atom_count: null
 min_release_year: null
 max_release_year: null

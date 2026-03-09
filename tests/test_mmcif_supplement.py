@@ -1,4 +1,7 @@
-from pbdata.parsing.mmcif_supplement import parse_mmcif_supplement
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from pbdata.parsing.mmcif_supplement import download_structure_files, parse_mmcif_supplement
 from pbdata.sources.rcsb_classify import classify_entry
 
 
@@ -79,3 +82,20 @@ def test_classify_entry_uses_mmcif_supplement_for_missing_nonpoly_and_glycan_dat
     glycans = [obj for obj in classified["bound_objects"] if obj.binder_type == "glycan"]
     assert len(metals) == 2
     assert len(glycans) == 1
+
+
+def test_download_structure_files_replaces_invalid_cached_cif() -> None:
+    tmp_path = Path(__file__).parent / "_tmp" / "mmcif_replace_case"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bad_path = tmp_path / "1ABC.cif"
+    bad_path.write_text("not a cif", encoding="utf-8")
+
+    response = Mock()
+    response.content = _MMCIF_TEXT.encode("utf-8")
+    response.raise_for_status.return_value = None
+
+    with patch("pbdata.parsing.mmcif_supplement.requests.get", return_value=response):
+        provenance = download_structure_files("1ABC", structures_dir=tmp_path)
+
+    assert provenance["structure_file_cif_path"] == str(bad_path)
+    assert bad_path.read_text(encoding="utf-8") == _MMCIF_TEXT

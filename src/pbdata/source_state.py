@@ -1,0 +1,55 @@
+"""Per-source operational state manifests.
+
+These records are not scientific provenance. They document source freshness,
+cache location, and the mode used to populate local data so users can review
+whether enrichment inputs were reused, fetched live, or loaded from a user-
+provided local cache.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from pbdata.storage import StorageLayout
+
+
+def write_source_state(
+    layout: StorageLayout,
+    *,
+    source_name: str,
+    status: str,
+    mode: str,
+    cache_path: Path | None = None,
+    record_id: str | None = None,
+    record_count: int | None = None,
+    notes: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> Path:
+    """Write one source-state JSON manifest."""
+    out_dir = layout.source_state_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "source_name": source_name,
+        "status": status,
+        "mode": mode,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "storage_root": str(layout.root),
+        "record_id": record_id,
+        "record_count": record_count,
+        "cache_path": str(cache_path) if cache_path is not None else None,
+        "notes": notes,
+    }
+    if cache_path is not None and cache_path.exists():
+        payload["cache_mtime"] = datetime.fromtimestamp(
+            cache_path.stat().st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
+        payload["cache_size_bytes"] = cache_path.stat().st_size
+    if extra:
+        payload["extra"] = extra
+    out_path = out_dir / f"{source_name.lower()}.json"
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
