@@ -9,7 +9,10 @@ from pbdata.models.baseline_memory import (
     evaluate_ligand_memory_model,
     train_ligand_memory_model,
 )
+from pbdata.data_pipeline.workflow_engine import harvest_unified_metadata, initialize_workspace
+from pbdata.graph.structural_graphs import build_structural_graphs
 from pbdata.storage import build_storage_layout
+from tests.test_feature_execution import _write_extracted_fixture
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
 _LOCAL_TMP.mkdir(exist_ok=True)
@@ -92,6 +95,25 @@ def test_train_ligand_memory_model_writes_artifact() -> None:
     assert saved["target_count"] == 2
     assert "graph_features.network_degree" in saved["numeric_feature_keys"]
     assert isinstance(saved["target_profiles"], dict)
+
+
+def test_train_ligand_memory_model_uses_structural_graph_summaries_when_available() -> None:
+    tmp_root = _tmp_dir("train_memory_model_graphs")
+    layout = build_storage_layout(tmp_root)
+    _write_training_fixture(layout)
+    _write_extracted_fixture(layout)
+    initialize_workspace(layout)
+    harvest_unified_metadata(layout)
+    build_structural_graphs(layout, graph_level="residue", scope="whole_protein", export_formats=("pyg",))
+
+    out_path, manifest = train_ligand_memory_model(layout)
+
+    assert out_path.exists()
+    assert "structural_graph.node_count" in manifest["numeric_feature_keys"]
+    assert any(
+        "structural_graph.node_count" in exemplar.get("numeric_features", {})
+        for exemplar in manifest["exemplars"]
+    )
 
 
 def test_evaluate_ligand_memory_model_scores_validation_split() -> None:

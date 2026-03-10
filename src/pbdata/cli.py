@@ -1362,6 +1362,53 @@ def build_conformational_states_cmd(ctx: typer.Context) -> None:
     typer.echo(f"Conformation manifest written to {manifest_path}")
 
 
+@app.command("setup-workspace")
+def setup_workspace_cmd(ctx: typer.Context) -> None:
+    """Create the workflow-engine workspace directories and manifest."""
+    from pbdata.data_pipeline.workflow_engine import initialize_workspace
+
+    layout = _storage_layout(ctx)
+    artifacts = initialize_workspace(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Workflow manifest written to {artifacts['workflow_manifest']}")
+
+
+@app.command("harvest-metadata")
+def harvest_metadata_cmd(ctx: typer.Context) -> None:
+    """Build the unified metadata table for dataset engineering workflows."""
+    from pbdata.data_pipeline.workflow_engine import harvest_unified_metadata
+
+    layout = _storage_layout(ctx)
+    artifacts = harvest_unified_metadata(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Metadata CSV written to {artifacts['metadata_csv']}")
+    typer.echo(f"Metadata manifest written to {artifacts['manifest']}")
+
+
+@app.command("build-structural-graphs")
+def build_structural_graphs_cmd(
+    ctx: typer.Context,
+    graph_level: Annotated[str, typer.Option(help="residue | atom")] = "residue",
+    scope: Annotated[str, typer.Option(help="whole_protein | interface_only | shell")] = "whole_protein",
+    shell_radius: Annotated[float, typer.Option(help="Neighborhood shell radius in angstroms.")] = 8.0,
+    export_formats: Annotated[list[str] | None, typer.Option("--export-format", help="Repeatable: pyg | dgl | networkx")] = None,
+) -> None:
+    """Build residue- or atom-level structural graphs for ML workflows."""
+    from pbdata.graph.structural_graphs import build_structural_graphs
+
+    layout = _storage_layout(ctx)
+    formats = tuple(export_formats or ["pyg", "networkx"])
+    artifacts = build_structural_graphs(
+        layout,
+        graph_level=graph_level,
+        scope=scope,
+        shell_radius=shell_radius,
+        export_formats=formats,
+    )
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Structural graph manifest written to {artifacts['manifest']}")
+
+
 @app.command("build-graph")
 def build_graph_cmd(ctx: typer.Context) -> None:
     """Write the graph-layer architecture manifest.
@@ -1598,6 +1645,46 @@ def build_custom_training_set_cmd(
     typer.echo(f"Summary             : {artifacts['custom_training_summary_json']}")
     typer.echo(f"Manifest            : {artifacts['custom_training_manifest_json']}")
     typer.echo(f"Snapshot dir        : {artifacts['custom_training_snapshot_dir']}")
+
+
+@app.command("engineer-dataset")
+def engineer_dataset_cmd(
+    ctx: typer.Context,
+    dataset_name: Annotated[str, typer.Option(help="Name of the engineered dataset export.")] = "engineered_dataset",
+    test_frac: Annotated[float, typer.Option(help="Test-set fraction.")] = 0.20,
+    cv_folds: Annotated[int, typer.Option(help="Optional number of CV folds.")] = 0,
+    strict_family_isolation: Annotated[bool, typer.Option(help="Keep the same protein family entirely in one split.")] = False,
+    embedding_backend: Annotated[str, typer.Option(help="auto | esm | fallback")] = "auto",
+    cluster_count: Annotated[int, typer.Option(help="Target cluster count for diversity grouping.")] = 8,
+    seed: Annotated[int, typer.Option(help="Deterministic seed.")] = 42,
+) -> None:
+    """Build a diverse, leakage-aware ML dataset export."""
+    from pbdata.dataset.engineering import DatasetEngineeringConfig, engineer_dataset
+
+    layout = _storage_layout(ctx)
+    artifacts = engineer_dataset(
+        layout,
+        config=DatasetEngineeringConfig(
+            dataset_name=dataset_name,
+            test_frac=test_frac,
+            cv_folds=cv_folds,
+            strict_family_isolation=strict_family_isolation,
+            embedding_backend=embedding_backend,
+            cluster_count=cluster_count,
+            seed=seed,
+        ),
+    )
+    typer.echo(f"Storage root: {layout.root}")
+    if "train_csv" in artifacts:
+        typer.echo(f"Train CSV        : {artifacts['train_csv']}")
+    if "test_csv" in artifacts:
+        typer.echo(f"Test CSV         : {artifacts['test_csv']}")
+    if "cv_folds_dir" in artifacts:
+        typer.echo(f"CV folds         : {artifacts['cv_folds_dir']}")
+    typer.echo(f"Diversity report : {artifacts['diversity_report']}")
+    typer.echo(f"Dataset config   : {artifacts['dataset_config']}")
+    typer.echo(f"Feature schema   : {artifacts['feature_schema']}")
+    typer.echo(f"Graph config     : {artifacts['graph_config']}")
 
 
 # ---------------------------------------------------------------------------

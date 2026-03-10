@@ -329,6 +329,10 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     gui._pipeline_execution_mode_var = _Var("hybrid")
     gui._site_pipeline_degraded_mode_var = _Var(True)
     gui._site_pipeline_run_id_var = _Var("site-run-001")
+    gui._site_physics_batch_id_var = _Var("batch-001")
+    gui._structural_graph_level_var = _Var("residue")
+    gui._structural_graph_scope_var = _Var("whole_protein")
+    gui._structural_graph_exports_var = _Var("pyg,networkx")
     gui._split_mode_var = _Var("pair-aware")
     gui._download_structures_var = _Var(True)
     gui._download_pdb_var = _Var(True)
@@ -342,6 +346,12 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     gui._custom_set_target_size_var = _Var("250")
     gui._custom_set_seed_var = _Var("9")
     gui._custom_set_cluster_cap_var = _Var("2")
+    gui._engineered_dataset_name_var = _Var("bench")
+    gui._engineered_dataset_test_frac_var = _Var("0.25")
+    gui._engineered_dataset_cv_folds_var = _Var("3")
+    gui._engineered_dataset_cluster_count_var = _Var("7")
+    gui._engineered_dataset_embedding_backend_var = _Var("auto")
+    gui._engineered_dataset_strict_family_var = _Var(True)
     cmd = gui._build_stage_cmd("extract")
 
     assert "--storage-root" in cmd
@@ -374,6 +384,12 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     queue_cmd = gui._build_stage_cmd("export-analysis-queue")
     assert "--run-id" in queue_cmd
     assert "site-run-001" in queue_cmd
+    structural_graph_cmd = gui._build_stage_cmd("build-structural-graphs")
+    assert "--graph-level" in structural_graph_cmd
+    assert "residue" in structural_graph_cmd
+    assert "--scope" in structural_graph_cmd
+    assert "whole_protein" in structural_graph_cmd
+    assert structural_graph_cmd.count("--export-format") == 2
     split_cmd = gui._build_stage_cmd("build-splits")
     assert "--split-mode" in split_cmd
     assert "pair-aware" in split_cmd
@@ -387,6 +403,10 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     assert "250" in custom_cmd
     assert "--per-receptor-cluster-cap" in custom_cmd
     assert "2" in custom_cmd
+    dataset_cmd = gui._build_stage_cmd("engineer-dataset")
+    assert "--dataset-name" in dataset_cmd
+    assert "bench" in dataset_cmd
+    assert "--strict-family-isolation" in dataset_cmd
 
 
 def test_cli_build_microstates_and_physics_features() -> None:

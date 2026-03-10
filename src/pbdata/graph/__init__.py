@@ -6,9 +6,12 @@ from .identifier_map import (
     detect_identifier_type,
     map_protein_identifier,
 )
+from .structural_graphs import build_structural_graphs, summarize_structure_graph_from_file
 
 __all__ = [
     "build_graph_manifest",
+    "build_structural_graphs",
+    "summarize_structure_graph_from_file",
     "GraphConnectorStub",
     "connector_stub",
     "IdentifierMappingPlan",

@@ -32,6 +32,42 @@ class StorageLayout:
         return self.root / "data"
 
     @property
+    def data_sources_dir(self) -> Path:
+        return self.root / "data_sources"
+
+    @property
+    def workspace_structures_dir(self) -> Path:
+        return self.root / "structures"
+
+    @property
+    def clean_structures_dir(self) -> Path:
+        return self.root / "clean_structures"
+
+    @property
+    def workspace_features_dir(self) -> Path:
+        return self.root / "features"
+
+    @property
+    def workspace_graphs_dir(self) -> Path:
+        return self.root / "graphs"
+
+    @property
+    def workspace_datasets_dir(self) -> Path:
+        return self.root / "datasets"
+
+    @property
+    def workspace_metadata_dir(self) -> Path:
+        return self.root / "metadata"
+
+    @property
+    def workspace_logs_dir(self) -> Path:
+        return self.root / "logs"
+
+    @property
+    def rosetta_outputs_dir(self) -> Path:
+        return self.root / "rosetta_outputs"
+
+    @property
     def artifacts_dir(self) -> Path:
         return self.root / "artifacts"
 

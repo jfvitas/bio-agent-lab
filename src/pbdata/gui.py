@@ -81,12 +81,17 @@ _SOURCE_INGEST_NOTES: dict[str, str] = {
 # Keep "extract" first — tests assert _SUBPROCESS_STAGES[0] == "extract".
 _SUBPROCESS_STAGES = [
     "extract", "normalize", "audit", "report",
+    "setup-workspace", "harvest-metadata", "build-structural-graphs", "engineer-dataset",
     "report-bias",
     "build-conformational-states", "build-graph", "build-microstates", "build-physics-features", "build-microstate-refinement", "build-mm-job-manifests", "run-mm-jobs", "run-feature-pipeline", "export-analysis-queue", "ingest-physics-results", "train-site-physics-surrogate", "build-features", "build-training-examples", "build-splits", "train-baseline-model", "evaluate-baseline-model", "build-custom-training-set", "build-release", "run-scenario-tests",
 ]
 
 # Pipeline groups for the UI
 _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Workflow Engine", [
+        ("setup-workspace", "Setup Workspace"),
+        ("harvest-metadata", "Harvest Metadata"),
+    ]),
     ("Data Acquisition", [
         ("ingest", "Ingest Sources"),
     ]),
@@ -100,6 +105,7 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("report-bias", "Report Bias"),
     ]),
     ("ML Pipeline", [
+        ("build-structural-graphs", "Build Structural Graphs"),
         ("build-conformational-states", "Build Conformational States"),
         ("build-graph", "Build Graph"),
         ("build-microstates", "Build Microstates"),
@@ -117,6 +123,7 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("train-baseline-model", "Train Baseline Model"),
         ("evaluate-baseline-model", "Evaluate Baseline Model"),
         ("build-custom-training-set", "Build Custom Training Set"),
+        ("engineer-dataset", "Engineer Dataset"),
         ("build-release", "Build Release Snapshot"),
         ("run-scenario-tests", "Run Scenario Tests"),
     ]),
@@ -609,6 +616,9 @@ class PbdataGUI:
         self._site_pipeline_degraded_mode_var = tk.BooleanVar(value=True)
         self._site_pipeline_run_id_var = tk.StringVar(value="")
         self._site_physics_batch_id_var = tk.StringVar(value="")
+        self._structural_graph_level_var = tk.StringVar(value="residue")
+        self._structural_graph_scope_var = tk.StringVar(value="whole_protein")
+        self._structural_graph_exports_var = tk.StringVar(value="pyg,networkx")
         self._split_mode_var          = tk.StringVar(value="auto")
         self._train_frac_var          = tk.StringVar(value="0.70")
         self._val_frac_var            = tk.StringVar(value="0.15")
@@ -620,6 +630,12 @@ class PbdataGUI:
         self._custom_set_target_size_var = tk.StringVar(value="500")
         self._custom_set_seed_var     = tk.StringVar(value="42")
         self._custom_set_cluster_cap_var = tk.StringVar(value="1")
+        self._engineered_dataset_name_var = tk.StringVar(value="engineered_dataset")
+        self._engineered_dataset_test_frac_var = tk.StringVar(value="0.20")
+        self._engineered_dataset_cv_folds_var = tk.StringVar(value="0")
+        self._engineered_dataset_cluster_count_var = tk.StringVar(value="8")
+        self._engineered_dataset_embedding_backend_var = tk.StringVar(value="auto")
+        self._engineered_dataset_strict_family_var = tk.BooleanVar(value=False)
 
         # --- Pipeline status vars ---
         self._status_vars: dict[str, tk.StringVar] = {
@@ -1369,6 +1385,74 @@ class PbdataGUI:
         )
         row += 1
 
+        ttk.Label(
+            outer, text="Workflow Engine",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+
+        ttk.Label(
+            outer,
+            text=(
+                "Use Setup Workspace to create the instruction-pack workspace layout,\n"
+                "then Harvest Metadata to build metadata/protein_metadata.csv for graph and dataset steps."
+            ),
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=row, column=0, sticky="ew", pady=10,
+        )
+        row += 1
+
+        ttk.Label(
+            outer, text="Structural Graph Options",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+
+        graph_frame = ttk.Frame(outer)
+        graph_frame.grid(row=row, column=0, sticky="ew")
+        graph_frame.columnconfigure(1, weight=1)
+        ttk.Label(graph_frame, text="Graph level:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Combobox(
+            graph_frame,
+            textvariable=self._structural_graph_level_var,
+            values=["residue", "atom"],
+            width=18,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Label(graph_frame, text="Scope:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Combobox(
+            graph_frame,
+            textvariable=self._structural_graph_scope_var,
+            values=["whole_protein", "interface_only", "shell"],
+            width=18,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Label(graph_frame, text="Export formats:").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(
+            graph_frame,
+            textvariable=self._structural_graph_exports_var,
+            width=22,
+        ).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=2)
+        row += 1
+
+        ttk.Label(
+            outer,
+            text="Comma-separated export formats. Supported: pyg, dgl, networkx.",
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=row, column=0, sticky="ew", pady=10,
+        )
+        row += 1
+
         # --- Split options ---
         ttk.Label(
             outer, text="Split Options",
@@ -1415,6 +1499,56 @@ class PbdataGUI:
             outer,
             text="Default uses k-mer Jaccard clustering to prevent\n"
                  "sequence-identity leakage between train/val/test.",
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=row, column=0, sticky="ew", pady=10,
+        )
+        row += 1
+
+        ttk.Label(
+            outer, text="Dataset Engineering",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+
+        dataset_frame = ttk.Frame(outer)
+        dataset_frame.grid(row=row, column=0, sticky="ew")
+        dataset_frame.columnconfigure(1, weight=1)
+        dataset_fields: list[tuple[str, tk.Variable, list[str] | None]] = [
+            ("Dataset name:", self._engineered_dataset_name_var, None),
+            ("Test fraction:", self._engineered_dataset_test_frac_var, None),
+            ("CV folds:", self._engineered_dataset_cv_folds_var, None),
+            ("Cluster count:", self._engineered_dataset_cluster_count_var, None),
+            ("Embedding backend:", self._engineered_dataset_embedding_backend_var, ["auto", "esm", "fallback"]),
+        ]
+        for i, (label, var, options) in enumerate(dataset_fields):
+            ttk.Label(dataset_frame, text=label).grid(row=i, column=0, sticky="w", pady=2)
+            if options is not None:
+                ttk.Combobox(
+                    dataset_frame,
+                    textvariable=var,
+                    values=options,
+                    width=18,
+                    state="readonly",
+                ).grid(row=i, column=1, sticky="w", padx=(6, 0), pady=2)
+            else:
+                ttk.Entry(dataset_frame, textvariable=var, width=18).grid(
+                    row=i, column=1, sticky="w", padx=(6, 0), pady=2,
+                )
+        ttk.Checkbutton(
+            dataset_frame,
+            text="Strict protein-family isolation",
+            variable=self._engineered_dataset_strict_family_var,
+        ).grid(row=len(dataset_fields), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        row += 1
+
+        ttk.Label(
+            outer,
+            text="Builds train.csv, test.csv, optional cv_folds/, and reproducibility configs from metadata/protein_metadata.csv.",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
@@ -2174,7 +2308,17 @@ class PbdataGUI:
         if stage in {"extract", "normalize", "audit"} and workers:
             cmd.extend(["--workers", workers])
 
-        if stage == "extract":
+        if stage == "build-structural-graphs":
+            level = self._structural_graph_level_var.get().strip()
+            scope = self._structural_graph_scope_var.get().strip()
+            exports = [part.strip() for part in self._structural_graph_exports_var.get().split(",") if part.strip()]
+            if level:
+                cmd.extend(["--graph-level", level])
+            if scope:
+                cmd.extend(["--scope", scope])
+            for export_format in exports:
+                cmd.extend(["--export-format", export_format])
+        elif stage == "extract":
             if not self._download_structures_var.get():
                 cmd.append("--no-download-structures")
             if self._download_pdb_var.get():
@@ -2237,6 +2381,24 @@ class PbdataGUI:
                 cmd.extend(["--seed", seed])
             if cluster_cap:
                 cmd.extend(["--per-receptor-cluster-cap", cluster_cap])
+        elif stage == "engineer-dataset":
+            dataset_name = self._engineered_dataset_name_var.get().strip()
+            test_frac = self._engineered_dataset_test_frac_var.get().strip()
+            cv_folds = self._engineered_dataset_cv_folds_var.get().strip()
+            cluster_count = self._engineered_dataset_cluster_count_var.get().strip()
+            embedding_backend = self._engineered_dataset_embedding_backend_var.get().strip()
+            if dataset_name:
+                cmd.extend(["--dataset-name", dataset_name])
+            if test_frac:
+                cmd.extend(["--test-frac", test_frac])
+            if cv_folds:
+                cmd.extend(["--cv-folds", cv_folds])
+            if cluster_count:
+                cmd.extend(["--cluster-count", cluster_count])
+            if embedding_backend:
+                cmd.extend(["--embedding-backend", embedding_backend])
+            if self._engineered_dataset_strict_family_var.get():
+                cmd.append("--strict-family-isolation")
         elif stage == "build-release":
             release_tag = self._release_tag_var.get().strip()
             if release_tag:
@@ -2625,9 +2787,20 @@ class PbdataGUI:
             mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
             auto_excluded = {"ingest-physics-results", "train-site-physics-surrogate"}
             if mode == "legacy":
-                stages = [stage for stage in _SUBPROCESS_STAGES if stage not in {"run-feature-pipeline", "export-analysis-queue", *auto_excluded}]
+                stages = [
+                    stage for stage in _SUBPROCESS_STAGES
+                    if stage not in {"run-feature-pipeline", "export-analysis-queue", *auto_excluded}
+                ]
             elif mode == "site-centric":
-                stages = ["run-feature-pipeline", "export-analysis-queue"]
+                stages = [
+                    "setup-workspace",
+                    "extract",
+                    "harvest-metadata",
+                    "build-structural-graphs",
+                    "run-feature-pipeline",
+                    "export-analysis-queue",
+                    "engineer-dataset",
+                ]
             else:
                 stages = [stage for stage in _SUBPROCESS_STAGES if stage not in auto_excluded]
 

@@ -10,6 +10,7 @@ from typing import Any
 
 from pbdata.features.microstate import summarize_structure_microstates
 from pbdata.features.physics_features import summarize_microstates_to_physics_features
+from pbdata.graph.structural_graphs import summarize_structure_graph_from_file
 from pbdata.models.affinity_models import (
     affinity_strength_from_log10,
     confidence_bonus,
@@ -196,6 +197,14 @@ def _query_numeric_features_from_structure(
         numeric = _safe_float(value)
         if numeric is not None:
             features[f"interaction.{key}"] = numeric
+    try:
+        graph_summary = summarize_structure_graph_from_file(Path(structure_file), graph_level="residue")
+    except Exception:
+        graph_summary = {}
+    for key, value in graph_summary.items():
+        numeric = _safe_float(value)
+        if numeric is not None:
+            features[f"structural_graph.{key}"] = numeric
     if interface_summary:
         residue_count = len(interface_summary.get("predicted_interface_residues") or [])
         observed_count = _safe_float(interface_summary.get("observed_interface_count"))

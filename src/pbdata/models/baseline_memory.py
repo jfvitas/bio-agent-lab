@@ -47,6 +47,15 @@ _NUMERIC_FEATURE_KEYS: tuple[tuple[str, str], ...] = (
     ("protein", "mean_hydropathy"),
     ("protein", "charged_fraction"),
     ("ligand", "molecular_weight"),
+    ("structural_graph", "node_count"),
+    ("structural_graph", "edge_count"),
+    ("structural_graph", "helix_residue_count"),
+    ("structural_graph", "sheet_residue_count"),
+    ("structural_graph", "hydrogen_bond_count"),
+    ("structural_graph", "salt_bridge_count"),
+    ("structural_graph", "hydrophobic_contact_count"),
+    ("structural_graph", "pi_stacking_count"),
+    ("structural_graph", "metal_coordination_count"),
 )
 
 
@@ -60,6 +69,23 @@ def _read_split_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def _load_structural_graph_summaries(layout: StorageLayout) -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {}
+    if not layout.workspace_graphs_dir.exists():
+        return summaries
+    for graph_dir in sorted(layout.workspace_graphs_dir.glob("*")):
+        if not graph_dir.is_dir():
+            continue
+        for path in sorted(graph_dir.glob("*.summary.json")):
+            raw = _read_json(path)
+            if not isinstance(raw, dict):
+                continue
+            pdb_id = str(raw.get("pdb_id") or path.stem.split(".", 1)[0]).upper()
+            if pdb_id and pdb_id not in summaries:
+                summaries[pdb_id] = raw
+    return summaries
 
 
 def _safe_float(value: object) -> float | None:
@@ -172,7 +198,11 @@ def score_query_context_against_target_profile(
     return round(sum(shared) / len(shared), 4)
 
 
-def _example_to_exemplar(example: dict[str, Any]) -> dict[str, Any] | None:
+def _example_to_exemplar(
+    example: dict[str, Any],
+    *,
+    structural_graph_summaries: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     protein = example.get("protein") or {}
     ligand = example.get("ligand") or {}
     labels = example.get("labels") or {}
@@ -186,11 +216,14 @@ def _example_to_exemplar(example: dict[str, Any]) -> dict[str, Any] | None:
     if not target_id or not smiles or not example_id:
         return None
 
+    pdb_id = str(structure.get("pdb_id") or "")
+    structural_graph = (structural_graph_summaries or {}).get(pdb_id.upper(), {}) if pdb_id else {}
+
     return {
         "example_id": example_id,
         "target_id": target_id,
         "pair_identity_key": str(provenance.get("pair_identity_key") or ""),
-        "pdb_id": str(structure.get("pdb_id") or ""),
+        "pdb_id": pdb_id,
         "ligand_smiles": smiles,
         "ligand_id": str(ligand.get("ligand_id") or ""),
         "affinity_type": str((labels.get("affinity_type") or experiment.get("affinity_type") or "")).strip() or None,
@@ -205,7 +238,14 @@ def _example_to_exemplar(example: dict[str, Any]) -> dict[str, Any] | None:
         "source_agreement_band": str(provenance.get("source_agreement_band") or ""),
         "source_conflict_flag": bool(labels.get("source_conflict_flag") or provenance.get("source_conflict_flag")),
         "memory_weight": round(_memory_weight(example), 4),
-        "numeric_features": _extract_numeric_features(example),
+        "numeric_features": {
+            **_extract_numeric_features(example),
+            **{
+                _feature_key_name("structural_graph", key): float(value)
+                for key, value in structural_graph.items()
+                if isinstance(value, (int, float))
+            },
+        },
     }
 
 
@@ -326,11 +366,15 @@ def _predict_from_exemplars(
 def train_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str, Any]]:
     examples_by_id = _training_examples_by_id(layout)
     train_ids = _read_split_ids(layout.splits_dir / "train.txt")
+    structural_graph_summaries = _load_structural_graph_summaries(layout)
     selected_ids = sorted(example_id for example_id in train_ids if example_id in examples_by_id)
     exemplars = [
         exemplar
         for example_id in selected_ids
-        if (exemplar := _example_to_exemplar(examples_by_id[example_id])) is not None
+        if (exemplar := _example_to_exemplar(
+            examples_by_id[example_id],
+            structural_graph_summaries=structural_graph_summaries,
+        )) is not None
     ]
     target_profiles = _target_profiles(exemplars)
     model = {
@@ -393,11 +437,15 @@ def evaluate_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str,
     train_ids = _read_split_ids(layout.splits_dir / "train.txt")
     val_ids = _read_split_ids(layout.splits_dir / "val.txt")
     test_ids = _read_split_ids(layout.splits_dir / "test.txt")
+    structural_graph_summaries = _load_structural_graph_summaries(layout)
     train_exemplars = [
         exemplar
         for example_id in sorted(train_ids)
         if example_id in examples_by_id
-        if (exemplar := _example_to_exemplar(examples_by_id[example_id])) is not None
+        if (exemplar := _example_to_exemplar(
+            examples_by_id[example_id],
+            structural_graph_summaries=structural_graph_summaries,
+        )) is not None
     ]
     train_target_profiles = _target_profiles(train_exemplars)
 
@@ -409,7 +457,10 @@ def evaluate_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str,
             example = examples_by_id.get(example_id)
             if not isinstance(example, dict):
                 continue
-            exemplar = _example_to_exemplar(example)
+            exemplar = _example_to_exemplar(
+                example,
+                structural_graph_summaries=structural_graph_summaries,
+            )
             if exemplar is None:
                 continue
             ranked = _predict_from_exemplars(
