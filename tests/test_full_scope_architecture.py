@@ -3,17 +3,25 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from typer.testing import CliRunner
 
 from pbdata.cli import app
+from pbdata.models import plan_affinity_models, plan_off_target_models
+from pbdata.prediction import plan_ligand_screening, plan_peptide_binding, plan_variant_effects
+from pbdata.risk import plan_pathway_reasoning, plan_severity_scoring
+from pbdata.sources.alphafold import plan_alphafold_state
 from pbdata.features.builder import build_features_from_extracted_and_graph
 from pbdata.features.mm_features import plan_mm_features
-from pbdata.features.pathway import plan_pathway_features
+from pbdata.features.pathway import plan_pathway_features, summarize_pathway_features
+from pbdata.reports.bias import build_bias_report
 from pbdata.graph.builder import build_graph_from_extracted
 from pbdata.graph.connectors import connector_stub
 from pbdata.graph.identifier_map import map_protein_identifier
+from pbdata.qa.scenario_runner import run_scenario_templates
 from pbdata.schemas.features import FeatureRecord
 from pbdata.schemas.graph import GraphEdgeRecord, GraphNodeRecord
+from pbdata.schemas.conformation import ConformationStateRecord
 from pbdata.schemas.training_example import (
     ExperimentFields,
     GraphFeatureFields,
@@ -36,16 +44,24 @@ def _tmp_dir(name: str) -> Path:
 
 
 def test_graph_schema_records_validate() -> None:
-    node = GraphNodeRecord(node_id="P12345", node_type="Protein", primary_id="P12345")
+    node = GraphNodeRecord(
+        node_id="P12345",
+        node_type="Protein",
+        primary_id="P12345",
+        provenance={"source": "RCSB"},
+    )
     edge = GraphEdgeRecord(
         edge_id="e1",
         edge_type="ProteinProteinInteraction",
         source_node_id="P12345",
         target_node_id="Q99999",
         source_database="STRING",
+        provenance={"source": "STRING"},
     )
     assert node.node_type == "Protein"
     assert edge.edge_type == "ProteinProteinInteraction"
+    assert node.provenance["source"] == "RCSB"
+    assert edge.provenance["source"] == "STRING"
 
 
 def test_training_example_schema_validates() -> None:
@@ -63,6 +79,16 @@ def test_training_example_schema_validates() -> None:
     assert record.protein.uniprot_id == "P12345"
 
 
+def test_conformation_state_schema_validates() -> None:
+    record = ConformationStateRecord(
+        target_id="P12345",
+        state_id="P12345:alphafold_planned",
+        structure_source="AlphaFold",
+        provenance={"source": "AlphaFold", "retrieved_at": "2026-03-09T00:00:00+00:00", "confidence": "planned"},
+    )
+    assert record.structure_source == "AlphaFold"
+
+
 def test_feature_schema_validates() -> None:
     record = FeatureRecord(
         feature_id="f1",
@@ -75,11 +101,55 @@ def test_feature_schema_validates() -> None:
     assert record.feature_group == "training_ready_core"
 
 
+def test_feature_schema_rejects_unknown_key() -> None:
+    with pytest.raises(Exception):
+        FeatureRecord(
+            feature_id="f1",
+            pdb_id="1ABC",
+            pair_identity_key="protein_ligand|1ABC|A|ATP|wt_or_unspecified",
+            feature_group="training_ready_core",
+            values={"unknown_feature_key": 2},
+            provenance={"generated_at": "2026-03-08T00:00:00+00:00"},
+        )
+
+
+def test_graph_builder_emits_placeholder_pathway_node_without_external_sources() -> None:
+    tmp_root = _tmp_dir("graph_placeholder")
+    extracted_dir = tmp_root / "extracted"
+    (extracted_dir / "entry").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "chains").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "bound_objects").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "interfaces").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "assays").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({"pdb_id": "1ABC"}), encoding="utf-8")
+    (extracted_dir / "chains" / "1ABC.json").write_text(
+        json.dumps([{"pdb_id": "1ABC", "chain_id": "A", "is_protein": True, "uniprot_id": "P12345"}]),
+        encoding="utf-8",
+    )
+    (extracted_dir / "bound_objects" / "1ABC.json").write_text("[]", encoding="utf-8")
+    (extracted_dir / "interfaces" / "1ABC.json").write_text("[]", encoding="utf-8")
+    (extracted_dir / "assays" / "1ABC.json").write_text("[]", encoding="utf-8")
+
+    graph_dir = tmp_root / "graph"
+    nodes_path, _, _ = build_graph_from_extracted(extracted_dir, graph_dir, enable_external=False)
+
+    nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
+    assert any(node["node_type"] == "Pathway" for node in nodes)
+
+
 def test_remaining_scope_stubs_are_importable_and_explicit() -> None:
     connector = connector_stub("STRING", Path("data/raw/graph_sources/STRING"))
     mapping = map_protein_identifier("P12345", resolve_remote=False)
     pathway = plan_pathway_features("protein:P12345")
     mm_plan = plan_mm_features("1ABC")
+    alphafold_plan = plan_alphafold_state("P12345")
+    affinity_plan = plan_affinity_models()
+    off_target_plan = plan_off_target_models()
+    ligand_screening_plan = plan_ligand_screening()
+    peptide_binding_plan = plan_peptide_binding()
+    variant_effects_plan = plan_variant_effects()
+    pathway_reasoning_plan = plan_pathway_reasoning()
+    severity_plan = plan_severity_scoring()
     training_plan = plan_training_assembly(
         Path("data/extracted"),
         Path("data/features"),
@@ -91,7 +161,33 @@ def test_remaining_scope_stubs_are_importable_and_explicit() -> None:
     assert mapping.status == "stub"
     assert pathway.status == "stub"
     assert mm_plan.status == "stub"
+    assert alphafold_plan.status == "planned"
+    assert affinity_plan.status == "baseline_heuristic_available"
+    assert off_target_plan.status == "baseline_heuristic_available"
+    assert ligand_screening_plan.status == "stub"
+    assert peptide_binding_plan.status == "stub"
+    assert variant_effects_plan.status == "stub"
+    assert pathway_reasoning_plan.status == "stub"
+    assert severity_plan.status == "stub"
     assert training_plan.status == "stub"
+
+
+def test_pathway_summary_reads_graph_edges() -> None:
+    tmp_root = _tmp_dir("pathway_summary")
+    graph_dir = tmp_root / "graph"
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    (graph_dir / "graph_nodes.json").write_text(json.dumps([
+        {"node_id": "protein:P12345", "node_type": "Protein", "primary_id": "P12345"},
+        {"node_id": "pathway:R-HSA-1", "node_type": "Pathway", "primary_id": "R-HSA-1"},
+    ]), encoding="utf-8")
+    (graph_dir / "graph_edges.json").write_text(json.dumps([
+        {"edge_id": "e1", "edge_type": "ProteinPathway", "source_node_id": "protein:P12345", "target_node_id": "pathway:R-HSA-1", "source_database": "Reactome"},
+    ]), encoding="utf-8")
+
+    summary = summarize_pathway_features("protein:P12345", graph_dir)
+
+    assert summary.pathway_count == 1
+    assert summary.status == "from_graph_pathways"
 
 
 def test_architecture_cli_commands_write_manifests() -> None:
@@ -126,6 +222,143 @@ def test_architecture_cli_commands_write_manifests() -> None:
 
     graph_body = json.loads(graph_manifest.read_text(encoding="utf-8"))
     assert graph_body["status"] in {"planned", "materialized_from_extracted", "materialized_with_external"}
+
+
+def test_scenario_runner_writes_reports() -> None:
+    tmp = _tmp_dir("scenario_runner")
+    scenario_yaml = tmp / "scenario_test_templates.yaml"
+    rubric = tmp / "undesirable_state_rubric.md"
+    scenario_yaml.write_text(
+        "scenarios:\n  example:\n    goal: demo\n    expected_outputs: [ranked_target_list]\n    forbidden_behaviors: [silent_failure]\n",
+        encoding="utf-8",
+    )
+    rubric.write_text("severity\nlocation\ndescription\nsuggested_fix\n", encoding="utf-8")
+
+    prediction_dir = tmp / "data" / "prediction" / "ligand_screening"
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    (prediction_dir / "prediction_manifest.json").write_text(
+        json.dumps({
+            "status": "scaffold_only_no_predictions",
+            "ranked_target_list": [],
+            "predicted_kd": None,
+            "predicted_delta_g": None,
+            "confidence_score": None,
+        }),
+        encoding="utf-8",
+    )
+
+    report_path, manifest_path = run_scenario_templates(scenario_yaml, rubric, tmp / "data" / "qa_out")
+    reports = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert reports[0]["scenario_id"] == "example"
+    assert reports[0]["missing_expected_outputs"] == ["ranked_target_list"]
+    assert manifest["status"] == "scenario_templates_loaded"
+
+
+def test_bias_and_conformation_cli_commands_write_outputs() -> None:
+    tmp_root = _tmp_dir("bias_and_conformations")
+    extracted = tmp_root / "data" / "extracted"
+    for name in ["entry", "chains", "bound_objects"]:
+        (extracted / name).mkdir(parents=True, exist_ok=True)
+    (extracted / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "task_hint": "protein_ligand",
+        "organism_names": ["Homo sapiens"],
+        "experimental_method": "X-RAY DIFFRACTION",
+        "resolution_bin": "medium_res_1.5-2.5",
+        "structure_file_cif_path": "C:/tmp/1ABC.cif",
+        "downloaded_at": "2026-03-09T00:00:00+00:00",
+    }), encoding="utf-8")
+    (extracted / "chains" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "chain_id": "A", "is_protein": True, "uniprot_id": "P12345"},
+    ]), encoding="utf-8")
+    (extracted / "bound_objects" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "component_id": "ATP", "component_inchikey": "ATP-KEY"},
+    ]), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["--storage-root", str(tmp_root), "report-bias"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert (tmp_root / "data" / "reports" / "bias_report.json").exists()
+
+    result = runner.invoke(app, ["--storage-root", str(tmp_root), "build-conformational-states"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert (tmp_root / "data" / "conformations" / "conformation_states.json").exists()
+
+    result = runner.invoke(app, ["--storage-root", str(tmp_root), "run-scenario-tests"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert (tmp_root / "data" / "qa" / "scenario_test_report.json").exists()
+
+
+def test_bias_report_separates_missing_data_from_real_categories() -> None:
+    tmp_root = _tmp_dir("bias_report")
+    extracted = tmp_root / "extracted"
+    (extracted / "entry").mkdir(parents=True, exist_ok=True)
+    (extracted / "bound_objects").mkdir(parents=True, exist_ok=True)
+    (extracted / "entry" / "1ABC.json").write_text(
+        json.dumps({"pdb_id": "1ABC", "organism_names": []}),
+        encoding="utf-8",
+    )
+    (extracted / "bound_objects" / "1ABC.json").write_text(
+        json.dumps([{}]),
+        encoding="utf-8",
+    )
+
+    _, report = build_bias_report(extracted, tmp_root / "reports")
+
+    assert report["missing_data_count"]["task_hint"] == 1
+    assert report["missing_data_count"]["organism_names"] == 1
+    assert report["missing_data_count"]["ligand_scaffold_identifier"] == 1
+    assert "unknown" not in report["protein_family_distribution"]
+
+
+def test_prediction_and_risk_cli_commands_write_outputs() -> None:
+    tmp_root = _tmp_dir("prediction_and_risk")
+    (tmp_root / "model_ready_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,receptor_uniprot_ids,binding_affinity_type,source_conflict_flag\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,P12345; Q99999,Kd,false\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "scientific_coverage_summary.json").write_text(
+        json.dumps({"counts": {"pair_count": 1}}),
+        encoding="utf-8",
+    )
+    graph_dir = tmp_root / "data" / "graph"
+    graph_dir.mkdir(parents=True, exist_ok=True)
+    (graph_dir / "graph_nodes.json").write_text("[]", encoding="utf-8")
+    (graph_dir / "graph_edges.json").write_text("[]", encoding="utf-8")
+
+    structure_path = tmp_root / "demo.cif"
+    structure_path.write_text("data_demo\n#", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "predict-ligand-screening", "--smiles", "CCO"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert (tmp_root / "data" / "prediction" / "ligand_screening" / "prediction_manifest.json").exists()
+
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "predict-peptide-binding", "--structure-file", str(structure_path)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert (tmp_root / "data" / "prediction" / "peptide_binding" / "prediction_manifest.json").exists()
+
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "score-pathway-risk", "--targets", "P12345"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    risk_path = tmp_root / "data" / "risk" / "pathway_risk_summary.json"
+    assert risk_path.exists()
+    risk_body = json.loads(risk_path.read_text(encoding="utf-8"))
+    assert risk_body["matching_pair_count"] == 1
 
 
 def test_build_graph_from_extracted_materializes_nodes_and_edges() -> None:

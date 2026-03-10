@@ -154,6 +154,7 @@ def extract_rcsb_entry(
     structures_dir: Path | None = None,
     download_structures: bool = True,
     download_pdb: bool = False,
+    structure_mirror: str = "rcsb",
 ) -> dict[str, Any]:
     """Extract multi-table records from a single raw RCSB entry.
 
@@ -190,7 +191,10 @@ def extract_rcsb_entry(
     if pdb_id and download_structures:
         try:
             file_prov = download_structure_files(
-                pdb_id, structures_dir=structures_dir, download_pdb=download_pdb,
+                pdb_id,
+                structures_dir=structures_dir,
+                download_pdb=download_pdb,
+                mirror=structure_mirror,
             )
         except Exception as exc:
             logger.warning("Structure file download failed for %s: %s", pdb_id, exc)
@@ -336,6 +340,7 @@ def extract_rcsb_entry(
             "structure_file_cif_path": {
                 "source": "RCSB",
                 "method": "HTTP_download" if file_prov.get("structure_file_cif_path") else None,
+                "mirror": file_prov.get("structure_download_mirror"),
             },
         },
         field_confidence={

@@ -19,9 +19,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-from pbdata.dataset.splits import _cluster_sequences, _normalize_mutation_key
+from pbdata.dataset.splits import _normalize_mutation_key
 from pbdata.pairing import parse_pair_identity_key
 from pbdata.storage import StorageLayout
 
@@ -93,19 +91,6 @@ def _write_csv(path: Path, columns: list[str], rows: list[dict[str, str]]) -> Pa
         writer.writerows(rows)
     tmp.replace(path)
     return path
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
 
 
 def _safe_float(value: str | None, default: float = 0.0) -> float:
@@ -182,21 +167,15 @@ def _pair_family_key(task_type: str, receptor_identity: str, ligand_key: str, pa
     return f"{task_type}|{receptor_identity}|{partner_key or '-'}"
 
 
-def _build_chain_sequence_map(layout: StorageLayout) -> dict[tuple[str, str], str]:
-    mapping: dict[tuple[str, str], str] = {}
-    for row in _load_table_json(layout.extracted_dir / "chains"):
-        pdb_id = str(row.get("pdb_id") or "")
-        chain_id = str(row.get("chain_id") or "")
-        seq = str(row.get("polymer_sequence") or "")
-        if pdb_id and chain_id and seq:
-            mapping[(pdb_id, chain_id)] = seq
-    return mapping
-
-
-def _join_receptor_sequence(pdb_id: str, receptor_chain_ids: str, chain_sequences: dict[tuple[str, str], str]) -> str | None:
-    pieces = [chain_sequences.get((pdb_id, chain_id)) for chain_id in _semicolon_values(receptor_chain_ids.replace(",", ";"))]
-    seqs = [piece for piece in pieces if piece]
-    return "|".join(seqs) if seqs else None
+def _receptor_sequence_token(row: dict[str, str]) -> str | None:
+    uniprot_ids = _semicolon_values(row.get("receptor_uniprot_ids"))
+    if uniprot_ids:
+        return "|".join(uniprot_ids)
+    chain_ids = _semicolon_values(str(row.get("receptor_chain_ids") or "").replace(",", ";"))
+    pdb_id = str(row.get("pdb_id") or "")
+    if chain_ids and pdb_id:
+        return "|".join(f"{pdb_id}:{chain_id}" for chain_id in chain_ids)
+    return None
 
 
 def _dedupe_model_ready_rows(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -237,8 +216,6 @@ def _build_candidates(
     entry_rows = _read_csv(_repo_path("master_pdb_repository.csv", root))
     entry_by_pdb = {str(row.get("pdb_id") or ""): row for row in entry_rows if row.get("pdb_id")}
     deduped_rows, dedupe_exclusions = _dedupe_model_ready_rows(model_ready_rows)
-    chain_sequences = _build_chain_sequence_map(layout)
-
     candidates: list[SelectionCandidate] = []
     for index, row in enumerate(deduped_rows):
         pdb_id = str(row.get("pdb_id") or "")
@@ -252,7 +229,7 @@ def _build_candidates(
         partner_key = ",".join(parsed.partner_chain_ids) if parsed is not None and parsed.partner_chain_ids else ""
         pair_family = _pair_family_key(task_type, receptor_identity, ligand_key, partner_key)
         entry = entry_by_pdb.get(pdb_id, {})
-        receptor_sequence = _join_receptor_sequence(pdb_id, str(row.get("receptor_chain_ids") or ""), chain_sequences)
+        receptor_sequence = _receptor_sequence_token(row)
         confidence_penalty = _confidence_penalty(row.get("assay_field_confidence_json")) + _confidence_penalty(entry.get("field_confidence_json"))
         quality_score = _safe_float(entry.get("quality_score"), 0.0)
         base_score = (
@@ -299,11 +276,12 @@ def _build_candidates(
     if not candidates:
         return [], dedupe_exclusions
 
-    cluster_map = _cluster_sequences(
-        [candidate.candidate_id for candidate in candidates],
-        [candidate.receptor_sequence for candidate in candidates],
-        threshold=0.30,
-    )
+    cluster_map: dict[str, int] = {}
+    token_to_cluster: dict[str, int] = {}
+    for candidate in candidates:
+        token = candidate.receptor_sequence or candidate.receptor_identity or candidate.candidate_id
+        cluster_id = token_to_cluster.setdefault(token, len(token_to_cluster))
+        cluster_map[candidate.candidate_id] = cluster_id
     normalized: list[SelectionCandidate] = []
     for candidate in candidates:
         normalized.append(SelectionCandidate(

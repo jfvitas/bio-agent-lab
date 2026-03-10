@@ -285,12 +285,26 @@ def test_extract_can_skip_structure_downloads(mock_download):
     assert entry.parsed_structure_format is None
 
 
+@patch("pbdata.pipeline.extract.download_structure_files")
+def test_extract_passes_structure_mirror_to_download(mock_download):
+    mock_download.return_value = {"parsed_structure_format": "mmCIF"}
+
+    extract_rcsb_entry(_mock_entry("1ABC"), structure_mirror="pdbj")
+
+    assert mock_download.call_args.kwargs["mirror"] == "pdbj"
+
+
 def test_gui_pipeline_includes_extract_stage() -> None:
     assert _SUBPROCESS_STAGES[0] == "extract"
     assert "extract" in _SUBPROCESS_STAGES
     assert "build-graph" in _SUBPROCESS_STAGES
     assert "build-microstates" in _SUBPROCESS_STAGES
     assert "build-physics-features" in _SUBPROCESS_STAGES
+    assert "build-microstate-refinement" in _SUBPROCESS_STAGES
+    assert "build-mm-job-manifests" in _SUBPROCESS_STAGES
+    assert "run-mm-jobs" in _SUBPROCESS_STAGES
+    assert "run-feature-pipeline" in _SUBPROCESS_STAGES
+    assert "export-analysis-queue" in _SUBPROCESS_STAGES
     assert "build-features" in _SUBPROCESS_STAGES
     assert "build-training-examples" in _SUBPROCESS_STAGES
     assert "build-splits" in _SUBPROCESS_STAGES
@@ -312,6 +326,9 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     gui = PbdataGUI.__new__(PbdataGUI)
     gui._storage_root_var = _Var(r"C:\tmp\pbdata-root")
     gui._workers_var = _Var("4")
+    gui._pipeline_execution_mode_var = _Var("hybrid")
+    gui._site_pipeline_degraded_mode_var = _Var(True)
+    gui._site_pipeline_run_id_var = _Var("site-run-001")
     gui._split_mode_var = _Var("pair-aware")
     gui._download_structures_var = _Var(True)
     gui._download_pdb_var = _Var(True)
@@ -339,6 +356,24 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     physics_cmd = gui._build_stage_cmd("build-physics-features")
     assert "--storage-root" in physics_cmd
     assert r"C:\tmp\pbdata-root" in physics_cmd
+    refinement_cmd = gui._build_stage_cmd("build-microstate-refinement")
+    assert "--storage-root" in refinement_cmd
+    assert r"C:\tmp\pbdata-root" in refinement_cmd
+    mm_cmd = gui._build_stage_cmd("build-mm-job-manifests")
+    assert "--storage-root" in mm_cmd
+    assert r"C:\tmp\pbdata-root" in mm_cmd
+    run_mm_cmd = gui._build_stage_cmd("run-mm-jobs")
+    assert "--storage-root" in run_mm_cmd
+    assert r"C:\tmp\pbdata-root" in run_mm_cmd
+    feature_cmd = gui._build_stage_cmd("run-feature-pipeline")
+    assert "--run-mode" in feature_cmd
+    assert "full_build" in feature_cmd
+    assert "--degraded-mode" in feature_cmd
+    assert "--run-id" in feature_cmd
+    assert "site-run-001" in feature_cmd
+    queue_cmd = gui._build_stage_cmd("export-analysis-queue")
+    assert "--run-id" in queue_cmd
+    assert "site-run-001" in queue_cmd
     split_cmd = gui._build_stage_cmd("build-splits")
     assert "--split-mode" in split_cmd
     assert "pair-aware" in split_cmd
@@ -382,6 +417,14 @@ def test_cli_build_microstates_and_physics_features() -> None:
     result = runner.invoke(app, ["--storage-root", str(storage_root), "build-physics-features"])
     assert result.exit_code == 0
     assert (storage_root / "data" / "features" / "physics" / "physics_feature_records.json").exists()
+
+    result = runner.invoke(app, ["--storage-root", str(storage_root), "build-microstate-refinement"])
+    assert result.exit_code == 0
+    assert (storage_root / "data" / "features" / "microstate_refinement" / "microstate_refinement_records.json").exists()
+
+    result = runner.invoke(app, ["--storage-root", str(storage_root), "build-mm-job-manifests"])
+    assert result.exit_code == 0
+    assert (storage_root / "data" / "features" / "mm_jobs" / "mm_job_records.json").exists()
 
 
 def test_gui_criteria_from_ui_includes_branched_and_assembly_filters() -> None:

@@ -174,6 +174,43 @@ def _assign_microstate(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summarize_structure_microstates(
+    structure_file: Path,
+    *,
+    receptor_chain_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Compute heuristic microstates directly from a structure file for inference-time use."""
+    try:
+        structure = gemmi.read_structure(str(structure_file))
+    except Exception:
+        return None
+
+    selected_chain_ids = receptor_chain_ids
+    if not selected_chain_ids:
+        selected_chain_ids = {
+            str(chain.name)
+            for model in structure
+            for chain in model
+            if any(residue.name.strip().upper() in _IONIZABLE_RESIDUES for residue in chain)
+        }
+    if not selected_chain_ids:
+        return None
+
+    try:
+        contexts = _load_residue_contexts(structure_file, set(selected_chain_ids))
+    except Exception:
+        return None
+    assignments = [_assign_microstate(record) for record in contexts]
+    if not assignments:
+        return None
+    return {
+        "microstates": assignments,
+        "record_count": len(assignments),
+        "chain_ids": sorted(selected_chain_ids),
+        "method": "heuristic_local_context_v1",
+    }
+
+
 def build_microstate_records(
     extracted_dir: Path,
     output_dir: Path,

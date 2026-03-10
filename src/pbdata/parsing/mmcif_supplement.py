@@ -13,6 +13,7 @@ hashing and file provenance metadata per the structure extraction spec.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import logging
 from collections import Counter, defaultdict
@@ -59,10 +60,34 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _structure_urls(pdb_id: str, mirror: str) -> tuple[str, str]:
+    mirror_key = str(mirror or "rcsb").strip().lower()
+    if mirror_key == "pdbj":
+        shard = pdb_id[1:3].lower()
+        return (
+            f"https://files.pdbj.org/pub/pdb/data/structures/divided/mmCIF/{shard}/{pdb_id.lower()}.cif.gz",
+            f"https://files.pdbj.org/pub/pdb/data/structures/divided/pdb/{shard}/pdb{pdb_id.lower()}.ent.gz",
+        )
+    return (
+        _MMCIF_URL.format(pdb_id=pdb_id),
+        _PDB_URL.format(pdb_id=pdb_id),
+    )
+
+
+def _download_bytes(url: str) -> bytes:
+    response = requests.get(url, timeout=_TIMEOUT)
+    response.raise_for_status()
+    payload = response.content
+    if url.endswith(".gz"):
+        return gzip.decompress(payload)
+    return payload
+
+
 def download_structure_files(
     pdb_id: str,
     structures_dir: Path | None = None,
     download_pdb: bool = False,
+    mirror: str = "rcsb",
 ) -> dict[str, Any]:
     """Download mmCIF (and optionally PDB) files, save permanently, return provenance.
 
@@ -82,7 +107,7 @@ def download_structure_files(
 
     # ── mmCIF (required primary format) ──────────────────────────────
     cif_path = out_dir / f"{pdb_id}.cif"
-    cif_url = _MMCIF_URL.format(pdb_id=pdb_id)
+    cif_url, pdb_url = _structure_urls(pdb_id, mirror)
 
     if reuse_existing_file(cif_path, validator=validate_mmcif_file):
         cif_bytes = cif_path.read_bytes()
@@ -91,35 +116,33 @@ def download_structure_files(
         provenance["structure_file_hash_sha256"] = _sha256(cif_bytes)
         provenance["structure_download_url"] = cif_url
         provenance["structure_downloaded_at"] = "cached"
+        provenance["structure_download_mirror"] = mirror
     else:
         try:
-            resp = requests.get(cif_url, timeout=_TIMEOUT)
-            resp.raise_for_status()
-            cif_bytes = resp.content
+            cif_bytes = _download_bytes(cif_url)
             cif_path.write_bytes(cif_bytes)
             provenance["structure_file_cif_path"] = str(cif_path)
             provenance["structure_file_cif_size_bytes"] = len(cif_bytes)
             provenance["structure_file_hash_sha256"] = _sha256(cif_bytes)
             provenance["structure_download_url"] = cif_url
             provenance["structure_downloaded_at"] = datetime.now(timezone.utc).isoformat()
+            provenance["structure_download_mirror"] = mirror
         except Exception as exc:
             logger.warning("mmCIF download failed for %s: %s", pdb_id, exc)
             provenance["structure_file_cif_path"] = None
             provenance["structure_download_url"] = cif_url
+            provenance["structure_download_mirror"] = mirror
 
     # ── PDB (optional compatibility fallback) ────────────────────────
     if download_pdb:
         pdb_path = out_dir / f"{pdb_id}.pdb"
-        pdb_url = _PDB_URL.format(pdb_id=pdb_id)
         if reuse_existing_file(pdb_path, validator=validate_pdb_file):
             pdb_bytes = pdb_path.read_bytes()
             provenance["structure_file_pdb_path"] = str(pdb_path)
             provenance["structure_file_pdb_size_bytes"] = len(pdb_bytes)
         else:
             try:
-                resp = requests.get(pdb_url, timeout=_TIMEOUT)
-                resp.raise_for_status()
-                pdb_bytes = resp.content
+                pdb_bytes = _download_bytes(pdb_url)
                 pdb_path.write_bytes(pdb_bytes)
                 provenance["structure_file_pdb_path"] = str(pdb_path)
                 provenance["structure_file_pdb_size_bytes"] = len(pdb_bytes)
@@ -133,6 +156,7 @@ def download_structure_files(
 def fetch_mmcif_supplement(
     pdb_id: str,
     structures_dir: Path | None = None,
+    mirror: str = "rcsb",
 ) -> dict[str, Any] | None:
     """Fetch and parse a compact mmCIF supplement for one PDB entry.
 
@@ -157,9 +181,8 @@ def fetch_mmcif_supplement(
 
     # Download fresh
     try:
-        response = requests.get(_MMCIF_URL.format(pdb_id=pdb_id), timeout=_TIMEOUT)
-        response.raise_for_status()
-        text = response.text
+        cif_url, _ = _structure_urls(pdb_id, mirror)
+        text = _download_bytes(cif_url).decode("utf-8")
     except Exception:
         raise
     # Save to structures dir for future use

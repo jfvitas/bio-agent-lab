@@ -1,0 +1,32 @@
+batch_id: physics_batch_001
+created_at: "YYYY-MM-DDTHH:MM:SSZ"
+status: proposed
+motif_classes:
+  - backbone_carbonyl_oxygen
+  - backbone_amide_nitrogen
+  - asp_carboxylate_oxygen
+  - glu_carboxylate_oxygen
+  - lys_terminal_amine_nitrogen
+  - his_delta_nitrogen
+  - his_epsilon_nitrogen
+  - ser_hydroxyl_oxygen
+  - tyr_hydroxyl_oxygen
+  - carbonyl_oxygen
+  - carboxylate_oxygen
+  - amine_nitrogen
+  - aromatic_nitrogen
+  - aromatic_centroid
+  - metal_ion
+archetypes:
+  - archetype_id: example_0001
+    motif_class: backbone_carbonyl_oxygen
+    fragment_file: external_analysis/orca/physics_batch_001/inputs/example_0001.xyz
+    metadata_file: external_analysis/orca/physics_batch_001/inputs/example_0001.metadata.json
+    analyses_required:
+      - orca_fragment
+      - apbs
+      - openmm
+      - donor_probe
+      - acceptor_probe
+      - cation_probe
+      - anion_probe

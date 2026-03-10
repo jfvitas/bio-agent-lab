@@ -85,119 +85,9 @@ def _fetch_bindingdb_samples_for_pdb(
     *,
     layout: StorageLayout,
 ) -> list:
-    if not config.sources.bindingdb.enabled or not pdb_id:
-        return []
+    from pbdata.pipeline.enrichment import fetch_bindingdb_samples_for_pdb
 
-    from pbdata.sources.bindingdb import BindingDBAdapter
-    from pbdata.catalog import summarize_bulk_file, update_download_manifest
-
-    local_dir = str(config.sources.bindingdb.extra.get("local_dir") or "").strip()
-    local_cache_path = Path(local_dir) / f"{pdb_id.upper()}.json" if local_dir else None
-    managed_cache_path = layout.raw_bindingdb_dir / f"{pdb_id.upper()}.json"
-    cache_path = managed_cache_path
-    cache_mode = "managed_cache"
-    raw: dict | None = None
-
-    if local_cache_path and reuse_existing_file(
-        local_cache_path,
-        validator=lambda path, expected=pdb_id: validate_bindingdb_raw_json(path, expected_pdb_id=expected),
-    ):
-        cache_path = local_cache_path
-        cache_mode = "local_cache"
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
-    elif reuse_existing_file(
-        managed_cache_path,
-        validator=lambda path, expected=pdb_id: validate_bindingdb_raw_json(path, expected_pdb_id=expected),
-    ):
-        cache_path = managed_cache_path
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
-    else:
-        managed_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        adapter = BindingDBAdapter()
-        try:
-            raw = adapter.fetch_metadata(pdb_id)
-        except Exception as exc:
-            logger.warning("BindingDB lookup failed for %s: %s", pdb_id, exc)
-            write_source_state(
-                layout,
-                source_name="BindingDB",
-                status="error",
-                mode="live_api",
-                record_id=pdb_id.upper(),
-                notes=str(exc),
-                extra={"configured_local_dir": local_dir or None},
-            )
-            return []
-        managed_cache_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-        cache_path = managed_cache_path
-        cache_mode = "live_api"
-        if not validate_bindingdb_raw_json(cache_path, expected_pdb_id=pdb_id):
-            managed_cache_path.unlink(missing_ok=True)
-            logger.warning("BindingDB payload for %s was invalid and was removed.", pdb_id)
-            write_source_state(
-                layout,
-                source_name="BindingDB",
-                status="invalid_payload",
-                mode="live_api",
-                cache_path=managed_cache_path,
-                record_id=pdb_id.upper(),
-                extra={"configured_local_dir": local_dir or None},
-            )
-            return []
-        update_download_manifest([
-            summarize_bulk_file(
-                source_database="BindingDB",
-                source_record_id=pdb_id.upper(),
-                pdb_id=pdb_id.upper(),
-                raw_file_path=managed_cache_path,
-                raw_format="json",
-                downloaded_at=datetime.now(timezone.utc).isoformat(),
-                title="BindingDB cache payload",
-                task_hint="protein_ligand",
-                notes="BindingDB enrichment payload cached by PDB ID.",
-                status="cached",
-            )
-        ], layout.catalog_path)
-
-    try:
-        samples = BindingDBAdapter().normalize_all(raw or {})
-    except Exception as exc:
-        logger.warning("BindingDB normalization failed for %s: %s", pdb_id, exc)
-        write_source_state(
-            layout,
-            source_name="BindingDB",
-            status="normalization_error",
-            mode=cache_mode,
-            cache_path=cache_path,
-            record_id=pdb_id.upper(),
-            notes=str(exc),
-            extra={"configured_local_dir": local_dir or None},
-        )
-        return []
-
-    samples = [
-        sample.model_copy(update={
-            "provenance": {
-                **(sample.provenance or {}),
-                "cache_mode": cache_mode,
-                "cache_path": str(cache_path),
-                "configured_local_dir": local_dir or None,
-            },
-        })
-        for sample in samples
-    ]
-    write_source_state(
-        layout,
-        source_name="BindingDB",
-        status="ready",
-        mode=cache_mode,
-        cache_path=cache_path,
-        record_id=pdb_id.upper(),
-        record_count=len(samples),
-        notes="BindingDB enrichment loaded and normalized.",
-        extra={"configured_local_dir": local_dir or None},
-    )
-    return samples
+    return fetch_bindingdb_samples_for_pdb(pdb_id, config, layout=layout)
 
 
 def _delete_extracted_bundle(output_dir: Path, pdb_id: str) -> None:
@@ -229,48 +119,9 @@ def _load_external_assay_samples(
     *,
     layout: StorageLayout,
 ) -> dict[str, list]:
-    """Load locally available affinity sources for extract-time attachment."""
-    grouped: dict[str, list] = defaultdict(list)
+    from pbdata.pipeline.enrichment import load_external_assay_samples
 
-    if config.sources.skempi.enabled:
-        from pbdata.sources.skempi import load_skempi_csv
-
-        raw_path = config.sources.skempi.extra.get("local_path") or str(layout.raw_skempi_dir / "skempi_v2.csv")
-        path = Path(raw_path)
-        if path.exists():
-            for sample in load_skempi_csv(path, download=False):
-                if sample.pdb_id:
-                    grouped[sample.pdb_id].append(sample)
-        else:
-            logger.warning("SKEMPI enabled but file not found: %s", path)
-
-    if config.sources.pdbbind.enabled:
-        from pbdata.sources.pdbbind import PDBbindAdapter
-
-        local_dir_raw = config.sources.pdbbind.extra.get("local_dir")
-        if local_dir_raw:
-            local_dir = Path(str(local_dir_raw))
-            if local_dir.exists():
-                for sample in PDBbindAdapter(local_dir=local_dir).fetch_all():
-                    if sample.pdb_id:
-                        grouped[sample.pdb_id].append(sample)
-            else:
-                logger.warning("PDBbind enabled but local_dir not found: %s", local_dir)
-
-    if config.sources.biolip.enabled:
-        from pbdata.sources.biolip import BioLiPAdapter
-
-        local_dir_raw = config.sources.biolip.extra.get("local_dir")
-        if local_dir_raw:
-            local_dir = Path(str(local_dir_raw))
-            if local_dir.exists():
-                for sample in BioLiPAdapter(local_dir=local_dir).fetch_all():
-                    if sample.pdb_id:
-                        grouped[sample.pdb_id].append(sample)
-            else:
-                logger.warning("BioLiP enabled but local_dir not found: %s", local_dir)
-
-    return dict(grouped)
+    return load_external_assay_samples(config, layout=layout)
 
 
 def _raw_uniprot_ids(raw: dict) -> list[str]:
@@ -333,58 +184,9 @@ def _fetch_chembl_samples_for_raw(
     chem_descriptors: dict[str, dict[str, str]],
     config: AppConfig,
 ) -> list:
-    if not config.sources.chembl.enabled:
-        return []
+    from pbdata.pipeline.enrichment import fetch_chembl_samples_for_raw
 
-    from pbdata.sources.chembl import ChEMBLAdapter
-
-    accession_ids = _raw_uniprot_ids(raw)
-    inchikeys = _raw_ligand_inchikeys(raw, chem_descriptors)
-    if not accession_ids or not inchikeys:
-        return []
-
-    adapter = ChEMBLAdapter()
-    results: list = []
-    seen: set[str] = set()
-    raw_pdb_id = str(raw.get("rcsb_id") or "").upper()
-    chain_ids_by_uniprot = _raw_chain_ids_by_uniprot(raw)
-    for accession in accession_ids:
-        for inchikey in inchikeys:
-            try:
-                samples = adapter.fetch_by_uniprot_and_inchikey(accession, inchikey)
-            except Exception as exc:
-                logger.warning(
-                    "ChEMBL lookup failed for accession=%s inchikey=%s: %s",
-                    accession,
-                    inchikey,
-                    exc,
-                )
-                continue
-            for sample in samples:
-                if sample.sample_id in seen:
-                    continue
-                seen.add(sample.sample_id)
-                chain_ids = chain_ids_by_uniprot.get(accession, sample.chain_ids_receptor or [])
-                provenance = dict(sample.provenance or {})
-                ligand_key = sample.ligand_inchi_key or sample.ligand_id or sample.ligand_smiles or "unknown_ligand"
-                mutation_key = (
-                    sample.mutation_string
-                    or sample.wildtype_or_mutant
-                    or f"mutation_unknown:{sample.source_record_id}"
-                )
-                provenance["pair_grouping_override"] = "|".join([
-                    "protein_ligand",
-                    raw_pdb_id or "-",
-                    chain_group_key(chain_ids),
-                    ligand_key,
-                    mutation_key,
-                ])
-                results.append(sample.model_copy(update={
-                    "pdb_id": raw_pdb_id or sample.pdb_id,
-                    "chain_ids_receptor": chain_ids or sample.chain_ids_receptor,
-                    "provenance": provenance,
-                }))
-    return results
+    return fetch_chembl_samples_for_raw(raw, chem_descriptors, config)
 
 
 def _count_delimited_rows(path: Path, delimiter: str = ",") -> int | None:
@@ -941,6 +743,128 @@ def report(ctx: typer.Context) -> None:
         typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
 
 
+@app.command("report-bias")
+def report_bias_cmd(ctx: typer.Context) -> None:
+    """Generate automatic dataset-bias summaries from extracted records."""
+    from pbdata.reports.bias import build_bias_report
+
+    layout = _storage_layout(ctx)
+    if not (layout.extracted_dir / "entry").exists():
+        typer.echo(f"No extracted entries found in {layout.extracted_dir}. Run 'extract' first.")
+        return
+    report_path, _ = build_bias_report(layout.extracted_dir, layout.reports_dir)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Bias report written to {report_path}")
+
+
+@app.command("run-scenario-tests")
+def run_scenario_tests_cmd(ctx: typer.Context) -> None:
+    """Load scenario templates and emit a structured QA report scaffold."""
+    from pbdata.qa.scenario_runner import run_scenario_templates
+
+    layout = _storage_layout(ctx)
+    scenario_yaml = Path("specs/bio_agent_full_instruction_pack/qa/scenario_test_templates.yaml")
+    rubric_path = Path("specs/bio_agent_full_instruction_pack/qa/undesirable_state_rubric.md")
+    report_path, manifest_path = run_scenario_templates(
+        scenario_yaml,
+        rubric_path,
+        layout.qa_dir,
+    )
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Scenario test report written to {report_path}")
+    typer.echo(f"Scenario test manifest written to {manifest_path}")
+
+
+@app.command("predict-ligand-screening")
+def predict_ligand_screening_cmd(
+    ctx: typer.Context,
+    smiles: Annotated[Optional[str], typer.Option(help="SMILES input.")] = None,
+    sdf: Annotated[Optional[str], typer.Option(help="Path to SDF input.")] = None,
+    structure_file: Annotated[Optional[str], typer.Option(help="Path to PDB/mmCIF input.")] = None,
+    fasta: Annotated[Optional[str], typer.Option(help="FASTA sequence input.")] = None,
+) -> None:
+    """Normalize ligand-screening inputs and write a workflow manifest."""
+    from pbdata.prediction.engine import run_ligand_screening_workflow
+
+    layout = _storage_layout(ctx)
+    try:
+        out_path, manifest = run_ligand_screening_workflow(
+            layout,
+            smiles=smiles,
+            sdf=sdf,
+            structure_file=structure_file,
+            fasta=fasta,
+        )
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Ligand screening manifest written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("train-baseline-model")
+def train_baseline_model_cmd(ctx: typer.Context) -> None:
+    """Train the dependency-free split-aware ligand-memory baseline model."""
+    from pbdata.models.baseline_memory import train_ligand_memory_model
+
+    layout = _storage_layout(ctx)
+    out_path, manifest = train_ligand_memory_model(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Baseline model artifact written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("evaluate-baseline-model")
+def evaluate_baseline_model_cmd(ctx: typer.Context) -> None:
+    """Evaluate the ligand-memory baseline model against the current split files."""
+    from pbdata.models.baseline_memory import evaluate_ligand_memory_model
+
+    layout = _storage_layout(ctx)
+    out_path, manifest = evaluate_ligand_memory_model(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Baseline model evaluation written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("predict-peptide-binding")
+def predict_peptide_binding_cmd(
+    ctx: typer.Context,
+    structure_file: Annotated[str, typer.Option(help="Path to peptide PDB/mmCIF input.")],
+) -> None:
+    """Normalize peptide-binding inputs and write a workflow manifest."""
+    from pbdata.prediction.engine import run_peptide_binding_workflow
+
+    layout = _storage_layout(ctx)
+    try:
+        out_path, manifest = run_peptide_binding_workflow(layout, structure_file=structure_file)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Peptide binding manifest written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("score-pathway-risk")
+def score_pathway_risk_cmd(
+    ctx: typer.Context,
+    targets: Annotated[Optional[str], typer.Option(help="Comma-separated UniProt IDs.")] = None,
+) -> None:
+    """Write a pathway/risk summary from current dataset and graph context."""
+    from pbdata.risk.summary import build_pathway_risk_summary
+
+    layout = _storage_layout(ctx)
+    target_list = [item.strip() for item in str(targets or "").split(",") if item.strip()]
+    if not target_list:
+        typer.echo("Error: --targets is required and must contain at least one UniProt ID.")
+        raise typer.Exit(code=1)
+    out_path, summary = build_pathway_risk_summary(layout, targets=target_list)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Pathway risk summary written to {out_path}")
+    typer.echo(f"Workflow status: {summary['status']}")
+
+
 def _pair_split_items_from_layout(layout: StorageLayout) -> list:
     chains = _load_table_rows(layout.extracted_dir / "chains")
     assays = _load_table_rows(layout.extracted_dir / "assays")
@@ -1118,8 +1042,324 @@ def build_physics_features_cmd(ctx: typer.Context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# build-microstate-refinement
+# ---------------------------------------------------------------------------
+
+
+@app.command("build-microstate-refinement")
+def build_microstate_refinement_cmd(ctx: typer.Context) -> None:
+    """Build explicit protonation-policy planning records for local refinement."""
+    layout = _storage_layout(ctx)
+    from pbdata.features.mm_features import build_microstate_refinement_plan
+
+    microstate_path = layout.microstates_dir / "microstate_records.json"
+    if not microstate_path.exists():
+        typer.echo(f"No microstate records found at {microstate_path}. Run 'build-microstates' first.")
+        return
+
+    records_path, manifest_path = build_microstate_refinement_plan(
+        layout.extracted_dir,
+        layout.microstates_dir,
+        layout.microstate_refinement_dir,
+    )
+    record_count = 0
+    try:
+        record_count = len(json.loads(records_path.read_text(encoding="utf-8")))
+    except Exception:
+        record_count = 0
+    state_path = write_stage_state(
+        layout,
+        stage="build-microstate-refinement",
+        status="completed",
+        input_dir=layout.microstates_dir,
+        output_dir=layout.microstate_refinement_dir,
+        counts={"pairs_planned": record_count},
+        notes=(
+            "Pair-level protonation-policy planning records. "
+            "No external MM backend was executed."
+        ),
+    )
+    typer.echo(f"Microstate refinement records written to {records_path}")
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Microstate refinement manifest written to {manifest_path}")
+    typer.echo(f"Stage state: {state_path}")
+
+
+# ---------------------------------------------------------------------------
+# build-mm-job-manifests
+# ---------------------------------------------------------------------------
+
+
+@app.command("build-mm-job-manifests")
+def build_mm_job_manifests_cmd(ctx: typer.Context) -> None:
+    """Build backend-ready local MM job manifests from refinement plans."""
+    layout = _storage_layout(ctx)
+    from pbdata.features.mm_features import build_mm_job_manifests
+
+    refinement_path = layout.microstate_refinement_dir / "microstate_refinement_records.json"
+    if not refinement_path.exists():
+        typer.echo(
+            f"No microstate refinement records found at {refinement_path}. "
+            "Run 'build-microstate-refinement' first."
+        )
+        return
+
+    records_path, manifest_path = build_mm_job_manifests(
+        layout.microstate_refinement_dir,
+        layout.mm_jobs_dir,
+    )
+    record_count = 0
+    try:
+        record_count = len(json.loads(records_path.read_text(encoding="utf-8")))
+    except Exception:
+        record_count = 0
+    state_path = write_stage_state(
+        layout,
+        stage="build-mm-job-manifests",
+        status="completed",
+        input_dir=layout.microstate_refinement_dir,
+        output_dir=layout.mm_jobs_dir,
+        counts={"jobs_planned": record_count},
+        notes=(
+            "Backend-ready local MM job manifests for later Amber/CHARMM/OpenMM execution. "
+            "No MM engine was run in this stage."
+        ),
+    )
+    typer.echo(f"MM job records written to {records_path}")
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"MM job manifest written to {manifest_path}")
+    typer.echo(f"Stage state: {state_path}")
+
+
+# ---------------------------------------------------------------------------
+# run-mm-jobs
+# ---------------------------------------------------------------------------
+
+
+@app.command("run-mm-jobs")
+def run_mm_jobs_cmd(
+    ctx: typer.Context,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute",
+            help="Attempt execution when OpenMM is available. Otherwise validate bundles only.",
+        ),
+    ] = False,
+) -> None:
+    """Validate or dispatch local OpenMM-ready MM job bundles."""
+    layout = _storage_layout(ctx)
+    from pbdata.features.mm_features import run_mm_job_bundles
+
+    jobs_path = layout.mm_jobs_dir / "mm_job_records.json"
+    if not jobs_path.exists():
+        typer.echo(
+            f"No MM job records found at {jobs_path}. "
+            "Run 'build-mm-job-manifests' first."
+        )
+        return
+
+    results_path, manifest_path = run_mm_job_bundles(layout.mm_jobs_dir, execute=execute)
+    results = []
+    try:
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+    except Exception:
+        results = []
+    backend_unavailable = sum(1 for row in results if str(row.get("status") or "") == "backend_unavailable")
+    ready = sum(
+        1
+        for row in results
+        if str(row.get("status") or "") in {"backend_ready_not_executed", "backend_ready_execution_deferred"}
+    )
+    invalid = sum(1 for row in results if str(row.get("status") or "") == "invalid_bundle")
+    state_status = "completed" if results else "skipped"
+    state_path = write_stage_state(
+        layout,
+        stage="run-mm-jobs",
+        status=state_status,
+        input_dir=layout.mm_jobs_dir,
+        output_dir=layout.mm_jobs_dir,
+        counts={
+            "jobs_seen": len(results),
+            "backend_ready_jobs": ready,
+            "backend_unavailable_jobs": backend_unavailable,
+            "invalid_bundles": invalid,
+        },
+        notes=(
+            "MM job execution stage validates OpenMM-ready bundles and backend availability. "
+            "It does not fabricate refinement output when the backend is unavailable or execution is deferred."
+        ),
+    )
+    typer.echo(f"MM job execution results written to {results_path}")
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"MM job execution manifest written to {manifest_path}")
+    typer.echo(f"Stage state: {state_path}")
+
+
+# ---------------------------------------------------------------------------
+# site-centric feature pipeline
+# ---------------------------------------------------------------------------
+
+
+@app.command("run-feature-pipeline")
+def run_feature_pipeline_cmd(
+    ctx: typer.Context,
+    run_mode: Annotated[
+        str,
+        typer.Option(
+            "--run-mode",
+            help="Feature pipeline run mode: full_build | resume | stage_only | inference_prepare",
+        ),
+    ] = "full_build",
+    stage_name: Annotated[
+        Optional[str],
+        typer.Option("--stage-name", help="Stage name for stage_only mode."),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        typer.Option("--run-id", help="Optional explicit run identifier."),
+    ] = None,
+    degraded_mode: Annotated[
+        bool,
+        typer.Option("--degraded-mode/--no-degraded-mode", help="Allow explicit degraded proxy site physics if no surrogate checkpoint is available."),
+    ] = True,
+    fail_hard: Annotated[
+        bool,
+        typer.Option("--fail-hard/--no-fail-hard", help="Stop on the first failed record/stage."),
+    ] = False,
+    gpu_enabled: Annotated[
+        bool,
+        typer.Option("--gpu/--no-gpu", help="Record whether GPU-backed site physics is expected for this run."),
+    ] = False,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", help="CPU worker count recorded in the run config."),
+    ] = 1,
+) -> None:
+    """Run the new site-centric feature pipeline under artifacts/."""
+    from pbdata.pipeline.feature_execution import run_feature_pipeline
+
+    layout = _storage_layout(ctx)
+    result = run_feature_pipeline(
+        layout,
+        run_mode=run_mode,
+        stage_only=stage_name,
+        run_id=run_id,
+        degraded_mode=degraded_mode,
+        fail_hard=fail_hard,
+        gpu_enabled=gpu_enabled,
+        cpu_workers=_coerce_workers(workers),
+    )
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Feature pipeline run id: {result['run_id']}")
+    typer.echo(f"Artifacts root: {result['artifacts_root']}")
+    typer.echo(f"Input manifest: {result['input_manifest']}")
+    for stage, status in result["stage_statuses"].items():
+        typer.echo(f"{stage}: {status}")
+
+
+@app.command("export-analysis-queue")
+def export_analysis_queue_cmd(
+    ctx: typer.Context,
+    run_id: Annotated[
+        Optional[str],
+        typer.Option("--run-id", help="Existing feature-pipeline run id to export archetype queues from."),
+    ] = None,
+) -> None:
+    """Export motif/archetype analysis queues for external ORCA/APBS/OpenMM runs."""
+    from pbdata.pipeline.feature_execution import export_analysis_queue
+
+    layout = _storage_layout(ctx)
+    resolved_run_id = run_id
+    if not resolved_run_id:
+        manifests = sorted(
+            layout.artifact_manifests_dir.glob("*_input_manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not manifests:
+            typer.echo("Error: --run-id is required until at least one site-centric feature run exists.")
+            raise typer.Exit(code=1)
+        resolved_run_id = manifests[0].name.replace("_input_manifest.json", "")
+    result = export_analysis_queue(layout, run_id=resolved_run_id)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Feature pipeline run id: {resolved_run_id}")
+    typer.echo(f"Archetypes: {result['archetypes']}")
+    typer.echo(f"Analysis queue: {result['queue']}")
+    typer.echo(f"Batch manifest: {result['batch_manifest']}")
+
+
+@app.command("ingest-physics-results")
+def ingest_physics_results_cmd(
+    ctx: typer.Context,
+    batch_id: Annotated[
+        str,
+        typer.Option("--batch-id", help="External analysis batch id to ingest."),
+    ],
+) -> None:
+    """Ingest parsed ORCA/APBS/OpenMM outputs into normalized physics targets."""
+    from pbdata.pipeline.physics_feedback import ingest_external_analysis_results
+
+    layout = _storage_layout(ctx)
+    result = ingest_external_analysis_results(layout, batch_id=batch_id)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Physics targets: {result['physics_targets']}")
+    typer.echo(f"Failed fragments: {result['failed_fragments']}")
+    typer.echo(f"Manifest: {result['manifest']}")
+
+
+@app.command("train-site-physics-surrogate")
+def train_site_physics_surrogate_cmd(
+    ctx: typer.Context,
+    batch_id: Annotated[
+        str,
+        typer.Option("--batch-id", help="Physics target batch id."),
+    ],
+    source_run_id: Annotated[
+        str,
+        typer.Option("--source-run-id", help="Site-centric feature run id used to generate archetypes/env vectors."),
+    ],
+    surrogate_run_id: Annotated[
+        Optional[str],
+        typer.Option("--surrogate-run-id", help="Optional explicit surrogate training run id."),
+    ] = None,
+) -> None:
+    """Train the deterministic site-physics surrogate from normalized physics targets."""
+    from pbdata.pipeline.physics_feedback import train_site_physics_surrogate
+
+    layout = _storage_layout(ctx)
+    result = train_site_physics_surrogate(
+        layout,
+        batch_id=batch_id,
+        source_run_id=source_run_id,
+        surrogate_run_id=surrogate_run_id,
+    )
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Checkpoint: {result['checkpoint']}")
+    typer.echo(f"Manifest: {result['manifest']}")
+    typer.echo(f"Latest pointer: {result['latest']}")
+
+
+# ---------------------------------------------------------------------------
 # build-graph
 # ---------------------------------------------------------------------------
+
+
+@app.command("build-conformational-states")
+def build_conformational_states_cmd(ctx: typer.Context) -> None:
+    """Catalog experimental and planned predicted conformational states."""
+    from pbdata.dataset.conformations import build_conformation_states
+
+    layout = _storage_layout(ctx)
+    extracted_dir = layout.extracted_dir
+    if not (extracted_dir / "entry").exists():
+        typer.echo(f"No extracted entries found in {extracted_dir}. Run 'extract' first.")
+        return
+
+    states_path, manifest_path = build_conformation_states(extracted_dir, layout.conformations_dir)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Conformational states written to {states_path}")
+    typer.echo(f"Conformation manifest written to {manifest_path}")
 
 
 @app.command("build-graph")
@@ -1547,6 +1787,7 @@ def extract_cmd(
         return
 
     cfg: AppConfig = ctx.obj.get("config", AppConfig())
+    structure_mirror = str(cfg.sources.rcsb.extra.get("structure_mirror") or "rcsb").strip().lower()
     assay_samples_by_pdb = _load_external_assay_samples(cfg, layout=layout)
 
     # Collect ligand comp_ids for batch descriptor fetch
@@ -1596,6 +1837,7 @@ def extract_cmd(
             structures_dir=struct_dir if download_structures else None,
             download_structures=download_structures,
             download_pdb=download_pdb,
+            structure_mirror=structure_mirror,
         )
         write_records_json(records, out_dir)
         return path.name, "ok"

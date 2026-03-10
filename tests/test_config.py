@@ -13,6 +13,12 @@ from typer.testing import CliRunner
 
 from pbdata.cli import app
 from pbdata.config import AppConfig, load_config
+from pbdata.gui import (
+    _load_sources_config,
+    _load_structure_mirror,
+    _save_sources_config,
+    _validate_source_path,
+)
 from pbdata.logging_config import setup_logging
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
@@ -21,6 +27,12 @@ _LOCAL_TMP.mkdir(exist_ok=True)
 
 def _tmp_file(name: str) -> Path:
     return _LOCAL_TMP / f"{uuid4().hex}_{name}"
+
+
+def _tmp_dir(name: str) -> Path:
+    path = _LOCAL_TMP / f"{uuid4().hex}_{name}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -178,3 +190,55 @@ def test_cli_missing_config_fails_clearly() -> None:
     assert result.exit_code != 0
     assert isinstance(result.exception, FileNotFoundError)
     assert "Config file not found" in str(result.exception)
+
+
+def test_gui_source_config_persists_structure_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_root = _tmp_dir("gui_sources_cfg")
+    cfg_path = tmp_root / "sources.yaml"
+    monkeypatch.setattr("pbdata.gui._SOURCES_CFG", cfg_path)
+
+    _save_sources_config(
+        {"rcsb": True, "bindingdb": False, "chembl": False, "pdbbind": False, "biolip": False, "skempi": False},
+        {"bindingdb": "", "pdbbind": "", "biolip": "", "skempi": ""},
+        storage_root=str(tmp_root),
+        structure_mirror="pdbj",
+    )
+
+    enabled, paths, storage_root = _load_sources_config()
+    assert enabled["rcsb"] is True
+    assert paths["bindingdb"] == ""
+    assert storage_root == str(tmp_root)
+    assert _load_structure_mirror() == "pdbj"
+
+
+def test_validate_source_path_reports_local_dataset_readiness() -> None:
+    tmp_root = _tmp_dir("source_path_validation")
+    pdbbind_root = tmp_root / "pdbbind"
+    (pdbbind_root / "index").mkdir(parents=True)
+    (pdbbind_root / "index" / "INDEX_general_PL_data.2020").write_text(
+        "1ABC 2.0 2020 0.0 Kd=5.0nM // example\n",
+        encoding="utf-8",
+    )
+    biolip_root = tmp_root / "biolip"
+    biolip_root.mkdir(parents=True)
+    (biolip_root / "BioLiP.txt").write_text(
+        "PDB_ID\treceptor_chain\tbinding_site_residues\tligand_chain\tligand_ID\tligand_serial\tbinding_affinity\n"
+        "1ABC\tA\tTYR15 ASP34\tB\tATP\t401\tKd=5.0 nM\n",
+        encoding="utf-8",
+    )
+
+    status, message = _validate_source_path("bindingdb", "")
+    assert status == "ready"
+    assert "live BindingDB API" in message
+
+    status, message = _validate_source_path("pdbbind", str(pdbbind_root))
+    assert status == "ready"
+    assert "parsed successfully" in message
+
+    status, message = _validate_source_path("biolip", str(biolip_root))
+    assert status == "ready"
+    assert "parsed successfully" in message
+
+    status, message = _validate_source_path("pdbbind", "")
+    assert status == "error"
+    assert "requires a local dataset directory" in message

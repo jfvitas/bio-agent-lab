@@ -1,0 +1,30 @@
+
+scenarios:
+
+  ligand_offtarget_basic:
+    user_role: medicinal_chemist
+    goal: identify off-target binding risks for a candidate ligand
+    inputs:
+      smiles: "<SMILES_STRING>"
+    expected_outputs:
+      - ranked_target_list
+      - predicted_affinity
+      - confidence_score
+      - pathway_risk_summary
+    forbidden_behaviors:
+      - empty_output_without_warning
+      - silent_failure
+      - missing_confidence_scores
+
+  peptide_binding_prediction:
+    user_role: protein_engineer
+    goal: predict binding partners for a peptide structure
+    inputs:
+      structure_file: "<PDB_OR_CIF>"
+    expected_outputs:
+      - predicted_targets
+      - binding_probability
+      - interface_summary
+    forbidden_behaviors:
+      - incorrect_chain_mapping
+      - missing_interface_data

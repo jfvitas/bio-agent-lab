@@ -1,0 +1,9 @@
+{
+  "batch_id": "physics_batch_001",
+  "status": "ready_for_ingest",
+  "orca_results_path": "external_analysis/orca/physics_batch_001/parsed/parsed_results.parquet",
+  "apbs_results_path": "external_analysis/apbs/physics_batch_001/parsed/parsed_results.parquet",
+  "openmm_results_path": "external_analysis/openmm/physics_batch_001/parsed/parsed_results.parquet",
+  "failed_jobs_path": "external_analysis/physics_batch_001_failed_jobs.parquet",
+  "notes": "Replace with real paths after offline analysis completes."
+}

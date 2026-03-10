@@ -23,6 +23,44 @@ def _load_json_rows(path: Path) -> list[dict[str, Any]]:
     return []
 
 
+def summarize_microstates_to_physics_features(
+    microstates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Summarize microstate assignments into dense pair-style physics features."""
+    if not microstates:
+        return None
+    charges = [float(item.get("adjusted_charge_estimate") or 0.0) for item in microstates]
+    same_charge = 0
+    opposite_charge = 0
+    metal_contacts = 0
+    acidic_cluster_penalty = 0.0
+    for item in microstates:
+        same_d = item.get("nearest_same_charge_distance")
+        opp_d = item.get("nearest_opposite_charge_distance")
+        metal_d = item.get("nearest_metal_distance")
+        if same_d is not None and float(same_d) < 4.5:
+            same_charge += 1
+        if opp_d is not None and float(opp_d) < 4.5:
+            opposite_charge += 1
+        if metal_d is not None and float(metal_d) < 3.2:
+            metal_contacts += 1
+        if item.get("residue_name") in {"ASP", "GLU"} and same_d is not None and float(same_d) < 4.0:
+            acidic_cluster_penalty += 1.0 / max(float(same_d), 0.1)
+
+    return {
+        "microstate_record_count": len(microstates),
+        "estimated_net_charge": round(sum(charges), 4),
+        "mean_abs_residue_charge": round(sum(abs(charge) for charge in charges) / len(charges), 4),
+        "positive_residue_count": sum(1 for charge in charges if charge > 0.2),
+        "negative_residue_count": sum(1 for charge in charges if charge < -0.2),
+        "same_charge_contact_count": same_charge,
+        "opposite_charge_contact_count": opposite_charge,
+        "metal_contact_count": metal_contacts,
+        "acidic_cluster_penalty": round(acidic_cluster_penalty, 4),
+        "local_electrostatic_balance": round(opposite_charge - same_charge - acidic_cluster_penalty, 4),
+    }
+
+
 def build_local_physics_features(
     microstate_path: Path,
     output_dir: Path,
@@ -34,40 +72,14 @@ def build_local_physics_features(
     feature_rows: list[dict[str, Any]] = []
     for row in rows:
         microstates = row.get("microstates") or []
-        if not microstates:
+        summary = summarize_microstates_to_physics_features(microstates)
+        if summary is None:
             continue
-        charges = [float(item.get("adjusted_charge_estimate") or 0.0) for item in microstates]
-        same_charge = 0
-        opposite_charge = 0
-        metal_contacts = 0
-        acidic_cluster_penalty = 0.0
-        for item in microstates:
-            same_d = item.get("nearest_same_charge_distance")
-            opp_d = item.get("nearest_opposite_charge_distance")
-            metal_d = item.get("nearest_metal_distance")
-            if same_d is not None and float(same_d) < 4.5:
-                same_charge += 1
-            if opp_d is not None and float(opp_d) < 4.5:
-                opposite_charge += 1
-            if metal_d is not None and float(metal_d) < 3.2:
-                metal_contacts += 1
-            if item.get("residue_name") in {"ASP", "GLU"} and same_d is not None and float(same_d) < 4.0:
-                acidic_cluster_penalty += 1.0 / max(float(same_d), 0.1)
-
         feature_rows.append({
             "pdb_id": row.get("pdb_id"),
             "pair_identity_key": row.get("pair_identity_key"),
             "binding_affinity_type": row.get("binding_affinity_type"),
-            "microstate_record_count": len(microstates),
-            "estimated_net_charge": round(sum(charges), 4),
-            "mean_abs_residue_charge": round(sum(abs(charge) for charge in charges) / len(charges), 4),
-            "positive_residue_count": sum(1 for charge in charges if charge > 0.2),
-            "negative_residue_count": sum(1 for charge in charges if charge < -0.2),
-            "same_charge_contact_count": same_charge,
-            "opposite_charge_contact_count": opposite_charge,
-            "metal_contact_count": metal_contacts,
-            "acidic_cluster_penalty": round(acidic_cluster_penalty, 4),
-            "local_electrostatic_balance": round(opposite_charge - same_charge - acidic_cluster_penalty, 4),
+            **summary,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "method": "microstate_proxy_electrostatics_v1",
         })

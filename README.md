@@ -34,10 +34,13 @@ a **Typer CLI**. Most users will work exclusively through the GUI.
 8. [Quality scoring](#quality-scoring)
 9. [Dataset splitting](#dataset-splitting)
 10. [Configuration](#configuration)
-11. [Project layout](#project-layout)
-12. [Testing](#testing)
-13. [Development](#development)
-14. [Roadmap](#roadmap)
+11. [Prediction, risk, and QA layers](#prediction-risk-and-qa-layers)
+12. [Agent handoff system](#agent-handoff-system)
+13. [Specification documents](#specification-documents)
+14. [Project layout](#project-layout)
+15. [Testing](#testing)
+16. [Development](#development)
+17. [Roadmap](#roadmap)
 
 ---
 
@@ -66,6 +69,21 @@ BioLiP ──────┘  raw JSON     canonical   6-table   train.txt
 Additional ML pipeline stages (graph building, feature engineering, training
 example assembly, custom training sets, release snapshots) are accessible from
 the GUI and CLI.
+
+### Extended pipeline (layers 5–7)
+
+| Stage | What happens |
+|-------|--------------|
+| **Predict (ligand screening)** | Accepts SMILES/SDF/structure input, validates, writes prediction manifest |
+| **Predict (peptide binding)** | Accepts structure file, validates existence, writes prediction manifest |
+| **Score pathway risk** | Matches targets against dataset pairs, computes severity scores |
+| **Run scenario tests** | Self-test against QA scenario templates, verifies output completeness |
+| **Report bias** | Analyzes dataset composition: resolution bins, method balance, scaffold diversity |
+| **Build conformational states** | Materializes experimental + predicted conformational state records |
+| **Build features** | Physics-based, molecular-mechanics, microstate, and pathway features |
+| **Build graph** | Knowledge graph with protein/ligand/pathway nodes and interaction edges |
+| **Build training examples** | Assembles feature + graph + assay data into ML-ready records |
+| **Site-centric feature pipeline** | Runs site extraction, physics surrogates, and graph materialization |
 
 ---
 
@@ -438,6 +456,69 @@ Writes `data/splits/train.txt`, `val.txt`, `test.txt`, and `metadata.json`.
 | `--hash-only` | off | Use fast hash split (skips clustering) |
 | `--threshold` | `0.30` | Jaccard similarity threshold for clustering |
 
+### `pbdata predict-ligand-screening`
+
+Runs ligand off-target screening prediction workflow.
+
+| Flag | Description |
+|------|-------------|
+| `--smiles` | SMILES string for the candidate ligand |
+| `--sdf` | Path to SDF file |
+| `--structure-file` | Path to structure file (CIF/PDB) |
+| `--fasta` | FASTA sequence |
+
+### `pbdata predict-peptide-binding`
+
+Runs peptide binding prediction workflow.
+
+| Flag | Description |
+|------|-------------|
+| `--structure-file` | Path to structure file (CIF/PDB) |
+
+### `pbdata score-pathway-risk`
+
+Scores pathway activation risk for specified targets.
+
+| Flag | Description |
+|------|-------------|
+| `--targets` | Comma-separated UniProt accessions |
+
+### `pbdata run-scenario-tests`
+
+Runs QA scenario templates and writes a scenario test report.
+
+### `pbdata report-bias`
+
+Analyzes dataset composition bias (resolution, method, scaffold diversity).
+
+### `pbdata build-conformational-states`
+
+Materializes conformational state records from extracted data.
+
+### `pbdata build-graph`
+
+Constructs the protein interaction knowledge graph (nodes + edges).
+
+### `pbdata run-feature-pipeline`
+
+Runs the site-centric feature pipeline (site extraction, physics surrogates, graph materialization).
+
+### `pbdata ingest-physics-results`
+
+Ingests external physics analysis results (ORCA/APBS/OpenMM).
+
+### `pbdata train-site-physics-surrogate`
+
+Trains a linear surrogate model over site environment descriptors.
+
+### `pbdata train-baseline-model`
+
+Trains a baseline affinity prediction model.
+
+### `pbdata evaluate-baseline-model`
+
+Evaluates a trained baseline model on the test split.
+
 ### Quick start (CLI)
 
 ```bash
@@ -730,6 +811,99 @@ sources:
 
 ---
 
+## Prediction, risk, and QA layers
+
+The platform includes scaffold implementations for layers 5–7 of the
+bio-agent architecture. These modules produce structured manifest files
+documenting what a trained model would output, while clearly marking
+predictions as unavailable until model training is complete.
+
+### Prediction engine (`src/pbdata/prediction/`)
+
+- **`engine.py`** — Input type detection, SMILES validation, structure file
+  existence checks. Orchestrates ligand screening and peptide binding workflows.
+- **`ligand_screening.py`** — Ligand off-target screening logic.
+- **`peptide_binding.py`** — Peptide binding partner prediction logic.
+- **`variant_effects.py`** — Mutation variant effect prediction.
+
+### Risk scoring (`src/pbdata/risk/`)
+
+- **`summary.py`** — Pathway risk summary: matches targets against dataset pairs,
+  computes composite risk scores with configurable binding/pathway weights.
+- **`pathway_reasoning.py`** — Pathway overlap and activation reasoning.
+- **`severity_scoring.py`** — Risk severity level assignment (low/medium/high).
+
+### QA system (`src/pbdata/qa/`)
+
+- **`scenario_runner.py`** — Runs scenario test templates from
+  `specs/bio_agent_full_instruction_pack/qa/scenario_test_templates.yaml`.
+  Verifies that expected outputs exist and contain non-null values.
+
+### Bias reporting (`src/pbdata/reports/`)
+
+- **`bias.py`** — Analyzes dataset composition: resolution bin distribution,
+  experimental method balance, scaffold diversity, organism coverage.
+
+### Conformational states (`src/pbdata/dataset/conformations.py`)
+
+Materializes conformational state records from extracted structural data,
+combining experimental states with planned predicted states.
+
+### Baseline models (`src/pbdata/models/`)
+
+- **`affinity_models.py`** — Baseline affinity prediction model (train + evaluate).
+- **`off_target_models.py`** — Off-target binding risk model.
+- **`baseline_memory.py`** — Model checkpoint and metric persistence.
+
+### Site-centric feature pipeline (`src/pbdata/pipeline/`)
+
+- **`feature_execution.py`** — Full site-centric feature pipeline: site extraction,
+  physics proxy computation, graph materialization, training example export.
+  Requires `torch` and `gemmi` (optional dependencies).
+- **`physics_feedback.py`** — Offline physics results ingest (ORCA/APBS/OpenMM),
+  linear surrogate training over site environment descriptors.
+- **`enrichment.py`** — Cross-source enrichment helpers.
+
+---
+
+## Agent handoff system
+
+The `handoffs/` directory contains structured review artifacts produced by
+specialized agent roles. Each handoff is a markdown file with YAML frontmatter
+tracking task ID, role, date, file permissions, required tests, and pass/fail
+status.
+
+| Handoff | Role | Summary |
+|---------|------|---------|
+| `2026-03-09_spec_compliance_review_architect.md` | Architect | 8 architectural issues against master spec |
+| `2026-03-09_scenario_test_execution_user_tester.md` | User Tester | 7 usability/correctness problems from scenario execution |
+| `2026-03-09_full_codebase_qa_reviewer.md` | QA Reviewer | 4 critical, 4 major, 5 minor issues with severity assessment |
+
+Handoff format follows `specs/AGENT_OUTPUT_REQUIREMENTS.md`.
+
+---
+
+## Specification documents
+
+The `specs/` directory contains authoritative engineering specifications:
+
+| File | Description |
+|------|-------------|
+| `bio_agent_master_instruction_file.md` | Master engineering spec for the 7-layer architecture |
+| `bio_agent_full_instruction_pack/` | Full spec pack: layer definitions, QA rubrics, scenario templates |
+| `AGENT_OUTPUT_REQUIREMENTS.md` | Format requirements for agent handoff artifacts |
+| `FEATURE_PIPELINE_EXECUTION_SPEC.md` | Site-centric feature pipeline contract |
+| `SITE_CENTRIC_PHYSICS_SPEC.md` | Physics-based feature extraction specification |
+| `local_physics_agent_pack/` | Local physics computation agent instructions |
+| `canonical_schema.yaml` | Canonical schema definition |
+| `quality_rules.yaml` | Quality scoring rules |
+| `split_policy.yaml` | Dataset splitting policy |
+| `source_requirements.md` | Data source adapter requirements |
+| `coding_standards.md` | Coding conventions |
+| `repo_contract.md` | Repository structure contract |
+
+---
+
 ## Project layout
 
 ```
@@ -779,7 +953,8 @@ bio-agent-lab/
 │       │   ├── audit.py              # Quality flags + score
 │       │   └── stress_panel.py       # Stress panel evaluation helpers
 │       ├── dataset/
-│       │   └── splits.py             # k-mer Jaccard clustering splits
+│       │   ├── splits.py             # k-mer Jaccard clustering splits
+│       │   └── conformations.py      # Conformational state materialization
 │       ├── features/
 │       │   ├── builder.py            # Feature aggregation
 │       │   ├── microstate.py         # Conformational microstate features
@@ -790,9 +965,41 @@ bio-agent-lab/
 │       │   ├── builder.py            # Knowledge graph construction
 │       │   ├── connectors.py         # STRING, Reactome, BioGRID connectors
 │       │   └── identifier_map.py     # UniProt/Ensembl/Entrez ID mapping
+│       ├── prediction/
+│       │   ├── engine.py             # Prediction orchestration + input validation
+│       │   ├── ligand_screening.py   # Ligand off-target screening
+│       │   ├── peptide_binding.py    # Peptide binding prediction
+│       │   └── variant_effects.py    # Mutation variant effects
+│       ├── risk/
+│       │   ├── summary.py            # Pathway risk summary
+│       │   ├── pathway_reasoning.py  # Pathway overlap reasoning
+│       │   └── severity_scoring.py   # Risk severity levels
+│       ├── qa/
+│       │   └── scenario_runner.py    # QA scenario test execution
+│       ├── reports/
+│       │   └── bias.py               # Dataset composition bias analysis
+│       ├── models/
+│       │   ├── affinity_models.py    # Baseline affinity model
+│       │   ├── off_target_models.py  # Off-target binding model
+│       │   └── baseline_memory.py    # Model checkpoint persistence
+│       ├── data_pipeline/
+│       │   ├── extraction.py         # Extraction pipeline helpers
+│       │   ├── ingestion.py          # Ingestion pipeline helpers
+│       │   └── normalization.py      # Normalization pipeline helpers
 │       └── training/
 │           └── assembler.py          # Training example assembly
-├── tests/                             # 263+ unit tests, 71+ integration tests
+├── specs/
+│   ├── bio_agent_master_instruction_file.md
+│   ├── bio_agent_full_instruction_pack/   # Full 7-layer spec pack + QA rubrics
+│   ├── AGENT_OUTPUT_REQUIREMENTS.md
+│   ├── FEATURE_PIPELINE_EXECUTION_SPEC.md
+│   ├── SITE_CENTRIC_PHYSICS_SPEC.md
+│   └── local_physics_agent_pack/          # Physics computation agent specs
+├── handoffs/                              # Agent review artifacts (YAML frontmatter)
+│   ├── 2026-03-09_spec_compliance_review_architect.md
+│   ├── 2026-03-09_scenario_test_execution_user_tester.md
+│   └── 2026-03-09_full_codebase_qa_reviewer.md
+├── tests/                             # 297+ unit tests, 71+ integration tests
 │   ├── conftest.py                    # Fixtures
 │   ├── test_smoke.py                  # Import smoke tests
 │   ├── test_schema.py                 # Schema validation
@@ -815,7 +1022,15 @@ bio-agent-lab/
 │   ├── test_custom_training_set.py    # Custom training sets
 │   ├── test_structural_edge_cases.py  # Panel A/B: 100+ unit + integration tests
 │   ├── test_stress_panel.py           # Panel A stress tests
-│   └── test_stress_panel_c.py         # Panel C: 48 integration tests
+│   ├── test_stress_panel_c.py         # Panel C: 48 integration tests
+│   ├── test_prediction_engine.py      # Prediction engine tests
+│   ├── test_risk_scoring.py           # Risk scoring tests
+│   ├── test_conformational_state.py   # Conformational state tests
+│   ├── test_baseline_memory.py        # Model persistence tests
+│   ├── test_feature_execution.py      # Site-centric feature pipeline tests
+│   ├── test_physics_feedback.py       # Physics surrogate tests
+│   ├── test_mm_features.py            # Molecular mechanics feature tests
+│   └── test_full_scope_architecture.py  # Architecture compliance tests
 ├── data/
 │   ├── raw/rcsb/                      # Raw RCSB GraphQL JSON
 │   ├── raw/skempi/                    # Raw SKEMPI CSV
@@ -833,7 +1048,11 @@ bio-agent-lab/
 │   ├── training_examples/             # Assembled training records
 │   ├── splits/                        # train/val/test splits
 │   ├── audit/                         # Audit summary
-│   └── reports/                       # Statistics reports
+│   ├── reports/                       # Statistics reports
+│   ├── conformations/                 # Conformational state records
+│   ├── prediction/                    # Prediction manifests (ligand/peptide)
+│   ├── qa/                            # Scenario test reports
+│   └── risk/                          # Pathway risk summaries
 ├── docs/
 │   ├── bio_agent_full_scope_architecture.md
 │   ├── bio_agent_full_scope_gap_analysis.md
@@ -873,11 +1092,13 @@ pytest tests/test_stress_panel_c.py -m integration -v
 
 ### Test coverage
 
-- **263+ unit tests** — entity classification, bound object detection,
+- **297+ unit tests** — entity classification, bound object detection,
   oligomeric state inference, covalent warhead detection, membrane context,
   quality flags, schema validation, config loading, assay merge, feature
   engineering, graph construction, training assembly, master export,
-  release artifacts, custom training sets, GUI integration
+  release artifacts, custom training sets, GUI integration, prediction engine,
+  risk scoring, conformational states, bias reporting, baseline models,
+  site-centric feature pipeline, physics surrogates, architecture compliance
 - **71+ integration tests** — Panel A (10 entries), Panel B (10 entries),
   Panel C (48 tests across 12 entries covering classification flags,
   source expectations, multi-table extraction, and field coverage)
@@ -939,6 +1160,16 @@ pbdata-gui
 
 ## Roadmap
 
+- [x] Prediction engine scaffold (ligand screening, peptide binding)
+- [x] Pathway risk scoring with severity levels
+- [x] QA scenario testing framework
+- [x] Dataset bias reporting
+- [x] Conformational state materialization
+- [x] Site-centric feature pipeline with physics surrogates
+- [x] Baseline affinity model training/evaluation
+- [x] Agent handoff system with structured review artifacts
+- [ ] Train actual prediction models (replace scaffold manifests with real predictions)
+- [ ] RDKit SMILES validation for ligand screening input
 - [ ] UniProt enrichment (GO terms, pathways, protein families, gene names)
 - [ ] InterPro/Pfam/CATH domain annotations
 - [ ] Interface residue extraction from mmCIF coordinates

@@ -32,6 +32,14 @@ class StorageLayout:
         return self.root / "data"
 
     @property
+    def artifacts_dir(self) -> Path:
+        return self.root / "artifacts"
+
+    @property
+    def interim_dir(self) -> Path:
+        return self.data_dir / "interim"
+
+    @property
     def raw_rcsb_dir(self) -> Path:
         return self.data_dir / "raw" / "rcsb"
 
@@ -56,6 +64,10 @@ class StorageLayout:
         return self.data_dir / "reports"
 
     @property
+    def feature_reports_dir(self) -> Path:
+        return self.artifacts_dir / "reports"
+
+    @property
     def splits_dir(self) -> Path:
         return self.data_dir / "splits"
 
@@ -72,6 +84,62 @@ class StorageLayout:
         return self.data_dir / "catalog" / "source_state"
 
     @property
+    def artifact_manifests_dir(self) -> Path:
+        return self.artifacts_dir / "manifests"
+
+    @property
+    def artifact_logs_dir(self) -> Path:
+        return self.artifacts_dir / "logs"
+
+    @property
+    def artifact_caches_dir(self) -> Path:
+        return self.artifacts_dir / "caches"
+
+    @property
+    def canonical_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "canonical"
+
+    @property
+    def prepared_structures_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "prepared_structures"
+
+    @property
+    def base_features_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "base_features"
+
+    @property
+    def site_physics_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "site_physics"
+
+    @property
+    def graphs_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "graphs"
+
+    @property
+    def training_examples_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "training_examples"
+
+    @property
+    def site_envs_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "site_envs"
+
+    @property
+    def archetypes_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "archetypes"
+
+    @property
+    def external_analysis_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "external_analysis"
+
+    @property
+    def physics_targets_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "physics_targets"
+
+    @property
+    def surrogate_training_artifacts_dir(self) -> Path:
+        return self.artifacts_dir / "surrogate_training"
+
+    @property
     def extracted_dir(self) -> Path:
         return self.data_dir / "extracted"
 
@@ -84,8 +152,36 @@ class StorageLayout:
         return self.data_dir / "graph"
 
     @property
+    def conformations_dir(self) -> Path:
+        return self.data_dir / "conformations"
+
+    @property
+    def prediction_dir(self) -> Path:
+        return self.data_dir / "prediction"
+
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
     def features_dir(self) -> Path:
         return self.data_dir / "features"
+
+    @property
+    def structural_feature_exports_dir(self) -> Path:
+        return self.root / "features" / "structural_features"
+
+    @property
+    def ligand_feature_exports_dir(self) -> Path:
+        return self.root / "features" / "ligand_features"
+
+    @property
+    def interface_feature_exports_dir(self) -> Path:
+        return self.root / "features" / "interface_features"
+
+    @property
+    def graph_feature_exports_dir(self) -> Path:
+        return self.root / "features" / "graph_features"
 
     @property
     def microstates_dir(self) -> Path:
@@ -96,12 +192,28 @@ class StorageLayout:
         return self.features_dir / "physics"
 
     @property
+    def microstate_refinement_dir(self) -> Path:
+        return self.features_dir / "microstate_refinement"
+
+    @property
+    def mm_jobs_dir(self) -> Path:
+        return self.features_dir / "mm_jobs"
+
+    @property
     def training_dir(self) -> Path:
         return self.data_dir / "training_examples"
 
     @property
     def releases_dir(self) -> Path:
         return self.data_dir / "releases"
+
+    @property
+    def qa_dir(self) -> Path:
+        return self.data_dir / "qa"
+
+    @property
+    def risk_dir(self) -> Path:
+        return self.data_dir / "risk"
 
 
 def resolve_storage_root(storage_root: str | Path | None) -> Path:

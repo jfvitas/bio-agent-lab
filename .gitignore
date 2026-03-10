@@ -44,6 +44,12 @@ data/training_examples/*
 !data/graph/.gitkeep
 !data/training_examples/.gitkeep
 
+# Runtime-generated data directories
+data/conformations/*
+data/prediction/*
+data/qa/*
+data/risk/*
+
 # Generated output files (root level)
 canonical_entries.csv
 canonical_pairs.csv

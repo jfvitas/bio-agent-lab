@@ -57,6 +57,7 @@ _SOURCE_PATH_FIELDS = {
     "biolip": "local_dir",
     "skempi": "local_path",
 }
+_STRUCTURE_MIRROR_OPTIONS = ["rcsb", "pdbj"]
 
 _SOURCE_DESCRIPTIONS: dict[str, str] = {
     "rcsb":      "RCSB PDB — structural metadata via Search & GraphQL",
@@ -80,7 +81,8 @@ _SOURCE_INGEST_NOTES: dict[str, str] = {
 # Keep "extract" first — tests assert _SUBPROCESS_STAGES[0] == "extract".
 _SUBPROCESS_STAGES = [
     "extract", "normalize", "audit", "report",
-    "build-graph", "build-microstates", "build-physics-features", "build-features", "build-training-examples", "build-splits", "build-custom-training-set", "build-release",
+    "report-bias",
+    "build-conformational-states", "build-graph", "build-microstates", "build-physics-features", "build-microstate-refinement", "build-mm-job-manifests", "run-mm-jobs", "run-feature-pipeline", "export-analysis-queue", "ingest-physics-results", "train-site-physics-surrogate", "build-features", "build-training-examples", "build-splits", "train-baseline-model", "evaluate-baseline-model", "build-custom-training-set", "build-release", "run-scenario-tests",
 ]
 
 # Pipeline groups for the UI
@@ -95,16 +97,28 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Quality & Analysis", [
         ("audit", "Audit Quality"),
         ("report", "Generate Report"),
+        ("report-bias", "Report Bias"),
     ]),
     ("ML Pipeline", [
+        ("build-conformational-states", "Build Conformational States"),
         ("build-graph", "Build Graph"),
         ("build-microstates", "Build Microstates"),
         ("build-physics-features", "Build Physics Features"),
+        ("build-microstate-refinement", "Build Microstate Refinement"),
+        ("build-mm-job-manifests", "Build MM Job Manifests"),
+        ("run-mm-jobs", "Run MM Jobs"),
+        ("run-feature-pipeline", "Run Site-Centric Feature Pipeline"),
+        ("export-analysis-queue", "Export Analysis Queue"),
+        ("ingest-physics-results", "Ingest Physics Results"),
+        ("train-site-physics-surrogate", "Train Site-Physics Surrogate"),
         ("build-features", "Build Features"),
         ("build-training-examples", "Build Training Examples"),
         ("build-splits", "Build Splits"),
+        ("train-baseline-model", "Train Baseline Model"),
+        ("evaluate-baseline-model", "Evaluate Baseline Model"),
         ("build-custom-training-set", "Build Custom Training Set"),
         ("build-release", "Build Release Snapshot"),
+        ("run-scenario-tests", "Run Scenario Tests"),
     ]),
 ]
 
@@ -148,6 +162,7 @@ _REVIEW_ISSUE_OPTIONS = [
 ]
 _REVIEW_CONFIDENCE_OPTIONS = ["All", "Non-high", "Medium", "Low"]
 _FILTERED_REVIEW_CSV_NAME = "master_pdb_review_filtered.csv"
+_PIPELINE_EXECUTION_MODES = ["legacy", "site-centric", "hybrid"]
 
 _T = TypeVar("_T")
 
@@ -180,6 +195,7 @@ def _save_sources_config(
     paths: dict[str, str],
     *,
     storage_root: str,
+    structure_mirror: str = "rcsb",
 ) -> None:
     _SOURCES_CFG.parent.mkdir(parents=True, exist_ok=True)
     if _SOURCES_CFG.exists():
@@ -200,8 +216,66 @@ def _save_sources_config(
                 extra[field] = path_value
             else:
                 extra.pop(field, None)
+    rcsb_extra = sources.setdefault("rcsb", {}).setdefault("extra", {})
+    rcsb_extra["structure_mirror"] = (
+        structure_mirror if structure_mirror in _STRUCTURE_MIRROR_OPTIONS else "rcsb"
+    )
     with _SOURCES_CFG.open("w") as f:
         yaml.safe_dump(raw, f, default_flow_style=False)
+
+
+def _load_structure_mirror() -> str:
+    if not _SOURCES_CFG.exists():
+        return "rcsb"
+    with _SOURCES_CFG.open() as f:
+        raw: dict[str, Any] = yaml.safe_load(f) or {}
+    value = str((((raw.get("sources") or {}).get("rcsb") or {}).get("extra") or {}).get("structure_mirror") or "rcsb")
+    value = value.strip().lower()
+    return value if value in _STRUCTURE_MIRROR_OPTIONS else "rcsb"
+
+
+def _validate_source_path(src: str, path_value: str) -> tuple[str, str]:
+    path_value = path_value.strip()
+    if src == "chembl":
+        return "ready", "Live API enrichment will be queried during Extract."
+    if src == "bindingdb":
+        if not path_value:
+            return "ready", "No local cache configured. Extract will use the live BindingDB API."
+        path = Path(path_value)
+        if not path.exists() or not path.is_dir():
+            return "error", "Configured BindingDB cache directory does not exist."
+        json_count = len(list(path.glob("*.json")))
+        return "ready", f"BindingDB cache directory is available ({json_count} JSON file(s) detected)."
+    if src == "pdbbind":
+        if not path_value:
+            return "error", "PDBbind requires a local dataset directory."
+        try:
+            from pbdata.sources.pdbbind import load_pdbbind_index
+
+            count = len(load_pdbbind_index(Path(path_value)))
+            return "ready", f"PDBbind index parsed successfully ({count} row(s))."
+        except Exception as exc:
+            return "error", f"PDBbind directory is not usable: {exc}"
+    if src == "biolip":
+        if not path_value:
+            return "error", "BioLiP requires a local dataset directory."
+        try:
+            from pbdata.sources.biolip import load_biolip_rows
+
+            count = len(load_biolip_rows(Path(path_value)))
+            return "ready", f"BioLiP file parsed successfully ({count} row(s))."
+        except Exception as exc:
+            return "error", f"BioLiP directory is not usable: {exc}"
+    if src == "skempi":
+        if not path_value:
+            return "ready", "No local SKEMPI file configured. Ingest will download the official CSV."
+        path = Path(path_value)
+        if not path.exists():
+            return "error", "Configured SKEMPI CSV file does not exist."
+        if validate_skempi_csv(path):
+            return "ready", "Configured SKEMPI CSV validated successfully."
+        return "error", "Configured SKEMPI CSV failed validation."
+    return "ready", "No additional validation available."
 
 
 def _call_on_tk_thread(root: Any, fn: Callable[[], _T]) -> _T:
@@ -527,9 +601,14 @@ class PbdataGUI:
 
         # --- Pipeline option variables ---
         self._storage_root_var        = tk.StringVar(value=str(Path.cwd()))
+        self._structure_mirror_var    = tk.StringVar(value="rcsb")
         self._download_structures_var = tk.BooleanVar(value=True)
         self._download_pdb_var        = tk.BooleanVar(value=False)
         self._workers_var             = tk.StringVar(value="1")
+        self._pipeline_execution_mode_var = tk.StringVar(value="hybrid")
+        self._site_pipeline_degraded_mode_var = tk.BooleanVar(value=True)
+        self._site_pipeline_run_id_var = tk.StringVar(value="")
+        self._site_physics_batch_id_var = tk.StringVar(value="")
         self._split_mode_var          = tk.StringVar(value="auto")
         self._train_frac_var          = tk.StringVar(value="0.70")
         self._val_frac_var            = tk.StringVar(value="0.15")
@@ -746,18 +825,40 @@ class PbdataGUI:
         )
         row += 1
 
-        # Path fields for local sources
         ttk.Label(
-            frame, text="Local Source Paths:",
+            frame, text="Experimental Structure Mirror:",
+            font=("Helvetica", 9, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
+        mirror_box = ttk.Combobox(
+            frame,
+            state="readonly",
+            textvariable=self._structure_mirror_var,
+            values=_STRUCTURE_MIRROR_OPTIONS,
+            width=12,
+        )
+        mirror_box.grid(row=row, column=1, sticky="w", padx=(6, 0), pady=(0, 4))
+        row += 1
+
+        ttk.Label(
+            frame,
+            text="Used for experimental mmCIF/PDB downloads during Extract and downstream physics features.",
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        row += 1
+
+        # Path fields for local or cached enrichment sources
+        ttk.Label(
+            frame, text="Extract-Time Source Paths:",
             font=("Helvetica", 9, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 4))
         row += 1
 
         path_labels = {
-            "bindingdb": "BindingDB cache directory",
-            "pdbbind": "PDBbind directory",
-            "biolip":  "BioLiP directory",
-            "skempi":  "SKEMPI CSV file",
+            "bindingdb": "BindingDB local cache directory (optional)",
+            "pdbbind": "PDBbind local dataset directory",
+            "biolip":  "BioLiP local dataset directory",
+            "skempi":  "SKEMPI CSV file (optional override)",
         }
         for src, label in path_labels.items():
             path_frame = ttk.Frame(frame)
@@ -1176,6 +1277,59 @@ class PbdataGUI:
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", pady=(2, 0))
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=row, column=0, sticky="ew", pady=10,
+        )
+        row += 1
+
+        ttk.Label(
+            outer, text="Pipeline Mode",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+
+        pipeline_mode_frame = ttk.Frame(outer)
+        pipeline_mode_frame.grid(row=row, column=0, sticky="ew")
+        pipeline_mode_frame.columnconfigure(1, weight=1)
+        ttk.Label(pipeline_mode_frame, text="Execution mode:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Combobox(
+            pipeline_mode_frame,
+            textvariable=self._pipeline_execution_mode_var,
+            values=_PIPELINE_EXECUTION_MODES,
+            width=18,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Label(pipeline_mode_frame, text="Site-centric run id:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(
+            pipeline_mode_frame,
+            textvariable=self._site_pipeline_run_id_var,
+            width=22,
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Label(pipeline_mode_frame, text="Physics batch id:").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(
+            pipeline_mode_frame,
+            textvariable=self._site_physics_batch_id_var,
+            width=22,
+        ).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Checkbutton(
+            pipeline_mode_frame,
+            text="Allow degraded site physics proxies when no surrogate is available",
+            variable=self._site_pipeline_degraded_mode_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
+
+        ttk.Label(
+            outer,
+            text=(
+                "legacy: current pipeline only\n"
+                "site-centric: new artifacts/ pipeline only\n"
+                "hybrid: run both, keeping shared extract/canonical inputs"
+            ),
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
         ttk.Separator(outer, orient="horizontal").grid(
@@ -1796,16 +1950,19 @@ class PbdataGUI:
         for src, var in self._src_path_vars.items():
             var.set(paths.get(src, ""))
         self._storage_root_var.set(storage_root)
+        self._structure_mirror_var.set(_load_structure_mirror())
 
     def _save_sources(self) -> None:
         _save_sources_config(
             {s: v.get() for s, v in self._src_enabled.items()},
             {s: v.get() for s, v in self._src_path_vars.items()},
             storage_root=self._storage_root_var.get().strip() or str(Path.cwd()),
+            structure_mirror=self._structure_mirror_var.get().strip().lower() or "rcsb",
         )
         self._log_line(
             f"Source config saved to configs/sources.yaml "
-            f"(storage root: {self._storage_root_var.get().strip() or Path.cwd()})"
+            f"(storage root: {self._storage_root_var.get().strip() or Path.cwd()}, "
+            f"structure mirror: {self._structure_mirror_var.get().strip().lower() or 'rcsb'})"
         )
 
     def _load_criteria_into_ui(self) -> None:
@@ -2022,6 +2179,32 @@ class PbdataGUI:
                 cmd.append("--no-download-structures")
             if self._download_pdb_var.get():
                 cmd.append("--download-pdb")
+        elif stage == "run-feature-pipeline":
+            cmd.extend(["--run-mode", "full_build"])
+            if workers:
+                cmd.extend(["--workers", workers])
+            if self._site_pipeline_degraded_mode_var.get():
+                cmd.append("--degraded-mode")
+            else:
+                cmd.append("--no-degraded-mode")
+            run_id = self._site_pipeline_run_id_var.get().strip()
+            if run_id:
+                cmd.extend(["--run-id", run_id])
+        elif stage == "export-analysis-queue":
+            run_id = self._site_pipeline_run_id_var.get().strip()
+            if run_id:
+                cmd.extend(["--run-id", run_id])
+        elif stage == "ingest-physics-results":
+            batch_id = self._site_physics_batch_id_var.get().strip()
+            if batch_id:
+                cmd.extend(["--batch-id", batch_id])
+        elif stage == "train-site-physics-surrogate":
+            batch_id = self._site_physics_batch_id_var.get().strip()
+            run_id = self._site_pipeline_run_id_var.get().strip()
+            if batch_id:
+                cmd.extend(["--batch-id", batch_id])
+            if run_id:
+                cmd.extend(["--source-run-id", run_id])
 
         elif stage == "build-splits":
             split_mode = self._split_mode_var.get().strip()
@@ -2186,6 +2369,19 @@ class PbdataGUI:
                     self._root.after(0, self._log_line,
                                      f"\n  {src.upper()}: WARNING — local path not set or not found")
                     source_statuses.append(f"{src.upper()}: path missing")
+
+        for src in ["chembl", "bindingdb", "pdbbind", "biolip"]:
+            if not enabled.get(src):
+                continue
+            path_val = _call_on_tk_thread(
+                self._root,
+                lambda s=src: self._src_path_vars.get(s, tk.StringVar()).get().strip(),
+            )
+            status, message = _validate_source_path(src, path_val)
+            self._root.after(0, self._log_line, f"    readiness: {src.upper()} -> {message}")
+            source_statuses.append(f"{src.upper()} validation: {status}")
+            if status == "error" and overall_status != "cancelled":
+                overall_status = "error"
 
         # Summary
         self._root.after(0, self._log_line, "\n  Ingest summary:")
@@ -2426,8 +2622,17 @@ class PbdataGUI:
                 self._root.after(0, self._log_line, "\nPipeline cancelled.")
                 return
 
+            mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
+            auto_excluded = {"ingest-physics-results", "train-site-physics-surrogate"}
+            if mode == "legacy":
+                stages = [stage for stage in _SUBPROCESS_STAGES if stage not in {"run-feature-pipeline", "export-analysis-queue", *auto_excluded}]
+            elif mode == "site-centric":
+                stages = ["run-feature-pipeline", "export-analysis-queue"]
+            else:
+                stages = [stage for stage in _SUBPROCESS_STAGES if stage not in auto_excluded]
+
             # Remaining stages via subprocess
-            for stage in _SUBPROCESS_STAGES:
+            for stage in stages:
                 status = self._run_stage(stage)
                 if status == "error":
                     self._root.after(

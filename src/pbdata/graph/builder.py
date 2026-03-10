@@ -323,6 +323,11 @@ def build_graph_from_extracted(
                 "assembly_id": entry.get("assembly_id"),
                 "organism_names": entry.get("organism_names"),
             },
+            provenance={
+                "source": str(entry.get("source_database") or "RCSB"),
+                "confidence": "high",
+                "method": "extracted_entry_record",
+            },
         ))
 
     protein_chain_index: dict[tuple[str, str], str] = {}
@@ -344,6 +349,11 @@ def build_graph_from_extracted(
                 "taxonomy_id": chain.get("entity_source_taxonomy_id"),
                 "organism": chain.get("entity_source_organism"),
             },
+            provenance={
+                "source": "RCSB",
+                "confidence": "high",
+                "method": "extracted_chain_record",
+            },
         ))
 
     ligand_component_index: dict[tuple[str, str], str] = {}
@@ -363,6 +373,11 @@ def build_graph_from_extracted(
                 "component_id": bound_object.get("component_id"),
                 "component_type": bound_object.get("component_type"),
                 "smiles": bound_object.get("component_smiles"),
+            },
+            provenance={
+                "source": "RCSB",
+                "confidence": "high",
+                "method": "extracted_bound_object_record",
             },
         ))
         pdb_id = str(bound_object.get("pdb_id") or "")
@@ -391,6 +406,11 @@ def build_graph_from_extracted(
                         source_database="RCSB",
                         relation="structural_interface",
                         metadata={"pdb_id": pdb_id},
+                        provenance={
+                            "source": "RCSB",
+                            "confidence": "medium",
+                            "method": "structural_interface_graph_projection",
+                        },
                     ))
         elif iface_type == "protein_ligand":
             ligand_name = str(interface.get("entity_name_b") or "")
@@ -423,6 +443,11 @@ def build_graph_from_extracted(
                     metadata={
                         "pdb_id": pdb_id,
                         "binding_site_residue_ids": interface.get("binding_site_residue_ids"),
+                    },
+                    provenance={
+                        "source": "BioLiP",
+                        "confidence": "medium",
+                        "method": "binding_site_annotation_graph_projection",
                     },
                 ))
 
@@ -457,6 +482,11 @@ def build_graph_from_extracted(
                     "binding_affinity_value": assay.get("binding_affinity_value"),
                     "binding_affinity_unit": assay.get("binding_affinity_unit"),
                 },
+                provenance={
+                    "source": str(assay.get("source_database") or "unknown"),
+                    "confidence": "medium",
+                    "method": "assay_pair_graph_projection",
+                },
             ))
 
     # --- Merge external sources ---
@@ -470,6 +500,24 @@ def build_graph_from_extracted(
             biogrid_access_key=biogrid_access_key,
             string_score_threshold=string_score_threshold,
             log_fn=log_fn,
+        )
+
+    if not pathway_nodes:
+        pathway_nodes["pathway:placeholder_unannotated_context"] = GraphNodeRecord(
+            node_id="pathway:placeholder_unannotated_context",
+            node_type="Pathway",
+            primary_id="placeholder_unannotated_context",
+            display_name="Pathway context not yet annotated",
+            source_databases=["internal_placeholder"],
+            metadata={
+                "placeholder": True,
+                "reason": "external pathway ingestion disabled or no pathway membership was available",
+            },
+            provenance={
+                "source": "internal_placeholder",
+                "confidence": "low",
+                "method": "placeholder_pathway_backfill",
+            },
         )
 
     all_nodes = [

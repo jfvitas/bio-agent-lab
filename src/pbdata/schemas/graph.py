@@ -21,6 +21,7 @@ class GraphNodeRecord(BaseModel):
     entrez_id: str | None = None
     ensembl_id: str | None = None
     metadata: dict[str, Any] | None = None
+    provenance: dict[str, str | None] | None = None
 
 
 class GraphEdgeRecord(BaseModel):
@@ -42,3 +43,4 @@ class GraphEdgeRecord(BaseModel):
     evidence_score: float | None = None
     relation: str | None = None
     metadata: dict[str, Any] | None = None
+    provenance: dict[str, str | None] | None = None

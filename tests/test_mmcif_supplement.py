@@ -1,5 +1,8 @@
 from pathlib import Path
+from uuid import uuid4
 from unittest.mock import Mock, patch
+
+import gzip
 
 from pbdata.parsing.mmcif_supplement import download_structure_files, parse_mmcif_supplement
 from pbdata.sources.rcsb_classify import classify_entry
@@ -49,6 +52,12 @@ HETATM 3 NAG B B 401 1
 """
 
 
+def _tmp_dir(name: str) -> Path:
+    path = Path(__file__).parent / "_tmp" / f"{uuid4().hex}_{name}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def test_parse_mmcif_supplement_extracts_instances_and_branched_entities() -> None:
     supplement = parse_mmcif_supplement(_MMCIF_TEXT)
     assert len(supplement["nonpolymer_instances"]) == 2
@@ -85,8 +94,7 @@ def test_classify_entry_uses_mmcif_supplement_for_missing_nonpoly_and_glycan_dat
 
 
 def test_download_structure_files_replaces_invalid_cached_cif() -> None:
-    tmp_path = Path(__file__).parent / "_tmp" / "mmcif_replace_case"
-    tmp_path.mkdir(parents=True, exist_ok=True)
+    tmp_path = _tmp_dir("mmcif_replace_case")
     bad_path = tmp_path / "1ABC.cif"
     bad_path.write_text("not a cif", encoding="utf-8")
 
@@ -99,3 +107,19 @@ def test_download_structure_files_replaces_invalid_cached_cif() -> None:
 
     assert provenance["structure_file_cif_path"] == str(bad_path)
     assert bad_path.read_text(encoding="utf-8") == _MMCIF_TEXT
+
+
+def test_download_structure_files_supports_pdbj_gzip_mirror() -> None:
+    tmp_path = _tmp_dir("mmcif_pdbj_case")
+
+    response = Mock()
+    response.content = gzip.compress(_MMCIF_TEXT.encode("utf-8"))
+    response.raise_for_status.return_value = None
+
+    with patch("pbdata.parsing.mmcif_supplement.requests.get", return_value=response) as get:
+        provenance = download_structure_files("1ABC", structures_dir=tmp_path, mirror="pdbj")
+
+    assert provenance["structure_download_mirror"] == "pdbj"
+    assert provenance["structure_download_url"].endswith("/ab/1abc.cif.gz")
+    assert (tmp_path / "1ABC.cif").read_text(encoding="utf-8") == _MMCIF_TEXT
+    assert get.call_args.args[0].endswith("/ab/1abc.cif.gz")
