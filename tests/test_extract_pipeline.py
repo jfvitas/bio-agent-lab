@@ -15,6 +15,10 @@ from pbdata.gui import _SUBPROCESS_STAGES
 from pbdata.gui import PbdataGUI
 from pbdata.gui import build_filtered_review_rows
 from pbdata.gui import build_review_health_summary
+from pbdata.gui import build_training_set_kpis
+from pbdata.gui import build_training_set_builder_summary
+from pbdata.gui import build_training_set_workflow_status
+from pbdata.gui import build_curation_review_summary
 from pbdata.pipeline.assay_merge import pair_identity_key
 from pbdata.pipeline.extract import extract_rcsb_entry
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
@@ -520,6 +524,8 @@ def test_gui_refresh_review_exports_logs_conflict_csv() -> None:
         "conflict_csv": "C:/repo/master_pdb_conflicts.csv",
         "source_state_csv": "C:/repo/master_source_state.csv",
         "model_ready_pairs_csv": "C:/repo/model_ready_pairs.csv",
+        "custom_training_scorecard_json": "C:/repo/custom_training_scorecard.json",
+        "custom_training_split_benchmark_csv": "C:/repo/custom_training_split_benchmark.csv",
         "release_manifest_json": "C:/repo/dataset_release_manifest.json",
         "split_summary_csv": "C:/repo/split_summary.csv",
         "scientific_coverage_json": "C:/repo/scientific_coverage_summary.json",
@@ -530,9 +536,107 @@ def test_gui_refresh_review_exports_logs_conflict_csv() -> None:
     assert "master_pdb_conflicts.csv" in logged
     assert "master_source_state.csv" in logged
     assert "model_ready_pairs.csv" in logged
+    assert "custom_training_scorecard.json" in logged
+    assert "custom_training_split_benchmark.csv" in logged
     assert "dataset_release_manifest.json" in logged
     assert "scientific_coverage_summary.json" in logged
     gui._refresh_overview.assert_called_once()
+
+
+def test_build_training_set_builder_summary_reports_benchmark_pressure() -> None:
+    summary = build_training_set_builder_summary(
+        {
+            "selected_count": 120,
+            "candidate_pool_count": 400,
+            "diversity": {
+                "selected_receptor_clusters": 45,
+                "selected_pair_families": 110,
+            },
+            "quality": {
+                "mean_quality_score": 0.84,
+            },
+            "exclusions": {
+                "count": 280,
+            },
+        },
+        [
+            {"benchmark_mode": "receptor_cluster", "largest_group_fraction": "0.20"},
+            {"benchmark_mode": "pair_family", "largest_group_fraction": "0.42"},
+        ],
+    )
+
+    assert summary["status"] == "Needs tuning"
+    assert "120 selected from 400" in summary["coverage"]
+    assert "pair_family=42.00%" in summary["quality"]
+
+
+def test_build_training_set_kpis_and_workflow_status() -> None:
+    kpis = build_training_set_kpis(
+        {
+            "selected_count": 120,
+            "diversity": {"selected_receptor_clusters": 45},
+            "quality": {"mean_quality_score": 0.84},
+            "exclusions": {"count": 280},
+        },
+        [
+            {"benchmark_mode": "pair_family", "largest_group_fraction": "0.42"},
+        ],
+    )
+    assert kpis["selected"] == "120"
+    assert kpis["clusters"] == "45"
+    assert kpis["quality"] == "0.840"
+    assert kpis["dominance"] == "42.0%"
+    assert kpis["excluded"] == "280"
+
+    status = build_training_set_workflow_status({
+        "model_ready_pairs_csv": "C:/repo/model_ready_pairs.csv",
+        "custom_training_set_csv": "",
+        "custom_training_scorecard_json": "",
+        "custom_training_split_benchmark_csv": "",
+        "release_manifest_json": "",
+    })
+    assert status[0] == ("Model-ready pool", "missing")
+    assert status[1] == ("Custom set", "pending")
+
+
+def test_build_curation_review_summary_highlights_top_reasons() -> None:
+    summary = build_curation_review_summary(
+        [
+            {"reason": "receptor_cluster_cap_reached"},
+            {"reason": "receptor_cluster_cap_reached"},
+            {"reason": "redundant_pair_family"},
+        ],
+        [
+            {"source_agreement_band": "low"},
+            {"source_agreement_band": "medium"},
+        ],
+        [
+            {"issue_type": "missing_structure_file"},
+            {"issue_type": "missing_structure_file"},
+            {"issue_type": "ambiguous_mutation_context"},
+        ],
+    )
+    assert "receptor_cluster_cap_reached=2" in summary["exclusions"]
+    assert "low=1" in summary["conflicts"]
+    assert "missing_structure_file=2" in summary["issues"]
+
+
+def test_training_set_workflow_runs_expected_stages() -> None:
+    gui = PbdataGUI.__new__(PbdataGUI)
+    root = Mock()
+    root.after = Mock(side_effect=lambda _delay, fn, *args: fn(*args))
+    gui._root = root
+    gui._running = Mock()
+    gui._run_stage = Mock(side_effect=["done", "done", "done"])
+    gui._refresh_overview = Mock()
+    gui._log_line = Mock()
+
+    gui._run_training_set_workflow_thread()
+
+    assert gui._run_stage.call_args_list[0].args[0] == "build-splits"
+    assert gui._run_stage.call_args_list[1].args[0] == "build-custom-training-set"
+    assert gui._run_stage.call_args_list[2].args[0] == "build-release"
+    gui._running.release.assert_called_once()
 
 
 def test_build_filtered_review_rows_applies_conflict_and_flag_filters() -> None:

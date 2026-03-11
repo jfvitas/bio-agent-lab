@@ -27,6 +27,8 @@ _CUSTOM_TRAINING_SET_CSV = "custom_training_set.csv"
 _CUSTOM_TRAINING_EXCLUSIONS_CSV = "custom_training_exclusions.csv"
 _CUSTOM_TRAINING_SUMMARY_JSON = "custom_training_summary.json"
 _CUSTOM_TRAINING_MANIFEST_JSON = "custom_training_manifest.json"
+_CUSTOM_TRAINING_SCORECARD_JSON = "custom_training_scorecard.json"
+_CUSTOM_TRAINING_SPLIT_BENCHMARK_CSV = "custom_training_split_benchmark.csv"
 
 _MODE_OPTIONS = {
     "generalist",
@@ -313,6 +315,114 @@ def _candidate_tokens(candidate: SelectionCandidate) -> set[str]:
     return tokens
 
 
+def _benchmark_rows(selected: list[SelectionCandidate]) -> list[dict[str, str]]:
+    """Summarize leakage-sensitive grouping modes over the selected set.
+
+    Assumption:
+    - This is a curation benchmark, not an ML performance benchmark. It reports
+      how concentrated the selected set is under several biologically relevant
+      grouping keys so the user can judge likely leakage pressure.
+    """
+    group_modes = {
+        "release_split": lambda candidate: candidate.release_split or "unsplit",
+        "receptor_cluster": lambda candidate: candidate.receptor_cluster_key,
+        "pair_family": lambda candidate: candidate.pair_family_key,
+        "mutation_family": lambda candidate: candidate.mutation_family,
+        "task_type": lambda candidate: candidate.task_type,
+        "taxonomy": lambda candidate: candidate.taxonomy_ids or "taxonomy_unknown",
+    }
+    rows: list[dict[str, str]] = []
+    total = max(len(selected), 1)
+    for mode_name, key_fn in group_modes.items():
+        counts = Counter(key_fn(candidate) or "unknown" for candidate in selected)
+        largest_group = max(counts.values(), default=0)
+        singleton_groups = sum(1 for value in counts.values() if value == 1)
+        rows.append({
+            "benchmark_mode": mode_name,
+            "group_count": str(len(counts)),
+            "largest_group_size": str(largest_group),
+            "largest_group_fraction": f"{(largest_group / total):.4f}" if total else "0.0000",
+            "singleton_group_count": str(singleton_groups),
+            "mean_group_size": f"{(sum(counts.values()) / len(counts)):.4f}" if counts else "0.0000",
+            "dominant_groups": "; ".join(
+                f"{group}={count}"
+                for group, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+            ),
+        })
+    return rows
+
+
+def _build_scorecard(
+    *,
+    selected: list[SelectionCandidate],
+    pool: list[SelectionCandidate],
+    exclusions: list[dict[str, str]],
+    mode: str,
+    target_size: int,
+    per_receptor_cluster_cap: int,
+) -> dict[str, object]:
+    selected_task_counts = Counter(candidate.task_type for candidate in selected)
+    selected_source_counts = Counter(candidate.selected_preferred_source or candidate.source_database for candidate in selected)
+    selected_ligand_types = Counter(
+        ligand_type
+        for candidate in selected
+        for ligand_type in _semicolon_values(candidate.ligand_types)
+    )
+    selected_interface_types = Counter(
+        interface_type
+        for candidate in selected
+        for interface_type in _semicolon_values(candidate.matching_interface_types)
+    )
+    release_split_counts = Counter(candidate.release_split or "unsplit" for candidate in selected)
+    membrane_counts = Counter(candidate.membrane_vs_soluble or "unknown" for candidate in selected)
+    method_counts = Counter(candidate.experimental_method or "unknown" for candidate in selected)
+    mutation_counts = Counter(candidate.mutation_family for candidate in selected)
+    exclusion_counts = Counter(str(row.get("reason") or "unknown") for row in exclusions)
+    mean_quality = round(sum(candidate.quality_score for candidate in selected) / len(selected), 4) if selected else 0.0
+    mean_measurements = round(
+        sum(candidate.reported_measurement_count for candidate in selected) / len(selected), 4
+    ) if selected else 0.0
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "selection_mode": mode,
+        "target_size": target_size,
+        "selected_count": len(selected),
+        "candidate_pool_count": len(pool),
+        "selection_fraction": round((len(selected) / len(pool)), 4) if pool else 0.0,
+        "per_receptor_cluster_cap": per_receptor_cluster_cap,
+        "quality": {
+            "mean_quality_score": mean_quality,
+            "mean_reported_measurement_count": mean_measurements,
+            "high_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "high"),
+            "medium_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "medium"),
+            "low_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "low"),
+        },
+        "diversity": {
+            "selected_receptor_clusters": len({candidate.receptor_cluster_key for candidate in selected}),
+            "selected_pair_families": len({candidate.pair_family_key for candidate in selected}),
+            "selected_receptor_identities": len({candidate.receptor_identity for candidate in selected}),
+            "release_splits": dict(release_split_counts),
+            "task_types": dict(selected_task_counts),
+            "sources": dict(selected_source_counts),
+            "ligand_types": dict(selected_ligand_types),
+            "interface_types": dict(selected_interface_types),
+            "membrane_vs_soluble": dict(membrane_counts),
+            "experimental_methods": dict(method_counts),
+            "mutation_families": dict(mutation_counts),
+        },
+        "exclusions": {
+            "count": len(exclusions),
+            "reasons": dict(exclusion_counts),
+        },
+        "benchmark_modes": _benchmark_rows(selected),
+        "recommended_next_step": (
+            "Inspect the split benchmark and exclusion reasons, then rerun with a different mode "
+            "or receptor-cluster cap if one receptor family dominates."
+        ),
+    }
+
+
 def build_custom_training_set(
     layout: StorageLayout,
     *,
@@ -487,41 +597,55 @@ def build_custom_training_set(
         sorted(exclusions, key=lambda row: (row["reason"], row["pdb_id"], row["pair_identity_key"])),
     )
 
-    selected_task_counts = Counter(candidate.task_type for candidate in selected)
-    selected_source_counts = Counter(candidate.selected_preferred_source or candidate.source_database for candidate in selected)
-    selected_ligand_types = Counter(
-        ligand_type
-        for candidate in selected
-        for ligand_type in _semicolon_values(candidate.ligand_types)
-    )
-    selected_interface_types = Counter(
-        interface_type
-        for candidate in selected
-        for interface_type in _semicolon_values(candidate.matching_interface_types)
+    scorecard = _build_scorecard(
+        selected=selected,
+        pool=pool,
+        exclusions=exclusions,
+        mode=mode,
+        target_size=target_size,
+        per_receptor_cluster_cap=per_receptor_cluster_cap,
     )
     summary = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": str(scorecard["generated_at"]),
         "selection_mode": mode,
         "target_size": target_size,
         "selected_count": len(selected),
         "candidate_pool_count": len(pool),
         "per_receptor_cluster_cap": per_receptor_cluster_cap,
-        "selected_task_types": dict(selected_task_counts),
-        "selected_sources": dict(selected_source_counts),
-        "selected_ligand_types": dict(selected_ligand_types),
-        "selected_interface_types": dict(selected_interface_types),
-        "selected_receptor_clusters": len({candidate.receptor_cluster_key for candidate in selected}),
-        "selected_pair_families": len({candidate.pair_family_key for candidate in selected}),
-        "mean_quality_score": round(sum(candidate.quality_score for candidate in selected) / len(selected), 4) if selected else 0.0,
+        "selected_task_types": dict(scorecard["diversity"]["task_types"]),  # type: ignore[index]
+        "selected_sources": dict(scorecard["diversity"]["sources"]),  # type: ignore[index]
+        "selected_ligand_types": dict(scorecard["diversity"]["ligand_types"]),  # type: ignore[index]
+        "selected_interface_types": dict(scorecard["diversity"]["interface_types"]),  # type: ignore[index]
+        "selected_receptor_clusters": int(scorecard["diversity"]["selected_receptor_clusters"]),  # type: ignore[index]
+        "selected_pair_families": int(scorecard["diversity"]["selected_pair_families"]),  # type: ignore[index]
+        "mean_quality_score": float(scorecard["quality"]["mean_quality_score"]),  # type: ignore[index]
     }
     summary_path = _repo_path(_CUSTOM_TRAINING_SUMMARY_JSON, root)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+    scorecard_path = _repo_path(_CUSTOM_TRAINING_SCORECARD_JSON, root)
+    scorecard_path.write_text(json.dumps(scorecard, indent=2, sort_keys=True), encoding="utf-8")
+
+    benchmark_rows = _benchmark_rows(selected)
+    benchmark_path = _write_csv(
+        _repo_path(_CUSTOM_TRAINING_SPLIT_BENCHMARK_CSV, root),
+        [
+            "benchmark_mode",
+            "group_count",
+            "largest_group_size",
+            "largest_group_fraction",
+            "singleton_group_count",
+            "mean_group_size",
+            "dominant_groups",
+        ],
+        benchmark_rows,
+    )
 
     tag = release_tag or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     snapshot_dir = layout.data_dir / "custom_training_sets" / tag
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     snapshot_paths: dict[str, str] = {}
-    for path in (selection_path, exclusion_path, summary_path):
+    for path in (selection_path, exclusion_path, summary_path, scorecard_path, benchmark_path):
         copied = snapshot_dir / path.name
         shutil.copy2(path, copied)
         snapshot_paths[path.name] = str(copied)
@@ -538,6 +662,8 @@ def build_custom_training_set(
             "custom_training_set_csv": str(selection_path),
             "custom_training_exclusions_csv": str(exclusion_path),
             "custom_training_summary_json": str(summary_path),
+            "custom_training_scorecard_json": str(scorecard_path),
+            "custom_training_split_benchmark_csv": str(benchmark_path),
             "snapshot_dir": str(snapshot_dir),
         },
         "coverage_objectives": [
@@ -557,5 +683,7 @@ def build_custom_training_set(
         "custom_training_exclusions_csv": str(exclusion_path),
         "custom_training_summary_json": str(summary_path),
         "custom_training_manifest_json": str(manifest_path),
+        "custom_training_scorecard_json": str(scorecard_path),
+        "custom_training_split_benchmark_csv": str(benchmark_path),
         "custom_training_snapshot_dir": str(snapshot_dir),
     }

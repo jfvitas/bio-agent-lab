@@ -24,6 +24,7 @@ except ModuleNotFoundError:
     torch = None  # type: ignore[assignment]
 
 from pbdata.storage import StorageLayout
+from pbdata.table_io import read_dataframe, write_dataframe
 
 TARGET_COLUMNS = [
     "refined_partial_charge",
@@ -51,7 +52,7 @@ def _read_table_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     if path.suffix.lower() == ".parquet":
-        return pd.read_parquet(path).to_dict(orient="records")
+        return read_dataframe(path).to_dict(orient="records")
     rows: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -188,8 +189,8 @@ def ingest_external_analysis_results(layout: StorageLayout, *, batch_id: str) ->
     physics_path = out_dir / "physics_targets.parquet"
     failed_path = out_dir / "failed_fragments.parquet"
     manifest_path = out_dir / "physics_target_manifest.json"
-    pd.DataFrame(physics_rows).to_parquet(physics_path, index=False)
-    pd.DataFrame(failed_rows).to_parquet(failed_path, index=False)
+    write_dataframe(pd.DataFrame(physics_rows), physics_path)
+    write_dataframe(pd.DataFrame(failed_rows), failed_path)
     manifest = {
         "generated_at": _utc_now(),
         "batch_id": batch_id,
@@ -215,7 +216,7 @@ def _site_feature_rows(layout: StorageLayout, source_run_id: str) -> pd.DataFram
     rows: list[dict[str, Any]] = []
     env_dir = layout.base_features_artifacts_dir / source_run_id
     for env_path in sorted(env_dir.glob("*.env_vectors.parquet")):
-        env_df = pd.read_parquet(env_path)
+        env_df = read_dataframe(env_path)
         if env_df.empty:
             continue
         for site_id, site_df in env_df.groupby("site_id", sort=True):
@@ -244,7 +245,7 @@ def _build_training_matrix(
     physics_targets: pd.DataFrame,
     archetypes: pd.DataFrame,
     site_features: pd.DataFrame,
-) -> tuple[torch.Tensor, torch.Tensor, list[str], list[str], list[str]]:
+) -> tuple[list[list[float]], list[list[float]], list[str], list[str], list[str]]:
     merged = physics_targets.merge(archetypes[["archetype_id", "site_id", "motif_class"]], on=["archetype_id", "motif_class"], how="inner")
     merged = merged.merge(site_features, on=["site_id", "motif_class"], how="inner")
     feature_columns = sorted(
@@ -262,13 +263,52 @@ def _build_training_matrix(
         one_hot[motif_index[str(row["motif_class"])]] = 1.0
         x_rows.append(features + one_hot + [1.0])
         y_rows.append([float(row.get(column) or 0.0) for column in TARGET_COLUMNS])
-    return (
-        torch.tensor(x_rows, dtype=torch.float32),
-        torch.tensor(y_rows, dtype=torch.float32),
-        feature_columns,
-        motif_classes,
-        TARGET_COLUMNS,
-    )
+    return x_rows, y_rows, feature_columns, motif_classes, TARGET_COLUMNS
+
+
+def _transpose(matrix: list[list[float]]) -> list[list[float]]:
+    return [list(column) for column in zip(*matrix)] if matrix else []
+
+
+def _matmul(left: list[list[float]], right: list[list[float]]) -> list[list[float]]:
+    if not left or not right:
+        return []
+    right_t = _transpose(right)
+    return [[sum(lval * rval for lval, rval in zip(row, column)) for column in right_t] for row in left]
+
+
+def _invert_square_matrix(matrix: list[list[float]]) -> list[list[float]]:
+    size = len(matrix)
+    augmented = [
+        [float(value) for value in row] + [1.0 if idx == row_idx else 0.0 for idx in range(size)]
+        for row_idx, row in enumerate(matrix)
+    ]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda row_idx: abs(augmented[row_idx][col]))
+        if abs(augmented[pivot][col]) < 1e-12:
+            augmented[col][col] += 1e-6
+            pivot = col
+        augmented[col], augmented[pivot] = augmented[pivot], augmented[col]
+        pivot_value = augmented[col][col]
+        augmented[col] = [value / pivot_value for value in augmented[col]]
+        for row_idx in range(size):
+            if row_idx == col:
+                continue
+            factor = augmented[row_idx][col]
+            augmented[row_idx] = [
+                current - factor * pivoted
+                for current, pivoted in zip(augmented[row_idx], augmented[col])
+            ]
+    return [row[size:] for row in augmented]
+
+
+def _least_squares_weights(x_rows: list[list[float]], y_rows: list[list[float]]) -> list[list[float]]:
+    x_t = _transpose(x_rows)
+    xtx = _matmul(x_t, x_rows)
+    for idx in range(len(xtx)):
+        xtx[idx][idx] += 1e-6
+    xty = _matmul(x_t, y_rows)
+    return _matmul(_invert_square_matrix(xtx), xty)
 
 
 def train_site_physics_surrogate(
@@ -279,46 +319,61 @@ def train_site_physics_surrogate(
     surrogate_run_id: str | None = None,
 ) -> dict[str, str]:
     surrogate_run_id = surrogate_run_id or f"surrogate_{batch_id}"
-    physics_targets = pd.read_parquet(layout.physics_targets_artifacts_dir / batch_id / "physics_targets.parquet")
-    archetypes = pd.read_parquet(layout.archetypes_artifacts_dir / source_run_id / "archetypes.parquet")
+    physics_targets = read_dataframe(layout.physics_targets_artifacts_dir / batch_id / "physics_targets.parquet")
+    archetypes = read_dataframe(layout.archetypes_artifacts_dir / source_run_id / "archetypes.parquet")
     site_features = _site_feature_rows(layout, source_run_id)
 
-    x, y, feature_columns, motif_classes, target_columns = _build_training_matrix(physics_targets, archetypes, site_features)
-    if x.numel() == 0 or y.numel() == 0:
+    x_rows, y_rows, feature_columns, motif_classes, target_columns = _build_training_matrix(physics_targets, archetypes, site_features)
+    if not x_rows or not y_rows:
         raise ValueError("No training rows available after joining physics targets with archetype site features.")
-
-    solution = torch.linalg.lstsq(x, y).solution
-    predictions = x @ solution
-    mse = torch.mean((predictions - y) ** 2, dim=0)
+    if torch is not None:
+        x_tensor = torch.tensor(x_rows, dtype=torch.float32)
+        y_tensor = torch.tensor(y_rows, dtype=torch.float32)
+        solution = torch.linalg.lstsq(x_tensor, y_tensor).solution
+        predictions = x_tensor @ solution
+        mse_values = torch.mean((predictions - y_tensor) ** 2, dim=0).tolist()
+        weights_payload: Any = solution
+        checkpoint_format = "torch_tensor"
+    else:
+        solution = _least_squares_weights(x_rows, y_rows)
+        predictions = _matmul(x_rows, solution)
+        mse_values = []
+        for idx in range(len(target_columns)):
+            deltas = [(prediction[idx] - actual[idx]) ** 2 for prediction, actual in zip(predictions, y_rows)]
+            mse_values.append(sum(deltas) / max(len(deltas), 1))
+        weights_payload = solution
+        checkpoint_format = "json_matrix"
 
     out_dir = layout.surrogate_training_artifacts_dir / surrogate_run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / _SURROGATE_FILE
     manifest_path = out_dir / "surrogate_manifest.json"
-    torch.save(
-        {
-            "version": "site_physics_surrogate_v1",
-            "source_batch_id": batch_id,
-            "source_run_id": source_run_id,
-            "feature_columns": feature_columns,
-            "motif_classes": motif_classes,
-            "target_columns": target_columns,
-            "weights": solution,
-        },
-        checkpoint_path,
-    )
+    checkpoint_payload = {
+        "version": "site_physics_surrogate_v1",
+        "source_batch_id": batch_id,
+        "source_run_id": source_run_id,
+        "feature_columns": feature_columns,
+        "motif_classes": motif_classes,
+        "target_columns": target_columns,
+        "weights": weights_payload,
+        "checkpoint_format": checkpoint_format,
+    }
+    if torch is not None:
+        torch.save(checkpoint_payload, checkpoint_path)
+    else:
+        checkpoint_path.write_text(json.dumps(checkpoint_payload, indent=2), encoding="utf-8")
     manifest = {
         "generated_at": _utc_now(),
         "surrogate_run_id": surrogate_run_id,
         "source_batch_id": batch_id,
         "source_run_id": source_run_id,
         "status": "trained",
-        "training_row_count": int(x.shape[0]),
+        "training_row_count": len(x_rows),
         "feature_count": len(feature_columns),
         "motif_class_count": len(motif_classes),
         "target_columns": target_columns,
         "per_target_mse": {
-            column: round(float(mse[idx].item()), 8)
+            column: round(float(mse_values[idx]), 8)
             for idx, column in enumerate(target_columns)
         },
         "checkpoint_path": str(checkpoint_path),
@@ -346,7 +401,12 @@ def load_latest_site_physics_surrogate(layout: StorageLayout) -> dict[str, Any] 
     checkpoint_path = Path(str(latest.get("checkpoint_path") or ""))
     if not checkpoint_path.exists():
         return None
-    return torch.load(checkpoint_path, map_location="cpu")
+    if torch is not None:
+        try:
+            return torch.load(checkpoint_path, map_location="cpu")
+        except Exception:
+            pass
+    return json.loads(checkpoint_path.read_text(encoding="utf-8"))
 
 
 def predict_site_physics_from_surrogate(
@@ -363,9 +423,18 @@ def predict_site_physics_from_surrogate(
     one_hot = [0.0] * len(motif_classes)
     if motif_class in motif_classes:
         one_hot[motif_classes.index(motif_class)] = 1.0
-    vector = torch.tensor([row + one_hot + [1.0]], dtype=torch.float32)
-    prediction = vector @ weights
+    vector = row + one_hot + [1.0]
+    if torch is not None and hasattr(weights, "shape"):
+        prediction = torch.tensor([vector], dtype=torch.float32) @ weights
+        return {
+            column: float(prediction[0, idx].item())
+            for idx, column in enumerate(target_columns)
+        }
+    prediction_values = [
+        sum(vector[feature_idx] * float(weights[feature_idx][target_idx]) for feature_idx in range(len(vector)))
+        for target_idx in range(len(target_columns))
+    ]
     return {
-        column: float(prediction[0, idx].item())
+        column: float(prediction_values[idx])
         for idx, column in enumerate(target_columns)
     }

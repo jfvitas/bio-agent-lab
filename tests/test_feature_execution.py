@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from pbdata.cli import app
 from pbdata.pipeline.feature_execution import run_feature_pipeline
 from pbdata.storage import build_storage_layout
+from pbdata.table_io import read_dataframe, write_dataframe
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
 _LOCAL_TMP.mkdir(exist_ok=True)
@@ -146,13 +147,13 @@ def test_run_feature_pipeline_uses_surrogate_when_not_degraded() -> None:
     archetypes_path = layout.archetypes_artifacts_dir / "source_run" / "archetypes.parquet"
     archetypes_path.parent.mkdir(parents=True, exist_ok=True)
     import pandas as pd
-    pd.DataFrame([{
+    write_dataframe(pd.DataFrame([{
         "run_id": "source_run",
         "site_id": "1ABC|A|ASP|10|OD1|asp_carboxylate_oxygen",
         "motif_class": "asp_carboxylate_oxygen",
         "archetype_id": "asp_carboxylate_oxygen:abc123",
         "descriptor_hash": "abc123",
-    }]).to_parquet(archetypes_path, index=False)
+    }]), archetypes_path)
     for tool_name, payload in {
         "orca": {"atomic_charges": [-0.4], "donor_strength": 0.1, "acceptor_strength": 0.7, "polarizability_proxy": 0.3, "protonation_preference_score": -0.5, "metal_binding_propensity": 0.4, "aromatic_interaction_propensity": 0.2},
         "apbs": {"site_potential": -1.1, "field_magnitude_proxy": 2.2, "desolvation_penalty_proxy": 0.5},
@@ -173,6 +174,6 @@ def test_run_feature_pipeline_uses_surrogate_when_not_degraded() -> None:
     result = run_feature_pipeline(layout, run_id="surrogate_run", degraded_mode=False)
 
     assert result["stage_statuses"]["site_physics_enrichment"] == "passed"
-    site_refined = pd.read_parquet(layout.site_physics_artifacts_dir / "surrogate_run" / "1ABC.site_refined.parquet")
+    site_refined = read_dataframe(layout.site_physics_artifacts_dir / "surrogate_run" / "1ABC.site_refined.parquet")
     assert not site_refined.empty
     assert bool(site_refined.iloc[0]["degraded_mode"]) is False

@@ -256,6 +256,43 @@ def test_scenario_runner_writes_reports() -> None:
     assert manifest["status"] == "scenario_templates_loaded"
 
 
+def test_scenario_runner_executes_workflows_when_inputs_are_available() -> None:
+    tmp = _tmp_dir("scenario_runner_exec")
+    scenario_yaml = tmp / "scenario_test_templates.yaml"
+    rubric = tmp / "undesirable_state_rubric.md"
+    scenario_yaml.write_text(
+        "scenarios:\n  ligand:\n    goal: demo\n    expected_outputs: [ranked_target_list, confidence_score, pathway_risk_summary]\n",
+        encoding="utf-8",
+    )
+    rubric.write_text("severity\nlocation\ndescription\nsuggested_fix\n", encoding="utf-8")
+    (tmp / "data" / "extracted" / "bound_objects").mkdir(parents=True, exist_ok=True)
+    (tmp / "data" / "extracted" / "bound_objects" / "1ABC.json").write_text(
+        json.dumps([{"component_smiles": "CCO"}]),
+        encoding="utf-8",
+    )
+    (tmp / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,receptor_uniprot_ids,reported_measurement_mean_log10_standardized,source_conflict_flag,source_agreement_band,source_database,selected_preferred_source,ligand_key\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,P12345,0.7,false,high,PDBbind,PDBbind,ATP\n",
+        encoding="utf-8",
+    )
+    (tmp / "data" / "extracted" / "bound_objects" / "1ABC.json").write_text(
+        json.dumps([{"component_id": "ATP", "component_smiles": "CCO"}]),
+        encoding="utf-8",
+    )
+
+    report_path, manifest_path = run_scenario_templates(
+        scenario_yaml,
+        rubric,
+        tmp / "data" / "qa_out",
+        execute_workflows=True,
+    )
+
+    reports = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert any("ligand_screening_executed" in step for step in reports[0]["steps_taken"])
+    assert manifest["status"] == "scenario_templates_executed"
+
+
 def test_bias_and_conformation_cli_commands_write_outputs() -> None:
     tmp_root = _tmp_dir("bias_and_conformations")
     extracted = tmp_root / "data" / "extracted"

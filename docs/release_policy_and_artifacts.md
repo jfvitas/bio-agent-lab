@@ -1,5 +1,18 @@
 # Release Policy And Artifact Contract
 
+This document defines the supported release surface for the current implementation.
+
+## Current implementation stance
+
+- The shipped GUI is the Tkinter application in `src/pbdata/gui.py`.
+- The release contract is defined by the CLI, root review exports, and frozen snapshot artifacts.
+- Some subsystems remain intentionally labeled `Experimental` or `Baseline`:
+  - site-physics offline feedback loop
+  - prediction manifests
+  - pathway/risk scoring
+
+These surfaces are available for expert use, but they are not the core release-grade dataset contract.
+
 This repository now maintains two artifact layers:
 
 ## 1. Live review artifacts in the repo root
@@ -33,7 +46,14 @@ These are intended for inspection, iteration, and current-state QA.
 Use:
 
 ```bash
+pbdata --storage-root <root> release-check
 pbdata --storage-root <root> build-release --tag <release_tag>
+```
+
+For strict release gating, use:
+
+```bash
+pbdata --storage-root <root> build-release --tag <release_tag> --strict
 ```
 
 This writes a snapshot under:
@@ -56,6 +76,7 @@ The snapshot includes:
 - custom training-set artifacts if they exist at snapshot time
 - root review exports available at snapshot time
 - `release_snapshot_manifest.json`
+- `release_readiness_report.json`
 
 ## Scientific coverage summary
 
@@ -99,6 +120,7 @@ These exclusions are written explicitly to `model_ready_exclusions.csv`.
 1. Run ingest / extract / graph / features / training / splits.
 2. Inspect root review artifacts.
 3. Optionally run `build-custom-training-set` to create a diversity-optimized subset for model development.
-4. Resolve or accept exclusions.
-5. Run `build-release`.
+4. Run `release-check` and resolve blockers.
+5. Resolve or accept exclusions and warnings.
+6. Run `build-release`.
 6. Treat the snapshot directory as the frozen dataset handoff.

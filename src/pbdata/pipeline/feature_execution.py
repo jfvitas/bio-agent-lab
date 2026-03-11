@@ -34,6 +34,7 @@ from pbdata.pipeline.physics_feedback import (
     predict_site_physics_from_surrogate,
 )
 from pbdata.storage import StorageLayout
+from pbdata.table_io import read_dataframe, write_dataframe
 
 PIPELINE_VERSION = "site_feature_pipeline_v1"
 SITE_PHYSICS_SPEC_VERSION = "1.0"
@@ -84,8 +85,7 @@ def _json_dump(path: Path, payload: Any) -> Path:
 
 def _write_df(path: Path, rows: list[dict[str, Any]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_parquet(path, index=False)
-    return path
+    return write_dataframe(pd.DataFrame(rows), path)
 
 
 def _read_json_rows(path: Path) -> list[dict[str, Any]]:
@@ -660,7 +660,7 @@ def run_feature_pipeline(
         return len(entries), len(resolved), len(rejected), [str(resolved_path), str(rejected_path), str(manifest_path)], []
 
     def stage2():
-        df = pd.read_parquet(layout.artifact_manifests_dir / f"{config.run_id}_stage1_resolved_records.parquet")
+        df = read_dataframe(layout.artifact_manifests_dir / f"{config.run_id}_stage1_resolved_records.parquet")
         outputs: list[str] = []
         warnings: list[str] = []
         attempted = len(df.index)
@@ -688,8 +688,8 @@ def run_feature_pipeline(
             pdb_id = prepared_path.stem.replace(".prepared", "")
             attempted += 1
             try:
-                sites = pd.read_parquet(prepared_dir / f"{pdb_id}.sites.parquet").to_dict(orient="records")
-                atoms = pd.read_parquet(layout.site_envs_artifacts_dir / config.run_id / f"{pdb_id}.atoms.parquet").to_dict(orient="records")
+                sites = read_dataframe(prepared_dir / f"{pdb_id}.sites.parquet").to_dict(orient="records")
+                atoms = read_dataframe(layout.site_envs_artifacts_dir / config.run_id / f"{pdb_id}.atoms.parquet").to_dict(orient="records")
                 env_rows, node_rows = _shell_descriptor_rows(pdb_id, sites, atoms)
                 edge_rows = _edge_rows_from_sites(pdb_id, sites)
                 outputs.extend([
@@ -715,7 +715,7 @@ def run_feature_pipeline(
             pdb_id = env_path.stem.replace(".env_vectors", "")
             attempted += 1
             try:
-                env_rows = pd.read_parquet(env_path).to_dict(orient="records")
+                env_rows = read_dataframe(env_path).to_dict(orient="records")
                 if surrogate_model is not None:
                     refined_rows, provenance_rows, cache_stats = _site_refined_rows_from_surrogate(env_rows, surrogate_model)
                 else:
@@ -743,13 +743,17 @@ def run_feature_pipeline(
             attempted += 1
             try:
                 graph_nodes, graph_edges, meta = _graph_rows(
-                    pd.read_parquet(node_path).to_dict(orient="records"),
-                    pd.read_parquet(base_dir / f"{pdb_id}.edge_base.parquet").to_dict(orient="records"),
-                    pd.read_parquet(site_dir / f"{pdb_id}.site_refined.parquet").to_dict(orient="records"),
+                    read_dataframe(node_path).to_dict(orient="records"),
+                    read_dataframe(base_dir / f"{pdb_id}.edge_base.parquet").to_dict(orient="records"),
+                    read_dataframe(site_dir / f"{pdb_id}.site_refined.parquet").to_dict(orient="records"),
                 )
                 graph_pt = layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.graph.pt"
                 graph_pt.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({"nodes": graph_nodes, "edges": graph_edges, "meta": meta}, graph_pt)
+                graph_payload = {"nodes": graph_nodes, "edges": graph_edges, "meta": meta}
+                if torch is not None:
+                    torch.save(graph_payload, graph_pt)
+                else:
+                    graph_pt.write_text(json.dumps(graph_payload, indent=2), encoding="utf-8")
                 outputs.extend([
                     str(_write_df(layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.nodes.parquet", graph_nodes)),
                     str(_write_df(layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.edges.parquet", graph_edges)),
@@ -783,7 +787,10 @@ def run_feature_pipeline(
                     if index < len(examples):
                         example_path = layout.training_examples_artifacts_dir / config.run_id / f"{record_id}_{index}.example.pt"
                         example_path.parent.mkdir(parents=True, exist_ok=True)
-                        torch.save(examples[index], example_path)
+                        if torch is not None:
+                            torch.save(examples[index], example_path)
+                        else:
+                            example_path.write_text(json.dumps(examples[index], indent=2), encoding="utf-8")
                         outputs.append(str(example_path))
                     if index < len(labels):
                         outputs.append(str(_json_dump(layout.training_examples_artifacts_dir / config.run_id / f"{record_id}_{index}.label.json", labels[index])))
@@ -799,7 +806,14 @@ def run_feature_pipeline(
     def stage7():
         payloads = [payload for name in ("canonical_input_resolution", "structure_preparation", "base_feature_extraction", "site_physics_enrichment", "graph_construction", "training_example_assembly") if (payload := _load_stage_status(layout, config.run_id, name))]
         summary = [f"# Feature Pipeline Summary: {config.run_id}", "", f"- Pipeline version: {PIPELINE_VERSION}", f"- Run mode: {config.run_mode}", f"- Degraded mode: {config.degraded_mode}", "", "## Stage outcomes"]
-        summary.extend(f"- {payload['stage_name']}: {payload['status']} ({payload['records_succeeded']}/{payload['records_attempted']} succeeded)" for payload in payloads)
+        for payload in payloads:
+            attempted = int(payload["records_attempted"])
+            succeeded = int(payload["records_succeeded"])
+            if attempted == 0 and str(payload["status"]) == "passed":
+                line = f"- {payload['stage_name']}: passed (0 records; upstream input was empty)"
+            else:
+                line = f"- {payload['stage_name']}: {payload['status']} ({succeeded}/{attempted} succeeded)"
+            summary.append(line)
         summary_path = layout.feature_reports_dir / f"{config.run_id}_summary.md"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text("\n".join(summary), encoding="utf-8")
@@ -840,7 +854,7 @@ def export_analysis_queue(layout: StorageLayout, *, run_id: str) -> dict[str, st
     env_dir = layout.base_features_artifacts_dir / run_id
     archetype_rows: list[dict[str, Any]] = []
     for env_path in sorted(env_dir.glob("*.env_vectors.parquet")):
-        env_df = pd.read_parquet(env_path)
+        env_df = read_dataframe(env_path)
         if env_df.empty:
             continue
         for site_id, site_df in env_df.groupby("site_id", sort=True):

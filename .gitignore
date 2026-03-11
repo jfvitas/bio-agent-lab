@@ -64,3 +64,17 @@ dataset_release_manifest.json
 split_summary.csv
 scientific_coverage_summary.json
 master_pdb_review_filtered.csv
+custom_training_set.csv
+custom_training_exclusions.csv
+custom_training_summary.json
+custom_training_manifest.json
+custom_training_scorecard.json
+custom_training_split_benchmark.csv
+release_readiness_report.json
+
+# Runtime directories
+artifacts/
+metadata/
+data/custom_training_sets/
+data/models/
+data/releases/

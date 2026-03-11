@@ -104,3 +104,4 @@ class TrainingExampleRecord(BaseModel):
     graph_features: GraphFeatureFields
     labels: dict[str, Any] | None = None
     provenance: dict[str, Any]
+    field_provenance: dict[str, Any] | None = None

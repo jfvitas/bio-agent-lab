@@ -13,6 +13,7 @@ from pbdata.pipeline.physics_feedback import (
     train_site_physics_surrogate,
 )
 from pbdata.storage import build_storage_layout
+from pbdata.table_io import read_dataframe, write_dataframe
 from tests.test_feature_execution import _write_extracted_fixture
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
@@ -90,13 +91,13 @@ def test_ingest_external_analysis_results_writes_targets() -> None:
         "archetype_id": "asp_carboxylate_oxygen:abc123",
         "descriptor_hash": "abc123",
     }])
-    archetypes.to_parquet(layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet", index=False)
+    write_dataframe(archetypes, layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet")
     _write_parsed_results(layout, "batch1")
 
     result = ingest_external_analysis_results(layout, batch_id="batch1")
 
     assert Path(result["physics_targets"]).exists()
-    df = pd.read_parquet(result["physics_targets"])
+    df = read_dataframe(Path(result["physics_targets"]))
     assert len(df.index) == 1
     assert float(df.iloc[0]["electrostatic_potential"]) == -1.3
     assert "ORCA" in str(df.iloc[0]["source_analysis_methods"])
@@ -113,7 +114,7 @@ def test_train_site_physics_surrogate_and_load_latest() -> None:
         "archetype_id": "asp_carboxylate_oxygen:abc123",
         "descriptor_hash": "abc123",
     }])
-    archetypes.to_parquet(layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet", index=False)
+    write_dataframe(archetypes, layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet")
     _write_parsed_results(layout, "batch1")
     ingest_external_analysis_results(layout, batch_id="batch1")
 
@@ -138,7 +139,7 @@ def test_cli_ingest_and_train_site_physics_surrogate() -> None:
         "archetype_id": "asp_carboxylate_oxygen:abc123",
         "descriptor_hash": "abc123",
     }])
-    archetypes.to_parquet(layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet", index=False)
+    write_dataframe(archetypes, layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet")
     _write_parsed_results(layout, "batch1")
     runner = CliRunner()
 

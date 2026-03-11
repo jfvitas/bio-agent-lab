@@ -73,12 +73,18 @@ def test_build_custom_training_set_enforces_cluster_diversity() -> None:
         rows = list(csv.DictReader(handle))
     with Path(artifacts["custom_training_summary_json"]).open(encoding="utf-8") as handle:
         summary = json.load(handle)
+    with Path(artifacts["custom_training_scorecard_json"]).open(encoding="utf-8") as handle:
+        scorecard = json.load(handle)
+    with Path(artifacts["custom_training_split_benchmark_csv"]).open(newline="", encoding="utf-8") as handle:
+        benchmark_rows = list(csv.DictReader(handle))
 
     assert len(rows) == 2
     assert len({row["receptor_cluster_key"] for row in rows}) == 2
     assert Path(artifacts["custom_training_manifest_json"]).exists()
     assert summary["selected_count"] == 2
     assert summary["selected_receptor_clusters"] == 2
+    assert scorecard["diversity"]["selected_receptor_clusters"] == 2
+    assert any(row["benchmark_mode"] == "receptor_cluster" for row in benchmark_rows)
 
 
 def test_build_custom_training_set_mutation_mode_prefers_mutants() -> None:
@@ -128,5 +134,8 @@ def test_build_custom_training_set_cli_writes_outputs() -> None:
     assert result.exit_code == 0
     assert (tmp_root / "custom_training_set.csv").exists()
     assert (tmp_root / "custom_training_summary.json").exists()
+    assert (tmp_root / "custom_training_scorecard.json").exists()
+    assert (tmp_root / "custom_training_split_benchmark.csv").exists()
     assert (storage_root / "data" / "custom_training_sets" / "custom-v1").exists()
     assert "Custom training set" in result.output
+    assert "Scorecard" in result.output

@@ -33,6 +33,14 @@ _DEFAULT_CRITERIA    = Path("configs/criteria.yaml")
 logger = logging.getLogger(__name__)
 
 
+@app.command("gui")
+def gui_cmd() -> None:
+    """Launch the desktop GUI."""
+    from pbdata.gui import main as gui_main
+
+    gui_main()
+
+
 def _storage_layout(ctx: typer.Context) -> StorageLayout:
     return ctx.obj["storage_layout"]
 
@@ -77,6 +85,18 @@ def _validate_extracted_bundle(output_dir: Path, pdb_id: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _exit_with_dependency_error(exc: Exception) -> None:
+    message = str(exc)
+    lowered = message.lower()
+    if "torch" in lowered:
+        typer.echo("Error: this command requires the optional 'torch' dependency. Install it and retry.")
+    elif "pyarrow" in lowered or "fastparquet" in lowered or "parquet" in lowered:
+        typer.echo("Error: this command requires parquet support. Install 'pyarrow' or 'fastparquet' and retry.")
+    else:
+        typer.echo(f"Error: {exc}")
+    raise typer.Exit(code=1)
 
 
 def _fetch_bindingdb_samples_for_pdb(
@@ -759,7 +779,7 @@ def report_bias_cmd(ctx: typer.Context) -> None:
 
 @app.command("run-scenario-tests")
 def run_scenario_tests_cmd(ctx: typer.Context) -> None:
-    """Load scenario templates and emit a structured QA report scaffold."""
+    """Execute scenario templates when possible and emit a structured QA report."""
     from pbdata.qa.scenario_runner import run_scenario_templates
 
     layout = _storage_layout(ctx)
@@ -769,10 +789,50 @@ def run_scenario_tests_cmd(ctx: typer.Context) -> None:
         scenario_yaml,
         rubric_path,
         layout.qa_dir,
+        execute_workflows=True,
     )
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Scenario test report written to {report_path}")
     typer.echo(f"Scenario test manifest written to {manifest_path}")
+
+
+@app.command("status")
+def status_cmd(ctx: typer.Context) -> None:
+    """Show a concise snapshot of repository data and pipeline state."""
+    from pbdata.ops import build_status_report
+
+    layout = _storage_layout(ctx)
+    status = build_status_report(layout)
+    typer.echo(f"Storage root           : {status['storage_root']}")
+    typer.echo(f"Raw RCSB records       : {status['raw_rcsb_count']}")
+    typer.echo(f"Processed records      : {status['processed_rcsb_count']}")
+    typer.echo(f"Extracted entries      : {status['extracted_entry_count']}")
+    typer.echo(f"Structure files        : {status['structure_file_count']}")
+    typer.echo(f"Graph exports present  : {status['graph_node_export_present'] and status['graph_edge_export_present']}")
+    typer.echo(f"Feature manifest       : {status['feature_manifest_present']}")
+    typer.echo(f"Training examples      : {status['training_example_count']}")
+    typer.echo(f"Baseline model         : {status['baseline_model_present']}")
+    typer.echo(f"Site feature runs      : {status['site_feature_runs']}")
+    typer.echo(f"Surrogate checkpoint   : {status['surrogate_checkpoint_present']}")
+    typer.echo(f"Latest release         : {status['release_snapshot_present']}")
+
+
+@app.command("doctor")
+def doctor_cmd(ctx: typer.Context) -> None:
+    """Check dependency and configuration readiness for the current installation."""
+    from pbdata.ops import build_doctor_report
+
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj["config"]
+    report = build_doctor_report(layout, cfg)
+    typer.echo(f"Storage root      : {layout.root}")
+    typer.echo(f"Overall status    : {report['overall_status']}")
+    typer.echo(f"Python version    : {report['python_version']}")
+    typer.echo(f"Data dir present  : {report['required_directories']['data']}")
+    typer.echo(f"Artifacts present : {report['required_directories']['artifacts']}")
+    typer.echo("Dependencies:")
+    for name, payload in report["dependency_checks"].items():
+        typer.echo(f"  - {name}: {payload['status']}{' (required)' if payload['required'] else ''}")
 
 
 @app.command("predict-ligand-screening")
@@ -795,9 +855,8 @@ def predict_ligand_screening_cmd(
             structure_file=structure_file,
             fasta=fasta,
         )
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(code=1)
+    except (ValueError, ModuleNotFoundError, ImportError, RuntimeError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Ligand screening manifest written to {out_path}")
     typer.echo(f"Workflow status: {manifest['status']}")
@@ -838,9 +897,8 @@ def predict_peptide_binding_cmd(
     layout = _storage_layout(ctx)
     try:
         out_path, manifest = run_peptide_binding_workflow(layout, structure_file=structure_file)
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}")
-        raise typer.Exit(code=1)
+    except (ValueError, ModuleNotFoundError, ImportError, RuntimeError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Peptide binding manifest written to {out_path}")
     typer.echo(f"Workflow status: {manifest['status']}")
@@ -1240,16 +1298,19 @@ def run_feature_pipeline_cmd(
     from pbdata.pipeline.feature_execution import run_feature_pipeline
 
     layout = _storage_layout(ctx)
-    result = run_feature_pipeline(
-        layout,
-        run_mode=run_mode,
-        stage_only=stage_name,
-        run_id=run_id,
-        degraded_mode=degraded_mode,
-        fail_hard=fail_hard,
-        gpu_enabled=gpu_enabled,
-        cpu_workers=_coerce_workers(workers),
-    )
+    try:
+        result = run_feature_pipeline(
+            layout,
+            run_mode=run_mode,
+            stage_only=stage_name,
+            run_id=run_id,
+            degraded_mode=degraded_mode,
+            fail_hard=fail_hard,
+            gpu_enabled=gpu_enabled,
+            cpu_workers=_coerce_workers(workers),
+        )
+    except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Feature pipeline run id: {result['run_id']}")
     typer.echo(f"Artifacts root: {result['artifacts_root']}")
@@ -1281,7 +1342,10 @@ def export_analysis_queue_cmd(
             typer.echo("Error: --run-id is required until at least one site-centric feature run exists.")
             raise typer.Exit(code=1)
         resolved_run_id = manifests[0].name.replace("_input_manifest.json", "")
-    result = export_analysis_queue(layout, run_id=resolved_run_id)
+    try:
+        result = export_analysis_queue(layout, run_id=resolved_run_id)
+    except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Feature pipeline run id: {resolved_run_id}")
     typer.echo(f"Archetypes: {result['archetypes']}")
@@ -1398,13 +1462,16 @@ def build_structural_graphs_cmd(
 
     layout = _storage_layout(ctx)
     formats = tuple(export_formats or ["pyg", "networkx"])
-    artifacts = build_structural_graphs(
-        layout,
-        graph_level=graph_level,
-        scope=scope,
-        shell_radius=shell_radius,
-        export_formats=formats,
-    )
+    try:
+        artifacts = build_structural_graphs(
+            layout,
+            graph_level=graph_level,
+            scope=scope,
+            shell_radius=shell_radius,
+            export_formats=formats,
+        )
+    except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Structural graph manifest written to {artifacts['manifest']}")
 
@@ -1643,6 +1710,8 @@ def build_custom_training_set_cmd(
     typer.echo(f"Custom training set : {artifacts['custom_training_set_csv']}")
     typer.echo(f"Exclusions          : {artifacts['custom_training_exclusions_csv']}")
     typer.echo(f"Summary             : {artifacts['custom_training_summary_json']}")
+    typer.echo(f"Scorecard           : {artifacts['custom_training_scorecard_json']}")
+    typer.echo(f"Split benchmark     : {artifacts['custom_training_split_benchmark_csv']}")
     typer.echo(f"Manifest            : {artifacts['custom_training_manifest_json']}")
     typer.echo(f"Snapshot dir        : {artifacts['custom_training_snapshot_dir']}")
 
@@ -1662,18 +1731,21 @@ def engineer_dataset_cmd(
     from pbdata.dataset.engineering import DatasetEngineeringConfig, engineer_dataset
 
     layout = _storage_layout(ctx)
-    artifacts = engineer_dataset(
-        layout,
-        config=DatasetEngineeringConfig(
-            dataset_name=dataset_name,
-            test_frac=test_frac,
-            cv_folds=cv_folds,
-            strict_family_isolation=strict_family_isolation,
-            embedding_backend=embedding_backend,
-            cluster_count=cluster_count,
-            seed=seed,
-        ),
-    )
+    try:
+        artifacts = engineer_dataset(
+            layout,
+            config=DatasetEngineeringConfig(
+                dataset_name=dataset_name,
+                test_frac=test_frac,
+                cv_folds=cv_folds,
+                strict_family_isolation=strict_family_isolation,
+                embedding_backend=embedding_backend,
+                cluster_count=cluster_count,
+                seed=seed,
+            ),
+        )
+    except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
     if "train_csv" in artifacts:
         typer.echo(f"Train CSV        : {artifacts['train_csv']}")
@@ -1699,12 +1771,20 @@ def build_release_cmd(
         Optional[str],
         typer.Option("--tag", help="Optional release tag. Defaults to current UTC timestamp."),
     ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict/--no-strict", help="Block snapshot creation when release readiness has blockers."),
+    ] = False,
 ) -> None:
     """Freeze the current release artifacts into a versioned snapshot directory."""
     from pbdata.release_export import build_release_snapshot
 
     layout = _storage_layout(ctx)
-    artifacts = build_release_snapshot(layout, release_tag=tag)
+    try:
+        artifacts = build_release_snapshot(layout, release_tag=tag, strict=strict)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1)
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Release snapshot: {artifacts['release_snapshot_dir']}")
     if "model_ready_pairs_csv" in artifacts:
@@ -1716,6 +1796,22 @@ def build_release_cmd(
     typer.echo(f"Snapshot Manifest: {artifacts['release_snapshot_manifest_json']}")
     if "latest_release_json" in artifacts:
         typer.echo(f"Latest Release   : {artifacts['latest_release_json']}")
+    if "release_readiness_json" in artifacts:
+        typer.echo(f"Readiness Report : {artifacts['release_readiness_json']}")
+
+
+@app.command("release-check")
+def release_check_cmd(ctx: typer.Context) -> None:
+    """Build the release-readiness report and print blockers/warnings."""
+    from pbdata.release_export import build_release_readiness_report
+
+    layout = _storage_layout(ctx)
+    out_path, report = build_release_readiness_report(layout)
+    typer.echo(f"Storage root    : {layout.root}")
+    typer.echo(f"Release status  : {report['release_status']}")
+    typer.echo(f"Blockers        : {', '.join(report['blockers']) or 'none'}")
+    typer.echo(f"Warnings        : {', '.join(report['warnings']) or 'none'}")
+    typer.echo(f"Readiness report: {out_path}")
 
 
 # ---------------------------------------------------------------------------

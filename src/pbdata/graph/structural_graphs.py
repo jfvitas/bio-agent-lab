@@ -19,9 +19,9 @@ from typing import Any
 
 import gemmi
 import pandas as pd
-import torch
 
 from pbdata.storage import StorageLayout
+from pbdata.table_io import write_dataframe
 
 _AA_HYDROPHOBICITY = {
     "ALA": 1.8, "ARG": -4.5, "ASN": -3.5, "ASP": -3.5, "CYS": 2.5, "GLN": -3.5,
@@ -57,6 +57,14 @@ class StructuralGraphConfig:
     scope: str = "whole_protein"
     shell_radius: float = 8.0
     export_formats: tuple[str, ...] = ("pyg", "networkx")
+
+
+def _try_import_torch() -> Any | None:
+    try:
+        import torch  # type: ignore
+    except ModuleNotFoundError:
+        return None
+    return torch
 
 
 def _load_entry_rows(layout: StorageLayout) -> list[dict[str, Any]]:
@@ -97,6 +105,33 @@ def _scope_chain_ids(pdb_id: str, interfaces: list[dict[str, Any]], scope: str) 
                 if token:
                     scoped.add(token)
     return scoped
+
+
+def _parse_residue_identifier(raw: object) -> tuple[str, int] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if ":" in text:
+        chain_id, tail = text.split(":", 1)
+        digits = "".join(ch for ch in tail if ch.isdigit() or ch == "-")
+        if chain_id.strip() and digits:
+            try:
+                return chain_id.strip(), int(digits)
+            except ValueError:
+                return None
+    return None
+
+
+def _focus_residue_keys(pdb_id: str, interfaces: list[dict[str, Any]]) -> set[tuple[str, int]]:
+    keys: set[tuple[str, int]] = set()
+    for row in interfaces:
+        if str(row.get("pdb_id") or "").upper() != pdb_id.upper():
+            continue
+        for residue_id in row.get("binding_site_residue_ids") or []:
+            parsed = _parse_residue_identifier(residue_id)
+            if parsed is not None:
+                keys.add(parsed)
+    return keys
 
 
 def _residue_secondary_structure(residue: gemmi.Residue) -> str:
@@ -290,7 +325,7 @@ def _atom_edges(nodes: list[dict[str, Any]], shell_radius: float) -> list[dict[s
     return edges
 
 
-def _edge_feature_tensor(edges: list[dict[str, Any]]) -> torch.Tensor:
+def _edge_feature_rows(edges: list[dict[str, Any]]) -> list[list[float]]:
     rows = []
     for edge in edges:
         edge_type = str(edge.get("edge_type") or "")
@@ -303,7 +338,7 @@ def _edge_feature_tensor(edges: list[dict[str, Any]]) -> torch.Tensor:
             1.0 if edge_type == "pi_stacking" else 0.0,
             1.0 if edge_type == "metal_coordination" else 0.0,
         ])
-    return torch.tensor(rows, dtype=torch.float32) if rows else torch.zeros((0, 7), dtype=torch.float32)
+    return rows
 
 
 def _graph_summary(pdb_id: str, nodes: list[dict[str, Any]], edges: list[dict[str, Any]], *, graph_level: str, scope: str) -> dict[str, Any]:
@@ -371,7 +406,7 @@ def summarize_structure_graph_from_file(
     return _graph_summary(pdb_id, nodes, edges, graph_level=graph_level, scope="whole_protein")
 
 
-def _node_feature_tensor(nodes: list[dict[str, Any]], graph_level: str) -> torch.Tensor:
+def _node_feature_rows(nodes: list[dict[str, Any]], graph_level: str) -> list[list[float]]:
     if graph_level == "residue":
         rows = [
             [
@@ -396,10 +431,10 @@ def _node_feature_tensor(nodes: list[dict[str, Any]], graph_level: str) -> torch
             ]
             for node in nodes
         ]
-    return torch.tensor(rows, dtype=torch.float32) if rows else torch.zeros((0, 1), dtype=torch.float32)
+    return rows
 
 
-def _edge_index_tensor(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> torch.Tensor:
+def _edge_index_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[list[int]]:
     node_index = {row["node_id"]: idx for idx, row in enumerate(nodes)}
     pairs: list[list[int]] = []
     for edge in edges:
@@ -407,9 +442,36 @@ def _edge_index_tensor(nodes: list[dict[str, Any]], edges: list[dict[str, Any]])
             continue
         pairs.append([node_index[edge["source"]], node_index[edge["target"]]])
         pairs.append([node_index[edge["target"]], node_index[edge["source"]]])
-    if not pairs:
-        return torch.zeros((2, 0), dtype=torch.long)
-    return torch.tensor(pairs, dtype=torch.long).t().contiguous()
+    return pairs
+
+
+def _rows_to_torch_tensor(rows: list[list[float]] | list[list[int]], *, dtype: str) -> Any:
+    torch = _try_import_torch()
+    if torch is None:
+        return rows
+    if not rows:
+        shape = (2, 0) if dtype == "long" else (0, 0)
+        return torch.zeros(shape, dtype=getattr(torch, dtype))
+    if dtype == "long":
+        return torch.tensor(rows, dtype=torch.long).t().contiguous()
+    return torch.tensor(rows, dtype=torch.float32)
+
+
+def _write_export_bundle(
+    out_dir: Path,
+    *,
+    pdb_id: str,
+    export_name: str,
+    payload: dict[str, Any],
+) -> Path:
+    torch = _try_import_torch()
+    if torch is not None:
+        path = out_dir / f"{pdb_id}.{export_name}.pt"
+        torch.save(payload, path)
+        return path
+    path = out_dir / f"{pdb_id}.{export_name}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 def build_structural_graphs(
@@ -441,39 +503,98 @@ def build_structural_graphs(
         structure = gemmi.read_structure(str(structure_path))
         secondary_structure_index = _secondary_structure_index(structure_path)
         scoped_chain_ids = _scope_chain_ids(pdb_id, interfaces, scope)
-        nodes: list[dict[str, Any]] = []
-        chain_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        focus_residue_keys = _focus_residue_keys(pdb_id, interfaces)
+        all_nodes: list[dict[str, Any]] = []
+        focus_node_ids: set[str] = set()
         for model in structure:
             for chain in model:
                 chain_name = str(chain.name)
-                if scoped_chain_ids and chain_name not in scoped_chain_ids:
-                    continue
                 for residue in chain:
                     if graph_level == "residue":
                         node_id, node = _residue_node(chain_name, residue, secondary_structure_index=secondary_structure_index)
-                        nodes.append(node)
-                        chain_groups[chain_name].append(node)
+                        all_nodes.append(node)
+                        if (chain_name, int(residue.seqid.num)) in focus_residue_keys:
+                            focus_node_ids.add(node_id)
                     else:
                         for atom in residue:
-                            _, node = _atom_node(chain_name, residue, atom)
-                            nodes.append(node)
+                            node_id, node = _atom_node(chain_name, residue, atom)
+                            all_nodes.append(node)
+                            if (chain_name, int(residue.seqid.num)) in focus_residue_keys:
+                                focus_node_ids.add(node_id)
+        if scope == "whole_protein":
+            nodes = list(all_nodes)
+        elif scope == "interface_only":
+            if focus_node_ids:
+                nodes = [node for node in all_nodes if str(node.get("node_id") or "") in focus_node_ids]
+            else:
+                nodes = [
+                    node for node in all_nodes
+                    if not scoped_chain_ids or str(node.get("chain_id") or "") in scoped_chain_ids
+                ]
+        else:
+            focus_points = [
+                (float(node.get("x") or 0.0), float(node.get("y") or 0.0), float(node.get("z") or 0.0))
+                for node in all_nodes
+                if str(node.get("node_id") or "") in focus_node_ids
+            ]
+            if not focus_points:
+                focus_points = [
+                    (float(node.get("x") or 0.0), float(node.get("y") or 0.0), float(node.get("z") or 0.0))
+                    for node in all_nodes
+                    if not scoped_chain_ids or str(node.get("chain_id") or "") in scoped_chain_ids
+                ]
+            nodes = []
+            for node in all_nodes:
+                point = (float(node.get("x") or 0.0), float(node.get("y") or 0.0), float(node.get("z") or 0.0))
+                if any(((point[0] - fx) ** 2 + (point[1] - fy) ** 2 + (point[2] - fz) ** 2) ** 0.5 <= shell_radius for fx, fy, fz in focus_points):
+                    nodes.append(node)
+        chain_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for node in nodes:
+            chain_groups[str(node.get("chain_id") or "")].append(node)
         edges = _residue_edges(nodes, chain_groups, shell_radius) if graph_level == "residue" else _atom_edges(nodes, shell_radius)
         nodes_path = out_dir / f"{pdb_id}.nodes.parquet"
         edges_path = out_dir / f"{pdb_id}.edges.parquet"
-        pd.DataFrame(nodes).to_parquet(nodes_path, index=False)
-        pd.DataFrame(edges).to_parquet(edges_path, index=False)
+        write_dataframe(pd.DataFrame(nodes), nodes_path)
+        write_dataframe(pd.DataFrame(edges), edges_path)
 
-        edge_index = _edge_index_tensor(nodes, edges)
-        node_features = _node_feature_tensor(nodes, graph_level)
-        edge_features = _edge_feature_tensor(edges)
+        edge_index_rows = _edge_index_rows(nodes, edges)
+        node_feature_rows = _node_feature_rows(nodes, graph_level)
+        edge_feature_rows = _edge_feature_rows(edges)
+        edge_index = _rows_to_torch_tensor(edge_index_rows, dtype="long")
+        node_features = _rows_to_torch_tensor(node_feature_rows, dtype="float32")
+        edge_features = _rows_to_torch_tensor(edge_feature_rows, dtype="float32")
         summary = _graph_summary(pdb_id, nodes, edges, graph_level=graph_level, scope=scope)
         if "pyg" in export_formats:
-            pyg_path = out_dir / f"{pdb_id}.pyg.pt"
-            torch.save({"x": node_features, "edge_index": edge_index, "edge_attr": edge_features, "node_rows": nodes, "edge_rows": edges, "summary": summary}, pyg_path)
+            pyg_path = _write_export_bundle(
+                out_dir,
+                pdb_id=pdb_id,
+                export_name="pyg",
+                payload={
+                    "format_note": "torch_tensor_bundle" if _try_import_torch() is not None else "json_feature_bundle_no_torch",
+                    "x": node_features,
+                    "edge_index": edge_index,
+                    "edge_attr": edge_features,
+                    "node_rows": nodes,
+                    "edge_rows": edges,
+                    "summary": summary,
+                },
+            )
             outputs[f"{pdb_id}_pyg"] = str(pyg_path)
         if "dgl" in export_formats:
-            dgl_path = out_dir / f"{pdb_id}.dgl.pt"
-            torch.save({"num_nodes": len(nodes), "edges": edge_index, "edge_attr": edge_features, "node_rows": nodes, "edge_rows": edges, "summary": summary}, dgl_path)
+            dgl_path = _write_export_bundle(
+                out_dir,
+                pdb_id=pdb_id,
+                export_name="dgl",
+                payload={
+                    "format_note": "dgl_compatible_bundle_not_native_dgl_graph",
+                    "num_nodes": len(nodes),
+                    "edges": edge_index,
+                    "edge_attr": edge_features,
+                    "node_rows": nodes,
+                    "edge_rows": edges,
+                    "summary": summary,
+                },
+            )
             outputs[f"{pdb_id}_dgl"] = str(dgl_path)
         if "networkx" in export_formats:
             nx_path = out_dir / f"{pdb_id}.networkx.json"

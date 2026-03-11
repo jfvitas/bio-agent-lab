@@ -366,6 +366,41 @@ def assemble_training_examples(
                 "has_features": bool(feat),
                 "has_graph_data": bool(node_ids),
             },
+            field_provenance={
+                "structure": {
+                    "source_tables": ["entry", "features"],
+                    "pdb_id": pdb_id,
+                },
+                "protein": {
+                    "source_tables": ["chains", "features"],
+                    "receptor_chain_ids": receptor_chain_ids or None,
+                    "primary_chain_id": primary_chain.get("chain_id"),
+                },
+                "ligand": {
+                    "source_tables": ["bound_objects"],
+                    "ligand_key": ligand_key,
+                    "matched_component_id": primary_ligand.get("component_id"),
+                },
+                "interaction": {
+                    "source_tables": ["interfaces", "features", "microstates", "physics"],
+                    "matching_interface_count": len(all_residues),
+                },
+                "experiment": {
+                    "source_tables": ["assays"],
+                    "source_database": src_db or None,
+                    "selected_preferred_source": assay.get("selected_preferred_source"),
+                    "field_provenance": assay.get("field_provenance"),
+                    "field_confidence": assay.get("field_confidence"),
+                },
+                "graph_features": {
+                    "source_tables": ["graph", "features"],
+                    "node_ids": node_ids or None,
+                },
+                "labels": {
+                    "source_tables": ["assays"],
+                    "affinity_type": affinity_type or None,
+                },
+            },
         ))
 
     # Write output

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -106,17 +107,17 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("ML Pipeline", [
         ("build-structural-graphs", "Build Structural Graphs"),
-        ("build-conformational-states", "Build Conformational States"),
+        ("build-conformational-states", "Build Conformational States (Preview)"),
         ("build-graph", "Build Graph"),
         ("build-microstates", "Build Microstates"),
         ("build-physics-features", "Build Physics Features"),
-        ("build-microstate-refinement", "Build Microstate Refinement"),
-        ("build-mm-job-manifests", "Build MM Job Manifests"),
-        ("run-mm-jobs", "Run MM Jobs"),
+        ("build-microstate-refinement", "Build Microstate Refinement (Experimental)"),
+        ("build-mm-job-manifests", "Build MM Job Manifests (Experimental)"),
+        ("run-mm-jobs", "Run MM Jobs (Experimental)"),
         ("run-feature-pipeline", "Run Site-Centric Feature Pipeline"),
-        ("export-analysis-queue", "Export Analysis Queue"),
-        ("ingest-physics-results", "Ingest Physics Results"),
-        ("train-site-physics-surrogate", "Train Site-Physics Surrogate"),
+        ("export-analysis-queue", "Export Analysis Queue (Experimental)"),
+        ("ingest-physics-results", "Ingest Physics Results (Experimental)"),
+        ("train-site-physics-surrogate", "Train Site-Physics Surrogate (Experimental)"),
         ("build-features", "Build Features"),
         ("build-training-examples", "Build Training Examples"),
         ("build-splits", "Build Splits"),
@@ -135,27 +136,32 @@ _CRITERIA_PATH = Path("configs/criteria.yaml")
 _SOURCES_CFG   = Path("configs/sources.yaml")
 
 _STATUS_COLORS = {
-    "idle":      "#888888",
-    "running":   "#e6a817",
-    "done":      "#4caf50",
-    "error":     "#e53935",
-    "skipped":   "#607d8b",
+    "idle":      "#6b7280",
+    "running":   "#f59e0b",
+    "done":      "#10b981",
+    "error":     "#ef4444",
+    "skipped":   "#94a3b8",
 }
 
-_HEADER_BG   = "#1a237e"
-_HEADER_FG   = "#ffffff"
-_ACCENT_BG   = "#283593"
-_SECTION_FG  = "#1a237e"
-_LOG_BG      = "#1e1e1e"
-_LOG_FG      = "#d4d4d4"
-_OVERVIEW_BG = "#f5f5f5"
-_APP_BG      = "#f3f6fb"
-_CARD_BG     = "#ffffff"
-_CARD_BORDER = "#d7deea"
-_MUTED_FG    = "#5f6b7a"
+_HEADER_BG   = "#07111f"
+_HEADER_FG   = "#f8fafc"
+_ACCENT_BG   = "#14b8a6"
+_ACCENT_BG_ACTIVE = "#0f766e"
+_ACCENT_FG   = "#052e2b"
+_SECTION_FG  = "#0f172a"
+_LOG_BG      = "#081120"
+_LOG_FG      = "#dbe7f5"
+_OVERVIEW_BG = "#eef4fb"
+_APP_BG      = "#edf3f9"
+_CARD_BG     = "#fbfdff"
+_CARD_BORDER = "#d6e2f0"
+_CARD_ALT_BG = "#f4f8fc"
+_MUTED_FG    = "#64748b"
 _SUCCESS_FG  = "#0f766e"
 _WARNING_FG  = "#b45309"
 _ERROR_FG    = "#b91c1c"
+_HEADER_SUB_FG = "#9fb3c8"
+_HEADER_TAG_FG = "#7dd3fc"
 _REVIEW_ISSUE_OPTIONS = [
     "All",
     "missing_structure_file",
@@ -541,6 +547,141 @@ def build_review_health_summary(coverage: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def build_training_set_builder_summary(
+    scorecard: dict[str, Any],
+    benchmark_rows: list[dict[str, str]],
+) -> dict[str, str]:
+    """Build a compact GUI summary for custom training-set curation.
+
+    Assumption:
+    - This is an operational curation summary. It reports selected diversity and
+      grouping pressure from the generated scorecard/benchmark artifacts. It does
+      not claim model performance.
+    """
+    selected_count = int(scorecard.get("selected_count") or 0)
+    candidate_pool_count = int(scorecard.get("candidate_pool_count") or 0)
+    diversity = scorecard.get("diversity") or {}
+    quality = scorecard.get("quality") or {}
+    exclusions = scorecard.get("exclusions") or {}
+
+    receptor_clusters = int(diversity.get("selected_receptor_clusters") or 0)
+    pair_families = int(diversity.get("selected_pair_families") or 0)
+    mean_quality = float(quality.get("mean_quality_score") or 0.0)
+    exclusion_count = int(exclusions.get("count") or 0)
+
+    dominant_benchmark = max(
+        benchmark_rows,
+        key=lambda row: float(str(row.get("largest_group_fraction") or "0") or 0.0),
+        default={},
+    )
+    benchmark_mode = str(dominant_benchmark.get("benchmark_mode") or "n/a")
+    benchmark_fraction = float(str(dominant_benchmark.get("largest_group_fraction") or "0") or 0.0)
+
+    readiness = "Not built"
+    if selected_count > 0 and benchmark_fraction <= 0.35:
+        readiness = "Strong diversity"
+    elif selected_count > 0:
+        readiness = "Needs tuning"
+
+    next_action = "Build custom training set from model-ready pairs."
+    if selected_count > 0 and benchmark_fraction > 0.35:
+        next_action = (
+            "Reduce dominance by changing selection mode or lowering the per-receptor "
+            "cluster cap before releasing the set."
+        )
+    elif selected_count > 0:
+        next_action = "Inspect exclusions and split benchmark, then freeze a release snapshot."
+
+    return {
+        "status": readiness,
+        "coverage": (
+            f"{selected_count:,} selected from {candidate_pool_count:,}; "
+            f"{receptor_clusters:,} receptor clusters, {pair_families:,} pair families"
+        ),
+        "quality": (
+            f"mean quality {mean_quality:.3f}; {exclusion_count:,} excluded; "
+            f"largest benchmark group {benchmark_mode}={benchmark_fraction:.2%}"
+        ),
+        "next_action": next_action,
+    }
+
+
+def build_training_set_kpis(
+    scorecard: dict[str, Any],
+    benchmark_rows: list[dict[str, str]],
+) -> dict[str, str]:
+    """Build compact KPI tiles for the GUI curation dashboard."""
+    selected_count = int(scorecard.get("selected_count") or 0)
+    diversity = scorecard.get("diversity") or {}
+    quality = scorecard.get("quality") or {}
+    exclusions = scorecard.get("exclusions") or {}
+    largest_fraction = max(
+        (float(str(row.get("largest_group_fraction") or "0") or 0.0) for row in benchmark_rows),
+        default=0.0,
+    )
+    return {
+        "selected": f"{selected_count:,}",
+        "clusters": f"{int(diversity.get('selected_receptor_clusters') or 0):,}",
+        "quality": f"{float(quality.get('mean_quality_score') or 0.0):.3f}",
+        "dominance": f"{largest_fraction:.1%}",
+        "excluded": f"{int(exclusions.get('count') or 0):,}",
+    }
+
+
+def build_training_set_workflow_status(
+    review_paths: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Return simple workflow status tuples for the GUI curation path."""
+    def _exists(key: str) -> bool:
+        value = str(review_paths.get(key) or "").strip()
+        return bool(value) and Path(value).exists()
+
+    return [
+        ("Model-ready pool", "ready" if _exists("model_ready_pairs_csv") else "missing"),
+        ("Custom set", "ready" if _exists("custom_training_set_csv") else "pending"),
+        ("Scorecard", "ready" if _exists("custom_training_scorecard_json") else "pending"),
+        ("Benchmark", "ready" if _exists("custom_training_split_benchmark_csv") else "pending"),
+        ("Release", "ready" if _exists("release_manifest_json") else "pending"),
+    ]
+
+
+def build_curation_review_summary(
+    exclusion_rows: list[dict[str, str]],
+    conflict_rows: list[dict[str, str]],
+    issue_rows: list[dict[str, str]],
+) -> dict[str, str]:
+    """Summarize the main curation blockers from current root artifacts."""
+    exclusion_counts = Counter(str(row.get("reason") or "unknown") for row in exclusion_rows)
+    conflict_bands = Counter(str(row.get("source_agreement_band") or "unknown") for row in conflict_rows)
+    issue_counts = Counter(str(row.get("issue_type") or "unknown") for row in issue_rows)
+
+    top_exclusions = ", ".join(
+        f"{reason}={count}"
+        for reason, count in exclusion_counts.most_common(3)
+    ) or "none"
+    top_issues = ", ".join(
+        f"{issue}={count}"
+        for issue, count in issue_counts.most_common(3)
+    ) or "none"
+    conflict_summary = ", ".join(
+        f"{band}={count}"
+        for band, count in conflict_bands.most_common(3)
+    ) or "none"
+
+    next_action = "Build custom set and review exclusions."
+    if conflict_rows:
+        next_action = "Review conflicted pairs before freezing a release."
+    elif exclusion_rows:
+        next_action = "Inspect top exclusion reasons and retune selection mode or cluster cap."
+
+    return {
+        "exclusions": f"{len(exclusion_rows):,} rows; top reasons: {top_exclusions}",
+        "conflicts": f"{len(conflict_rows):,} rows; agreement bands: {conflict_summary}",
+        "issues": f"{len(issue_rows):,} rows; top issue types: {top_issues}",
+        "next_action": next_action,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -652,6 +793,32 @@ class PbdataGUI:
             "quality": tk.StringVar(value="--"),
             "next_action": tk.StringVar(value="--"),
         }
+        self._training_set_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "coverage": tk.StringVar(value="--"),
+            "quality": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._training_kpi_vars: dict[str, tk.StringVar] = {
+            "selected": tk.StringVar(value="--"),
+            "clusters": tk.StringVar(value="--"),
+            "quality": tk.StringVar(value="--"),
+            "dominance": tk.StringVar(value="--"),
+            "excluded": tk.StringVar(value="--"),
+        }
+        self._training_workflow_vars: dict[str, tk.StringVar] = {
+            "model_ready": tk.StringVar(value="--"),
+            "custom_set": tk.StringVar(value="--"),
+            "scorecard": tk.StringVar(value="--"),
+            "benchmark": tk.StringVar(value="--"),
+            "release": tk.StringVar(value="--"),
+        }
+        self._curation_review_vars: dict[str, tk.StringVar] = {
+            "exclusions": tk.StringVar(value="--"),
+            "conflicts": tk.StringVar(value="--"),
+            "issues": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
 
         # Serialise "Run All"
         self._running = threading.Lock()
@@ -683,13 +850,57 @@ class PbdataGUI:
         style.configure("TFrame", background=_APP_BG)
         style.configure("TLabel", background=_APP_BG, foreground="#0f172a")
         style.configure("Muted.TLabel", background=_APP_BG, foreground=_MUTED_FG, font=("Segoe UI", 8))
-        style.configure("Section.TLabelframe", background=_CARD_BG, relief="solid", borderwidth=1)
-        style.configure("Section.TLabelframe.Label", background=_CARD_BG, foreground="#0f172a", font=("Segoe UI Semibold", 10))
+        style.configure("Section.TLabelframe", background=_CARD_BG, relief="solid", borderwidth=1, bordercolor=_CARD_BORDER)
+        style.configure(
+            "Section.TLabelframe.Label",
+            background=_CARD_BG,
+            foreground=_SECTION_FG,
+            font=("Segoe UI Semibold", 10),
+        )
         style.configure("Card.TFrame", background=_CARD_BG, relief="solid", borderwidth=1)
-        style.configure("TNotebook", background=_APP_BG, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(12, 8), font=("Segoe UI Semibold", 9))
-        style.map("TNotebook.Tab", background=[("selected", _CARD_BG)], foreground=[("selected", "#0f172a")])
-        style.configure("Accent.TButton", font=("Segoe UI Semibold", 9))
+        style.configure("AltCard.TFrame", background=_CARD_ALT_BG, relief="solid", borderwidth=1)
+        style.configure("TNotebook", background=_APP_BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure(
+            "TNotebook.Tab",
+            padding=(14, 10),
+            font=("Segoe UI Semibold", 9),
+            background="#dfe9f3",
+            foreground="#475569",
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", _CARD_BG), ("active", "#e8f0f7")],
+            foreground=[("selected", "#0f172a"), ("active", "#0f172a")],
+        )
+        style.configure(
+            "Accent.TButton",
+            font=("Segoe UI Semibold", 9),
+            background=_ACCENT_BG,
+            foreground=_ACCENT_FG,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(12, 9),
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", _ACCENT_BG_ACTIVE), ("pressed", _ACCENT_BG_ACTIVE)],
+            foreground=[("active", _HEADER_FG), ("pressed", _HEADER_FG)],
+        )
+        style.configure(
+            "TButton",
+            padding=(10, 8),
+            background=_CARD_BG,
+            foreground="#0f172a",
+            borderwidth=1,
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#f3f7fb"), ("pressed", "#e7eef6")],
+            foreground=[("active", "#0f172a"), ("pressed", "#0f172a")],
+        )
+        style.configure("TEntry", fieldbackground="#ffffff", bordercolor=_CARD_BORDER, lightcolor=_CARD_BORDER, darkcolor=_CARD_BORDER)
+        style.configure("TCombobox", fieldbackground="#ffffff", bordercolor=_CARD_BORDER, lightcolor=_CARD_BORDER, darkcolor=_CARD_BORDER)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -731,33 +942,60 @@ class PbdataGUI:
         widget.bind("<Button-5>", _scroll, add="+")
 
     def _build_header(self) -> None:
-        bar = tk.Frame(self._root, bg=_HEADER_BG, pady=8)
+        bar = tk.Frame(self._root, bg=_HEADER_BG, pady=10, padx=8)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         bar.columnconfigure(1, weight=1)
 
         left = tk.Frame(bar, bg=_HEADER_BG)
-        left.pack(side="left", padx=16)
+        left.pack(side="left", padx=12)
+
+        badge = tk.Label(
+            left,
+            text="DATA PLATFORM",
+            fg=_ACCENT_BG,
+            bg=_HEADER_BG,
+            font=("Segoe UI Semibold", 8),
+            padx=8,
+            pady=2,
+        )
+        badge.pack(side="top", anchor="w", pady=(0, 4))
 
         tk.Label(
             left,
             text="pbdata",
             fg=_HEADER_FG, bg=_HEADER_BG,
-            font=("Helvetica", 15, "bold"),
-        ).pack(side="left")
+            font=("Segoe UI Semibold", 18),
+        ).pack(side="left", anchor="s")
 
         tk.Label(
             left,
             text="  Protein Binding Dataset Platform",
-            fg="#b0bec5", bg=_HEADER_BG,
-            font=("Helvetica", 11),
-        ).pack(side="left")
+            fg=_HEADER_SUB_FG, bg=_HEADER_BG,
+            font=("Segoe UI", 11),
+        ).pack(side="left", anchor="s", pady=(0, 1))
+
+        right = tk.Frame(bar, bg=_HEADER_BG)
+        right.pack(side="right", padx=12, fill="y")
 
         tk.Label(
-            bar,
-            text="Structure Extraction  |  Assay Ingestion  |  Graph Builder  |  ML Data Generator",
-            fg="#7986cb", bg=_HEADER_BG,
-            font=("Helvetica", 8),
-        ).pack(side="right", padx=16)
+            right,
+            text="Structure-aware curation for model-ready biological training sets",
+            fg=_HEADER_FG,
+            bg=_HEADER_BG,
+            font=("Segoe UI Semibold", 9),
+            anchor="e",
+            justify="right",
+        ).pack(side="top", anchor="e")
+
+        tk.Label(
+            right,
+            text="Extraction   •   Assays   •   Graphs   •   Physics   •   Release",
+            fg=_HEADER_TAG_FG,
+            bg=_HEADER_BG,
+            font=("Segoe UI", 8),
+            anchor="e",
+            justify="right",
+        ).pack(side="top", anchor="e", pady=(3, 0))
 
     def _build_left_panel(self) -> None:
         left = tk.Frame(self._root, bg=_APP_BG)
@@ -780,7 +1018,7 @@ class PbdataGUI:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
 
-        canvas = tk.Canvas(outer, highlightthickness=0)
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=_APP_BG)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         frame = ttk.Frame(canvas, padding=8)
         frame.bind(
@@ -1682,7 +1920,7 @@ class PbdataGUI:
                     pipeline_frame,
                     text=btn_text,
                     width=28,
-                    style="Accent.TButton" if stage_key in {"ingest", "extract", "build-release"} else "TButton",
+                    style="Accent.TButton" if stage_key in {"ingest", "extract", "build-release", "build-custom-training-set"} else "TButton",
                     command=cmd,
                 ).grid(row=prow, column=0, sticky="w", pady=3, padx=(8, 12))
 
@@ -1807,7 +2045,10 @@ class PbdataGUI:
         release_items = [
             ("model_ready_pairs_csv", "Model-ready CSV:"),
             ("custom_training_set_csv", "Custom training CSV:"),
+            ("custom_training_exclusions_csv", "Custom training exclusions:"),
             ("custom_training_summary_json", "Custom training summary:"),
+            ("custom_training_scorecard_json", "Training scorecard:"),
+            ("custom_training_split_benchmark_csv", "Split benchmark:"),
             ("release_manifest_json", "Release manifest:"),
             ("split_summary_csv", "Split summary:"),
             ("scientific_coverage_json", "Scientific coverage:"),
@@ -1832,8 +2073,154 @@ class PbdataGUI:
             command=self._open_latest_release_dir,
         ).grid(row=0, column=2, rowspan=len(release_items), sticky="ns", padx=(8, 0))
 
+        training_frame = ttk.LabelFrame(overview, text="Training Set Builder", padding=8, style="Section.TLabelframe")
+        training_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        training_frame.columnconfigure(1, weight=1)
+        training_items = [
+            ("status", "Builder status:"),
+            ("coverage", "Coverage snapshot:"),
+            ("quality", "Quality snapshot:"),
+            ("next_action", "Recommended next step:"),
+        ]
+        for r, (key, label) in enumerate(training_items):
+            ttk.Label(
+                training_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                training_frame,
+                textvariable=self._training_set_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+
+        metrics_frame = ttk.Frame(training_frame)
+        metrics_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            metrics_frame.columnconfigure(index, weight=1)
+        metric_labels = [
+            ("selected", "Selected"),
+            ("clusters", "Clusters"),
+            ("quality", "Mean quality"),
+            ("dominance", "Max dominance"),
+            ("excluded", "Excluded"),
+        ]
+        for index, (key, label) in enumerate(metric_labels):
+            card = ttk.Frame(metrics_frame, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(
+                card,
+                text=label,
+                style="Muted.TLabel",
+            ).grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._training_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        workflow_frame = ttk.Frame(training_frame)
+        workflow_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            workflow_frame.columnconfigure(index, weight=1)
+        workflow_items = [
+            ("model_ready", "1. Model-ready"),
+            ("custom_set", "2. Custom set"),
+            ("scorecard", "3. Scorecard"),
+            ("benchmark", "4. Benchmark"),
+            ("release", "5. Release"),
+        ]
+        for index, (key, label) in enumerate(workflow_items):
+            pill = ttk.Frame(workflow_frame, style="Card.TFrame", padding=6)
+            pill.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(
+                pill,
+                text=label,
+                style="Muted.TLabel",
+            ).grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                pill,
+                textvariable=self._training_workflow_vars[key],
+                font=("Segoe UI Semibold", 9),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        training_actions = ttk.Frame(training_frame)
+        training_actions.grid(row=0, column=2, rowspan=6, sticky="ns", padx=(8, 0))
+        for index in range(2):
+            training_actions.columnconfigure(index, weight=1)
+        ttk.Button(
+            training_actions,
+            text="Run Training Set Workflow",
+            style="Accent.TButton",
+            command=self._spawn_training_set_workflow,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            training_actions,
+            text="Build Custom Set",
+            command=lambda: self._spawn_stage("build-custom-training-set"),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(
+            training_actions,
+            text="Open Benchmark",
+            command=lambda: self._open_path(self._existing_review_path("custom_training_split_benchmark_csv")),
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=2)
+        ttk.Button(
+            training_actions,
+            text="Open Exclusions",
+            command=lambda: self._open_path(self._existing_review_path("custom_training_exclusions_csv")),
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(
+            training_actions,
+            text="Build Release",
+            command=lambda: self._spawn_stage("build-release"),
+        ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=2)
+
+        curation_frame = ttk.LabelFrame(overview, text="Curation Review", padding=8, style="Section.TLabelframe")
+        curation_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        curation_frame.columnconfigure(1, weight=1)
+        curation_items = [
+            ("exclusions", "Exclusion review:"),
+            ("conflicts", "Conflict review:"),
+            ("issues", "Issue review:"),
+            ("next_action", "Recommended next step:"),
+        ]
+        for r, (key, label) in enumerate(curation_items):
+            ttk.Label(
+                curation_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                curation_frame,
+                textvariable=self._curation_review_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        curation_actions = ttk.Frame(curation_frame)
+        curation_actions.grid(row=0, column=2, rowspan=len(curation_items), sticky="ns", padx=(8, 0))
+        for index in range(2):
+            curation_actions.columnconfigure(index, weight=1)
+        ttk.Button(
+            curation_actions,
+            text="Refresh Filtered Review",
+            command=self._refresh_filtered_review_csv,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            curation_actions,
+            text="Open Issues",
+            command=lambda: self._open_path(self._existing_review_path("issue_csv")),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(
+            curation_actions,
+            text="Open Conflicts",
+            command=lambda: self._open_path(self._existing_review_path("conflict_csv")),
+        ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=2)
+
         health_frame = ttk.LabelFrame(overview, text="Review Health", padding=8, style="Section.TLabelframe")
-        health_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        health_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         health_frame.columnconfigure(1, weight=1)
         health_items = [
             ("readiness", "Release readiness:"),
@@ -1856,7 +2243,7 @@ class PbdataGUI:
             ).grid(row=r, column=1, sticky="w", pady=1)
 
         help_frame = ttk.LabelFrame(overview, text="Interpretation Guide", padding=8, style="Section.TLabelframe")
-        help_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        help_frame.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         help_frame.columnconfigure(0, weight=1)
         help_lines = [
             "High confidence means a field came from direct structured data or a deterministic merge with no unresolved ambiguity.",
@@ -1874,8 +2261,8 @@ class PbdataGUI:
             ).grid(row=r, column=0, sticky="w", pady=1)
 
         actions_frame = ttk.LabelFrame(overview, text="Quick Actions", padding=8, style="Section.TLabelframe")
-        actions_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        for index in range(5):
+        actions_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        for index in range(7):
             actions_frame.columnconfigure(index, weight=1)
         ttk.Button(
             actions_frame,
@@ -1894,14 +2281,24 @@ class PbdataGUI:
         ).grid(row=0, column=2, sticky="ew", padx=4)
         ttk.Button(
             actions_frame,
+            text="Open Split Benchmark",
+            command=lambda: self._open_path(self._existing_review_path("custom_training_split_benchmark_csv")),
+        ).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(
+            actions_frame,
+            text="Open Training Scorecard",
+            command=lambda: self._open_path(self._existing_review_path("custom_training_scorecard_json")),
+        ).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(
+            actions_frame,
             text="Open Coverage Summary",
             command=lambda: self._open_path(self._existing_review_path("scientific_coverage_json")),
-        ).grid(row=0, column=3, sticky="ew", padx=4)
+        ).grid(row=0, column=5, sticky="ew", padx=4)
         ttk.Button(
             actions_frame,
             text="Open Storage Root",
             command=lambda: self._open_path(self._storage_layout().root),
-        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        ).grid(row=0, column=6, sticky="ew", padx=(4, 0))
 
     def _refresh_overview(self) -> None:
         layout = self._storage_layout()
@@ -1927,6 +2324,45 @@ class PbdataGUI:
         for key, value in summary.items():
             if key in self._review_health_vars:
                 self._review_health_vars[key].set(value)
+        scorecard_path = self._existing_review_path("custom_training_scorecard_json")
+        benchmark_path = self._existing_review_path("custom_training_split_benchmark_csv")
+        training_summary = build_training_set_builder_summary(
+            _load_json_dict(scorecard_path) if scorecard_path else {},
+            _load_csv_dict_rows(benchmark_path) if benchmark_path else [],
+        )
+        for key, value in training_summary.items():
+            if key in self._training_set_vars:
+                self._training_set_vars[key].set(value)
+        training_kpis = build_training_set_kpis(
+            _load_json_dict(scorecard_path) if scorecard_path else {},
+            _load_csv_dict_rows(benchmark_path) if benchmark_path else [],
+        )
+        for key, value in training_kpis.items():
+            if key in self._training_kpi_vars:
+                self._training_kpi_vars[key].set(value)
+        workflow_status = build_training_set_workflow_status(self._review_export_paths())
+        workflow_key_map = {
+            "Model-ready pool": "model_ready",
+            "Custom set": "custom_set",
+            "Scorecard": "scorecard",
+            "Benchmark": "benchmark",
+            "Release": "release",
+        }
+        for label, value in workflow_status:
+            key = workflow_key_map.get(label)
+            if key and key in self._training_workflow_vars:
+                self._training_workflow_vars[key].set(value)
+        exclusion_path = self._existing_review_path("custom_training_exclusions_csv")
+        conflict_path = self._existing_review_path("conflict_csv")
+        issue_path = self._existing_review_path("issue_csv")
+        curation_summary = build_curation_review_summary(
+            _load_csv_dict_rows(exclusion_path) if exclusion_path else [],
+            _load_csv_dict_rows(conflict_path) if conflict_path else [],
+            _load_csv_dict_rows(issue_path) if issue_path else [],
+        )
+        for key, value in curation_summary.items():
+            if key in self._curation_review_vars:
+                self._curation_review_vars[key].set(value)
 
     def _review_export_paths(self) -> dict[str, str]:
         repo_root = Path.cwd()
@@ -1939,7 +2375,10 @@ class PbdataGUI:
             "source_state_csv": "master_source_state.csv",
             "model_ready_pairs_csv": "model_ready_pairs.csv",
             "custom_training_set_csv": "custom_training_set.csv",
+            "custom_training_exclusions_csv": "custom_training_exclusions.csv",
             "custom_training_summary_json": "custom_training_summary.json",
+            "custom_training_scorecard_json": "custom_training_scorecard.json",
+            "custom_training_split_benchmark_csv": "custom_training_split_benchmark.csv",
             "release_manifest_json": "dataset_release_manifest.json",
             "split_summary_csv": "split_summary.csv",
             "scientific_coverage_json": "scientific_coverage_summary.json",
@@ -1972,6 +2411,10 @@ class PbdataGUI:
             self._log_line(f"Root export refreshed: {export_status['release_manifest_json']}")
         if "split_summary_csv" in export_status:
             self._log_line(f"Root export refreshed: {export_status['split_summary_csv']}")
+        if "custom_training_scorecard_json" in export_status:
+            self._log_line(f"Root export refreshed: {export_status['custom_training_scorecard_json']}")
+        if "custom_training_split_benchmark_csv" in export_status:
+            self._log_line(f"Root export refreshed: {export_status['custom_training_split_benchmark_csv']}")
         if "scientific_coverage_json" in export_status:
             self._log_line(f"Root export refreshed: {export_status['scientific_coverage_json']}")
         for key in ("master_csv_error", "pair_csv_error", "issue_csv_error", "conflict_csv_error", "source_state_csv_error"):
@@ -1983,6 +2426,9 @@ class PbdataGUI:
 
     def _filtered_review_csv_path(self) -> Path:
         return Path.cwd() / _FILTERED_REVIEW_CSV_NAME
+
+    def _refresh_filtered_review_csv(self) -> None:
+        self._apply_local_review_filters()
 
     def _apply_local_review_filters(self) -> None:
         review_paths = self._review_export_paths()
@@ -2050,7 +2496,7 @@ class PbdataGUI:
     # --- Log panel ---
 
     def _build_log_panel(self) -> None:
-        frame = ttk.LabelFrame(self._root, text="Log", padding=8)
+        frame = ttk.LabelFrame(self._root, text="Live Run Log", padding=8, style="Section.TLabelframe")
         frame.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0, 10))
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
@@ -2058,10 +2504,13 @@ class PbdataGUI:
         self._log = scrolledtext.ScrolledText(
             frame,
             state="disabled",
-            font=("Courier", 9),
+            font=("Cascadia Code", 9),
             bg=_LOG_BG, fg=_LOG_FG,
-            insertbackground="white",
+            insertbackground=_HEADER_FG,
             relief="flat",
+            padx=10,
+            pady=10,
+            bd=0,
         )
         self._log.grid(row=0, column=0, sticky="nsew")
         self._bind_text_mousewheel(self._log)
@@ -2452,6 +2901,39 @@ class PbdataGUI:
 
     def _spawn_stage(self, stage: str) -> None:
         threading.Thread(target=self._run_stage, args=(stage,), daemon=True).start()
+
+    def _spawn_training_set_workflow(self) -> None:
+        if not self._running.acquire(blocking=False):
+            self._log_line("Pipeline already running — please wait.")
+            return
+        threading.Thread(target=self._run_training_set_workflow_thread, daemon=True).start()
+
+    def _run_training_set_workflow_thread(self) -> None:
+        self._root.after(0, self._log_line, f"\n{'═' * 50}")
+        self._root.after(0, self._log_line, "  RUN TRAINING SET WORKFLOW")
+        self._root.after(0, self._log_line, f"{'═' * 50}")
+        self._root.after(
+            0,
+            self._log_line,
+            "  Workflow: build-splits -> build-custom-training-set -> build-release",
+        )
+        try:
+            for stage in ("build-splits", "build-custom-training-set", "build-release"):
+                status = self._run_stage(stage)
+                if status == "error":
+                    self._root.after(0, self._log_line, f"\nTraining set workflow stopped at '{stage}'.")
+                    return
+            self._root.after(0, self._log_line, f"\n{'═' * 50}")
+            self._root.after(0, self._log_line, "  TRAINING SET WORKFLOW COMPLETE")
+            self._root.after(0, self._log_line, f"{'═' * 50}")
+            self._root.after(
+                0,
+                self._log_line,
+                "  Review custom_training_scorecard.json and custom_training_split_benchmark.csv before shipping the set.",
+            )
+            self._root.after(0, self._refresh_overview)
+        finally:
+            self._running.release()
 
     # ------------------------------------------------------------------
     # Ingest — multi-source aware

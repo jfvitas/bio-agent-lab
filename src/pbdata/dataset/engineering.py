@@ -19,8 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from pbdata.data_pipeline.workflow_engine import write_dataset_export_configs
 from pbdata.storage import StorageLayout
 
@@ -147,22 +145,34 @@ def _esm_embedding(sequence: str, *, dims: int = 32) -> list[float] | None:
         return None
 
 
-def _kmeans(vectors: torch.Tensor, *, k: int, seed: int) -> list[int]:
-    if vectors.shape[0] == 0:
+def _squared_distance(left: list[float], right: list[float]) -> float:
+    return sum((lval - rval) ** 2 for lval, rval in zip(left, right))
+
+
+def _mean_vector(rows: list[list[float]]) -> list[float]:
+    if not rows:
         return []
-    k = max(1, min(k, int(vectors.shape[0])))
-    generator = torch.Generator().manual_seed(seed)
-    initial_ids = torch.randperm(vectors.shape[0], generator=generator)[:k]
-    centroids = vectors[initial_ids].clone()
-    assignments = torch.zeros(vectors.shape[0], dtype=torch.long)
+    dims = len(rows[0])
+    return [sum(row[idx] for row in rows) / len(rows) for idx in range(dims)]
+
+
+def _kmeans(vectors: list[list[float]], *, k: int, seed: int) -> list[int]:
+    if not vectors:
+        return []
+    k = max(1, min(k, len(vectors)))
+    start_digest = hashlib.md5(f"kmeans:{seed}:{len(vectors)}".encode("utf-8")).hexdigest()
+    start = int(start_digest[:8], 16) % len(vectors)
+    centroids = [list(vectors[(start + idx) % len(vectors)]) for idx in range(k)]
+    assignments = [0] * len(vectors)
     for _ in range(12):
-        distances = torch.cdist(vectors, centroids)
-        assignments = torch.argmin(distances, dim=1)
+        for idx, vector in enumerate(vectors):
+            distances = [_squared_distance(vector, centroid) for centroid in centroids]
+            assignments[idx] = min(range(len(distances)), key=lambda item: distances[item])
         for idx in range(k):
-            mask = assignments == idx
-            if torch.any(mask):
-                centroids[idx] = vectors[mask].mean(dim=0)
-    return [int(value) for value in assignments.tolist()]
+            cluster_rows = [vector for vector, assignment in zip(vectors, assignments) if assignment == idx]
+            if cluster_rows:
+                centroids[idx] = _mean_vector(cluster_rows)
+    return assignments
 
 
 def _hard_group_key(row: dict[str, str], *, strict_family_isolation: bool) -> str:
@@ -237,7 +247,7 @@ def engineer_dataset(
         raise ValueError(f"No metadata rows found at {metadata_path}. Run metadata harvest first.")
 
     backend = _embedding_backend_name(config.embedding_backend)
-    vectors = torch.tensor([_row_embedding(row, backend=backend if backend != "esm_unavailable" else "fallback") for row in rows], dtype=torch.float32)
+    vectors = [_row_embedding(row, backend=backend if backend != "esm_unavailable" else "fallback") for row in rows]
     cluster_ids = _kmeans(vectors, k=config.cluster_count, seed=config.seed)
 
     grouped: dict[str, dict[str, Any]] = {}

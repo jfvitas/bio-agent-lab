@@ -19,6 +19,7 @@ _MODEL_READY_EXCLUSIONS_CSV = "model_ready_exclusions.csv"
 _SPLIT_SUMMARY_CSV = "split_summary.csv"
 _RELEASE_MANIFEST_JSON = "dataset_release_manifest.json"
 _SCIENTIFIC_COVERAGE_JSON = "scientific_coverage_summary.json"
+_RELEASE_READINESS_JSON = "release_readiness_report.json"
 _SNAPSHOT_MANIFEST_JSON = "release_snapshot_manifest.json"
 _LATEST_RELEASE_JSON = "latest_release.json"
 
@@ -395,15 +396,94 @@ def export_release_artifacts(
     }
 
 
+def build_release_readiness_report(
+    layout: StorageLayout,
+    *,
+    repo_root: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Build a release-readiness report with explicit blockers and warnings."""
+    root = repo_root or Path.cwd()
+    artifacts = export_release_artifacts(layout, repo_root=root)
+    manifest_path = Path(artifacts["release_manifest_json"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    canonical_entry_count = int(manifest.get("canonical_entry_count") or 0)
+    canonical_pair_count = int(manifest.get("canonical_pair_count") or 0)
+    model_ready_pair_count = int(manifest.get("model_ready_pair_count") or 0)
+    split_metadata = manifest.get("split_metadata") or {}
+    exclusion_reasons = manifest.get("model_ready_exclusion_reasons") or {}
+
+    if canonical_entry_count <= 0:
+        blockers.append("no_canonical_entries")
+    if canonical_pair_count <= 0:
+        blockers.append("no_canonical_pairs")
+    if model_ready_pair_count <= 0:
+        blockers.append("no_model_ready_pairs")
+    if not split_metadata:
+        blockers.append("no_split_metadata")
+
+    if exclusion_reasons:
+        warnings.append("model_ready_exclusions_present")
+    if not (layout.training_dir / "training_examples.json").exists():
+        warnings.append("no_training_examples_materialized")
+    if not (layout.models_dir / "ligand_memory_model.json").exists():
+        warnings.append("no_baseline_model_artifact")
+    warnings.append("gui_framework_currently_tkinter")
+    warnings.append("prediction_and_risk_layers_include_baseline_or_placeholder_components")
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "storage_root": str(layout.root),
+        "repo_root": str(root),
+        "release_status": "ready" if not blockers else "blocked",
+        "blockers": blockers,
+        "warnings": warnings,
+        "counts": {
+            "canonical_entry_count": canonical_entry_count,
+            "canonical_pair_count": canonical_pair_count,
+            "model_ready_pair_count": model_ready_pair_count,
+            "model_ready_exclusion_count": int(manifest.get("model_ready_exclusion_count") or 0),
+        },
+        "supported_release_surface": {
+            "gui_framework": "tkinter",
+            "authoritative_release_artifacts": [
+                _CANONICAL_ENTRY_CSV,
+                _CANONICAL_PAIR_CSV,
+                _MODEL_READY_PAIR_CSV,
+                _MODEL_READY_EXCLUSIONS_CSV,
+                _SPLIT_SUMMARY_CSV,
+                _RELEASE_MANIFEST_JSON,
+                _SCIENTIFIC_COVERAGE_JSON,
+            ],
+            "experimental_or_baseline_surfaces": [
+                "risk_summary",
+                "prediction_manifests",
+                "site_physics_surrogate_without_offline_labels",
+            ],
+        },
+        "artifacts": artifacts,
+    }
+    out_path = _repo_path(_RELEASE_READINESS_JSON, root)
+    out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return out_path, report
+
+
 def build_release_snapshot(
     layout: StorageLayout,
     *,
     release_tag: str | None = None,
     repo_root: Path | None = None,
+    strict: bool = False,
 ) -> dict[str, str]:
     """Freeze the current release artifacts into a versioned snapshot directory."""
     root = repo_root or Path.cwd()
     artifacts = export_release_artifacts(layout, repo_root=root)
+    readiness_path, readiness = build_release_readiness_report(layout, repo_root=root)
+    artifacts["release_readiness_json"] = str(readiness_path)
+    if strict and readiness.get("blockers"):
+        raise ValueError(f"Release blocked: {', '.join(str(item) for item in readiness['blockers'])}")
     review_artifacts = {
         "master_csv": str(_repo_path("master_pdb_repository.csv", root)),
         "pair_csv": str(_repo_path("master_pdb_pairs.csv", root)),
@@ -413,7 +493,10 @@ def build_release_snapshot(
         "custom_training_set_csv": str(_repo_path("custom_training_set.csv", root)),
         "custom_training_exclusions_csv": str(_repo_path("custom_training_exclusions.csv", root)),
         "custom_training_summary_json": str(_repo_path("custom_training_summary.json", root)),
+        "custom_training_scorecard_json": str(_repo_path("custom_training_scorecard.json", root)),
+        "custom_training_split_benchmark_csv": str(_repo_path("custom_training_split_benchmark.csv", root)),
         "custom_training_manifest_json": str(_repo_path("custom_training_manifest.json", root)),
+        "release_readiness_json": str(readiness_path),
     }
     for key, path in review_artifacts.items():
         if Path(path).exists():
