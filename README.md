@@ -2,9 +2,9 @@
 
 A desktop application for building, curating, and releasing protein-binding
 datasets for machine learning. It pulls structural and affinity data from
-public databases (RCSB PDB, ChEMBL, BindingDB, SKEMPI v2), normalizes every
-record into a canonical schema, scores quality, and produces reproducible
-train/val/test splits that guard against sequence-identity leakage.
+public databases (RCSB PDB, ChEMBL, BindingDB, SKEMPI v2, PDBbind, BioLiP),
+normalizes every record into a canonical schema, scores quality, and produces
+reproducible train/val/test splits that guard against sequence-identity leakage.
 
 **The primary interface is a Tkinter desktop GUI.** Every pipeline stage can
 also be run from the Typer CLI.
@@ -39,7 +39,6 @@ also be run from the Typer CLI.
 12. [Testing](#testing)
 13. [Project layout](#project-layout)
 14. [Troubleshooting](#troubleshooting)
-15. [Internal demo flow](#internal-demo-flow)
 
 ---
 
@@ -78,19 +77,26 @@ source .venv/bin/activate       # macOS / Linux
 pip install -e ".[dev]"
 ```
 
+This installs all core dependencies: `pydantic>=2.7`, `pyyaml`, `typer`,
+`rich`, `gemmi`, `pandas>=2.0`, and `requests>=2.31`.
+
 ### Optional heavy dependencies
 
 These are **not required** for the core pipeline. Install only if you plan to
 use the advanced ML stages (structural graphs, dataset engineering, physics
 features):
 
-| Package   | Used by                                  |
-|-----------|------------------------------------------|
-| `torch`   | Structural graphs, dataset engineering   |
-| `pyarrow` | Parquet export in feature pipeline       |
-| `requests`| RCSB / SKEMPI / ChEMBL network calls     |
+| Package          | Used by                                  |
+|------------------|------------------------------------------|
+| `torch`          | Structural graphs, dataset engineering   |
+| `torch-geometric`| PyG graph export format                  |
+| `pyarrow`        | Parquet export in feature pipeline       |
+| `scikit-learn`   | Tabular affinity model training          |
+| `dgl`            | DGL graph export format                  |
 
 All optional imports are lazy-guarded — the GUI and CLI start without them.
+If a stage needs a missing package, it prints a clear installation instruction
+and exits without crashing.
 
 ---
 
@@ -109,55 +115,6 @@ resizable. Minimum size is 760 x 520.
 
 ---
 
-## Internal demo flow
-
-For a med-school AI team walkthrough, keep the narrative narrow:
-
-1. Show workspace readiness:
-
-   ```bash
-   pbdata status
-   pbdata doctor
-   pbdata demo-readiness
-   pbdata export-demo-snapshot
-   ```
-
-2. Show the data pipeline surface:
-
-   ```bash
-   pbdata ingest --dry-run
-   pbdata extract
-   pbdata normalize
-   pbdata audit
-   pbdata report
-   ```
-
-3. Show downstream engineering artifacts:
-
-   ```bash
-   pbdata build-graph
-   pbdata build-features
-   pbdata build-training-examples
-   pbdata train-baseline-model
-   ```
-
-4. Show predictions carefully:
-
-   ```bash
-   pbdata predict-ligand-screening --smiles "CC(=O)Oc1ccccc1C(=O)O"
-   pbdata predict-peptide-binding --structure-file data/structures/rcsb/1ATP.cif
-   pbdata score-pathway-risk --targets "P00533,P04637"
-   ```
-
-Presentation assumptions:
-- Treat prediction and risk outputs as baseline or scaffold outputs unless a trained artifact is explicitly present.
-- Emphasize reproducible data assembly, provenance, and QA as the current strengths.
-- Avoid framing current outputs as validated biological decision support.
-
-For the exact walkthrough order and screens, see `docs/internal_demo_runbook.md`.
-
----
-
 ## GUI walkthrough
 
 ### Window layout
@@ -165,7 +122,7 @@ For the exact walkthrough order and screens, see `docs/internal_demo_runbook.md`
 ```
 +-------------------------------------------------------------------+
 |  HEADER BAR                                                       |
-|  pbdata — Protein Binding Dataset Platform                        |
+|  pbdata -- Protein Binding Dataset Platform                       |
 +-------------------------------------------------------------------+
 |                       |                                           |
 |  LEFT COLUMN          |  RIGHT COLUMN                             |
@@ -213,8 +170,8 @@ Click the **Sources** tab (left column).
    | Source    | What it provides                                    |
    |-----------|-----------------------------------------------------|
    | RCSB      | Structural metadata via RCSB Search + GraphQL API   |
-   | ChEMBL    | Bioactivity data (Kd, Ki, IC50) — queried at Extract time |
-   | BindingDB | Binding affinity by PDB ID — queried at Extract time |
+   | ChEMBL    | Bioactivity data (Kd, Ki, IC50) -- queried at Extract time |
+   | BindingDB | Binding affinity by PDB ID -- queried at Extract time |
    | SKEMPI    | Protein-protein mutation ddG dataset                |
    | PDBbind   | Curated protein-ligand affinities (requires local files) |
    | BioLiP    | Biologically relevant ligand-protein (requires local files) |
@@ -246,9 +203,9 @@ enabled.
    API and fetches those entries directly.
 
 2. **Text filters:**
-   - Keywords / full-text — free-text search across PDB titles and descriptions
-   - Organism name — e.g. "Homo sapiens"
-   - NCBI taxonomy ID — e.g. `9606`
+   - Keywords / full-text -- free-text search across PDB titles and descriptions
+   - Organism name -- e.g. "Homo sapiens"
+   - NCBI taxonomy ID -- e.g. `9606`
 
 3. **Checkboxes:**
    - Membrane-related structures only
@@ -297,9 +254,9 @@ Click **Browse...** to change it. All output lands under
 `<storage root>/data/`.
 
 #### Pipeline mode
-- **legacy** — current pipeline stages only
-- **site-centric** — new artifacts/ pipeline only (experimental)
-- **hybrid** (default) — runs both, sharing extract/canonical inputs
+- **legacy** -- current pipeline stages only
+- **site-centric** -- new artifacts/ pipeline only (experimental)
+- **hybrid** (default) -- runs both, sharing extract/canonical inputs
 
 Additional fields for site-centric mode:
 - Site-centric run ID
@@ -330,7 +287,7 @@ Additional fields for site-centric mode:
 - Strict protein-family isolation checkbox
 
 #### Release options
-- Release tag (optional — defaults to UTC timestamp if blank)
+- Release tag (optional -- defaults to UTC timestamp if blank)
 
 #### Custom training set
 - Selection mode: generalist, protein_ligand, protein_protein,
@@ -352,7 +309,7 @@ What happens:
      reused automatically.
    - **SKEMPI:** downloads the SKEMPI v2 CSV (~3 MB) after confirmation,
      or reuses an existing valid copy.
-   - **ChEMBL / BindingDB:** logged as "enabled" — these are queried later
+   - **ChEMBL / BindingDB:** logged as "enabled" -- these are queried later
      during the Extract stage.
    - **PDBbind / BioLiP:** validates the local path you set.
 3. A summary appears in the log panel.
@@ -368,7 +325,7 @@ and produces six output tables:
 
 | Table          | Contents                                          |
 |----------------|---------------------------------------------------|
-| `entry/`       | One JSON per PDB entry — metadata, resolution, quality |
+| `entry/`       | One JSON per PDB entry -- metadata, resolution, quality |
 | `chains/`      | Protein chain records with sequences              |
 | `bound_objects/` | Ligands, ions, cofactors, glycans               |
 | `interfaces/`  | Protein-protein and protein-ligand interfaces     |
@@ -384,11 +341,11 @@ APIs are queried during this stage to enrich each entry with assay data.
 
 Still under **Processing** and **Quality & Analysis**:
 
-1. **Normalize Records** — converts raw records into the canonical Pydantic
+1. **Normalize Records** -- converts raw records into the canonical Pydantic
    schema and writes to `data/processed/rcsb/`.
-2. **Audit Quality** — scores each record on a 0.0–1.0 scale and flags issues.
-3. **Generate Report** — writes a summary statistics report.
-4. **Report Bias** — generates automatic dataset-bias summaries from extracted
+2. **Audit Quality** -- scores each record on a 0.0-1.0 scale and flags issues.
+3. **Generate Report** -- writes a summary statistics report.
+4. **Report Bias** -- generates automatic dataset-bias summaries from extracted
    records.
 
 Each button runs independently. Click them in order, or use
@@ -401,11 +358,11 @@ Each button runs independently. Click them in order, or use
 After Extract completes, click **Refresh Root Exports** (in the Data Overview
 panel or the Search Criteria tab). This regenerates:
 
-- `master_pdb_repository.csv` — one row per PDB entry
-- `master_pdb_pairs.csv` — one row per binding pair
-- `master_pdb_issues.csv` — flagged quality issues
-- `master_pdb_conflicts.csv` — multi-source value conflicts
-- `master_source_state.csv` — source coverage summary
+- `master_pdb_repository.csv` -- one row per PDB entry
+- `master_pdb_pairs.csv` -- one row per binding pair
+- `master_pdb_issues.csv` -- flagged quality issues
+- `master_pdb_conflicts.csv` -- multi-source value conflicts
+- `master_source_state.csv` -- source coverage summary
 
 The **Data Overview** panel updates automatically to show file counts.
 
@@ -427,11 +384,11 @@ specific PDB IDs, issue types, or confidence levels.
 
 Under **ML Pipeline**:
 
-1. **Build Splits** — creates `data/splits/train.txt`, `val.txt`, `test.txt`
+1. **Build Splits** -- creates `data/splits/train.txt`, `val.txt`, `test.txt`
    using k-mer Jaccard sequence clustering to prevent data leakage. Falls
    back to hash-based splitting if sequences are unavailable.
 
-2. **Build Custom Training Set** — selects a diversity-optimized subset from
+2. **Build Custom Training Set** -- selects a diversity-optimized subset from
    model-ready pairs. Controls: selection mode, target size, seed, and per-
    receptor cluster cap (set in the Options tab).
 
@@ -462,30 +419,39 @@ of the Data Overview to jump to the most recent snapshot folder.
 
 These stages appear under **ML Pipeline** and are optional:
 
+#### Core ML stages
+
 | Stage                           | What it does                              |
 |---------------------------------|-------------------------------------------|
 | Build Structural Graphs         | Residue- or atom-level graphs for GNNs    |
-| Build Conformational States     | Catalogs experimental conformations       |
 | Build Graph                     | Graph-layer architecture manifest          |
-| Build Microstates               | Pair-level microstate assignments          |
-| Build Physics Features          | Electrostatic proxy features               |
-| Build Microstate Refinement     | Protonation-policy planning (experimental) |
-| Build MM Job Manifests          | OpenMM job manifests (experimental)        |
-| Run MM Jobs                     | Dispatch OpenMM jobs (experimental)        |
-| Run Site-Centric Feature Pipeline | New artifacts/ feature pipeline          |
-| Export Analysis Queue           | Motif queues for external ORCA/APBS        |
-| Ingest Physics Results          | Import ORCA/APBS/OpenMM outputs            |
-| Train Site-Physics Surrogate    | Train a deterministic surrogate model      |
 | Build Features                  | First-pass features from extract + graph   |
-| Build Training Examples         | Assemble examples from all layers          |
+| Build Training Examples         | Assemble examples from all upstream layers |
 | Train Baseline Model            | Split-aware ligand-memory baseline         |
 | Evaluate Baseline Model         | Evaluate baseline against split files      |
+| Train Tabular Affinity Model    | Lightweight supervised affinity model      |
+| Evaluate Tabular Affinity Model | Evaluate supervised model                  |
 | Engineer Dataset                | Full diverse ML dataset export              |
 | Run Scenario Tests              | QA scenario templates                      |
 
-Stages marked "Experimental" or "Preview" require additional dependencies
-(torch, pyarrow) and may not be fully stable. The GUI's **Run Full Pipeline**
-flow skips those stages by default unless you explicitly opt in.
+#### Physics and site-centric stages (experimental)
+
+| Stage                             | What it does                              |
+|-----------------------------------|-------------------------------------------|
+| Build Microstates                 | Pair-level microstate assignments          |
+| Build Physics Features            | Electrostatic proxy features               |
+| Build Conformational States       | Catalogs experimental conformations        |
+| Build Microstate Refinement       | Protonation-policy planning                |
+| Build MM Job Manifests            | OpenMM job manifests                       |
+| Run MM Jobs                       | Dispatch OpenMM jobs                       |
+| Run Site-Centric Feature Pipeline | New artifacts/ feature pipeline            |
+| Export Analysis Queue             | Motif queues for external ORCA/APBS        |
+| Ingest Physics Results            | Import ORCA/APBS/OpenMM outputs            |
+| Train Site-Physics Surrogate      | Train a deterministic surrogate model      |
+
+Experimental stages require additional dependencies (torch, pyarrow) and may
+produce scaffold/placeholder outputs if upstream physics data is not yet
+available. The GUI labels them as "(Experimental)" or "(Preview)".
 
 ---
 
@@ -500,10 +466,6 @@ every stage in sequence:
 
 The pipeline stops on the first error. Each stage's status indicator updates
 in real time (idle / running / done / error).
-
-For `build-graph`, `build-features`, and `build-training-examples`, the GUI
-uses strict prerequisite checks so missing upstream data is reported as an
-error instead of silently producing a planned-manifest placeholder.
 
 ---
 
@@ -524,14 +486,14 @@ The Data Overview panel (top of the right column) shows at a glance:
 | Split files      | `data/splits/*.txt`              |
 
 Below the counts:
-- **Root Review Exports** — paths to the master CSVs + refresh button
-- **Release Artifacts** — links to model-ready CSV, custom training set,
+- **Root Review Exports** -- paths to the master CSVs + refresh button
+- **Release Artifacts** -- links to model-ready CSV, custom training set,
   scorecard, manifest, coverage summary
-- **Training Set Builder** — KPI tiles + workflow progress + quick actions
-- **Curation Review** — exclusion/conflict/issue summaries
-- **Review Health** — release readiness assessment
-- **Interpretation Guide** — explains confidence levels and conflict flags
-- **Quick Actions** — buttons to open any artifact file directly
+- **Training Set Builder** -- KPI tiles + workflow progress + quick actions
+- **Curation Review** -- exclusion/conflict/issue summaries
+- **Review Health** -- release readiness assessment
+- **Interpretation Guide** -- explains confidence levels and conflict flags
+- **Quick Actions** -- buttons to open any artifact file directly
 
 ---
 
@@ -574,14 +536,14 @@ line when it finishes.
 
 ## Supported data sources
 
-| Source    | Type         | Status         | Data provided                    |
-|-----------|-------------|----------------|----------------------------------|
-| RCSB PDB  | Remote API  | Fully implemented | Structural metadata, mmCIF files |
-| ChEMBL    | Remote API  | Fully implemented | Kd, Ki, IC50 bioactivity         |
-| BindingDB | Remote API  | Fully implemented | Binding affinity by PDB ID       |
-| SKEMPI v2 | Remote CSV  | Fully implemented | Protein-protein mutation ddG     |
-| PDBbind   | Local files | Stub           | Curated protein-ligand affinities |
-| BioLiP    | Local files | Stub           | Biologically relevant ligands     |
+| Source    | Type         | Status             | Data provided                    |
+|-----------|-------------|--------------------|---------------------------------|
+| RCSB PDB  | Remote API  | Fully implemented  | Structural metadata, mmCIF files |
+| ChEMBL    | Remote API  | Fully implemented  | Kd, Ki, IC50 bioactivity         |
+| BindingDB | Remote API  | Fully implemented  | Binding affinity by PDB ID       |
+| SKEMPI v2 | Remote CSV  | Fully implemented  | Protein-protein mutation ddG     |
+| PDBbind   | Local files | Index parser ready | Curated protein-ligand affinities |
+| BioLiP    | Local files | Row parser ready   | Biologically relevant ligands     |
 
 ---
 
@@ -590,8 +552,9 @@ line when it finishes.
 Every GUI action has a CLI equivalent. Run any command with `--help` for
 detailed options.
 
+### Core pipeline
+
 ```bash
-# Core pipeline
 pbdata ingest --source rcsb          # download raw metadata
 pbdata ingest --source skempi        # download SKEMPI v2
 pbdata extract                       # multi-table extraction + structure download
@@ -599,24 +562,71 @@ pbdata normalize                     # canonicalize records
 pbdata audit                         # quality score + flag
 pbdata report                        # summary statistics
 pbdata report-bias                   # dataset bias summaries
+```
 
-# Splits and training
+### Splits, training, and release
+
+```bash
 pbdata build-splits                  # k-mer Jaccard clustering splits
 pbdata build-custom-training-set     # diversity-optimized subset
 pbdata build-release --tag v1.0      # freeze a release snapshot
+pbdata release-check                 # release readiness report
+```
 
-# ML pipeline
-pbdata build-structural-graphs       # residue/atom graphs
-pbdata engineer-dataset              # full dataset export
+### ML pipeline
+
+```bash
+pbdata build-structural-graphs       # residue/atom-level graphs
+pbdata build-graph                   # graph-layer manifest
+pbdata build-features                # first-pass features
+pbdata build-training-examples       # assemble from all layers
+pbdata engineer-dataset              # full dataset export with CV folds
 pbdata train-baseline-model          # ligand-memory baseline
 pbdata evaluate-baseline-model       # evaluate against splits
+pbdata train-tabular-affinity-model  # supervised affinity model
+pbdata evaluate-tabular-affinity-model
+pbdata report-training-set-quality   # training set quality report
+pbdata report-model-comparison       # model comparison summary
+```
 
-# Utilities
+### Physics and site-centric pipeline
+
+```bash
+pbdata build-microstates             # microstate assignments
+pbdata build-physics-features        # electrostatic features
+pbdata build-microstate-refinement   # protonation planning
+pbdata build-mm-job-manifests        # OpenMM job generation
+pbdata run-mm-jobs                   # dispatch OpenMM
+pbdata run-feature-pipeline          # site-centric feature pipeline
+pbdata export-analysis-queue         # ORCA/APBS motif queues
+pbdata ingest-physics-results        # import external physics
+pbdata train-site-physics-surrogate  # surrogate model training
+```
+
+### Prediction and risk scoring
+
+```bash
+pbdata predict-ligand-screening --smiles "CC(=O)Oc1ccccc1C(=O)O"
+pbdata predict-peptide-binding --structure-file structure.cif
+pbdata score-pathway-risk --targets "P00533,P04637"
+```
+
+### Workspace utilities
+
+```bash
 pbdata status                        # data snapshot
-pbdata doctor                        # dependency check
+pbdata doctor                        # dependency + config check
+pbdata demo-readiness                # demo readiness assessment
+pbdata setup-workspace               # create workspace directories
+pbdata harvest-metadata              # build unified metadata table
+pbdata build-conformational-states   # experimental conformations
+pbdata run-scenario-tests            # QA scenarios
 pbdata gui                           # launch GUI from CLI
+```
 
-# Global options (apply to any command)
+### Global options
+
+```bash
 pbdata --storage-root /path/to/data <command>
 pbdata --config configs/sources.yaml <command>
 ```
@@ -646,10 +656,23 @@ data/
   graph/                     Graph nodes and edges
   features/                  Computed features
   splits/          *.txt     train.txt, val.txt, test.txt
-  reports/                   Audit and bias reports
-  releases/                  Versioned release snapshots
+  audit/                     Quality audit outputs
+  reports/                   Summary and bias reports
   models/                    Trained model artifacts
+  prediction/                Prediction outputs
+  releases/                  Versioned release snapshots
   custom_training_sets/      Curated training subsets
+  catalog/                   Download manifest, stage/source state
+
+artifacts/                   Site-centric feature pipeline outputs
+  manifests/                 Feature run manifests
+  base_features/             Base feature extractions
+  site_physics/              Physics enrichment artifacts
+  graphs/                    Graph construction artifacts
+  training_examples/         Assembled training records
+  archetypes/                Motif archetype clusters
+  physics_targets/           Physics target records
+  surrogate_training/        Surrogate model outputs
 ```
 
 Root-level review CSVs are written to the repo root:
@@ -671,7 +694,7 @@ Root-level review CSVs are written to the repo root:
 | `configs/sources.yaml`   | Enabled sources, local paths, structure mirror |
 
 Both are auto-saved by the GUI when you click their respective Save buttons.
-You can also edit them by hand — they are plain YAML.
+You can also edit them by hand -- they are plain YAML.
 
 **Example `configs/criteria.yaml`:**
 ```yaml
@@ -714,7 +737,12 @@ python -m pytest -m integration
 python -m pytest tests/test_extract_pipeline.py -v
 ```
 
-Current test suite: **322 tests passing** across 35+ test files.
+Current test suite: **326 tests passing** across 48 test files.
+
+The test suite includes three immutable stress test panels (32 adversarial
+PDB entries) that validate classification logic against biological ground
+truth. These panels and their expected outcomes are read-only and must never
+be modified to make tests pass.
 
 ---
 
@@ -723,53 +751,98 @@ Current test suite: **322 tests passing** across 35+ test files.
 ```
 bio-agent-lab/
   src/pbdata/
-    cli.py                   Typer CLI (30+ commands)
-    gui.py                   Tkinter GUI (3,300 lines)
+    cli.py                   Typer CLI (42 commands)
+    gui.py                   Tkinter GUI (3,300+ lines)
+    gui_overview.py          GUI data overview helpers
+    cli_reporting.py         CLI reporting helpers
     config.py                Pydantic config models
     criteria.py              Search criteria model + YAML I/O
-    storage.py               Storage layout + file validation
+    storage.py               Storage layout (50+ paths)
     master_export.py         Root CSV export logic
-    pairing.py               Pair identity + conflict detection
+    pairing.py               Pair identity key + matching
     stage_state.py           Pipeline stage state tracking
+    source_state.py          Source state tracking
+    table_io.py              Parquet I/O wrappers
+    workspace_state.py       Workspace state management
     schemas/
-      canonical_sample.py    CanonicalBindingSample (frozen Pydantic)
+      canonical_sample.py    CanonicalBindingSample (frozen Pydantic v2)
       records.py             Multi-table schemas (Entry, Chain, BoundObject, etc.)
-      features.py            Feature schemas
-      graph.py               Graph schemas
+      bound_objects.py       BoundObject, InterfaceInfo, AssemblyInfo
+      features.py            Feature record schema
+      graph.py               Graph node/edge schemas
       training_example.py    Training example schema
+      prediction_input.py    Prediction input schema
+      conformational_state.py Conformational state schema
     sources/
       rcsb.py                RCSB GraphQL adapter
       rcsb_search.py         RCSB Search API adapter
+      rcsb_classify.py       Entity classification pipeline (946 lines)
       chembl.py              ChEMBL REST API adapter
       bindingdb.py           BindingDB adapter
       skempi.py              SKEMPI v2 adapter
-      biolip.py              BioLiP stub
-      pdbbind.py             PDBbind stub
+      pdbbind.py             PDBbind index parser
+      biolip.py              BioLiP row parser
     parsing/
       mmcif_supplement.py    mmCIF download + quality extraction
     pipeline/
       extract.py             Multi-table extraction pipeline
-      assay_merge.py         Multi-source assay merge
-      feature_execution.py   Site-centric feature pipeline
-      physics_feedback.py    Physics results ingest + surrogate
+      assay_merge.py         Multi-source assay merge with conflict detection
+      enrichment.py          External assay sample loading
+      canonical_workflows.py Reusable pipeline orchestration
+      feature_execution.py   Site-centric feature pipeline (7 stages)
+      feature_pipeline_stages.py  Feature stage definitions
+      feature_pipeline_runtime.py Feature runtime helpers
+      feature_post_pipeline.py    Post-pipeline analysis
+      physics_feedback.py    Physics results ingest + surrogate training
     quality/
       audit.py               Quality flags + scoring
+      stress_panel.py        Stress test panel comparison
     dataset/
       splits.py              k-mer Jaccard clustering splits
-      engineering.py         Full dataset engineering
+      engineering.py         Dataset engineering with ESM embeddings
+      conformations.py       Conformational state builder
     graph/
-      structural_graphs.py   Residue/atom graph builder
-    features/                Feature builders
-    training/                Training example assembly
-    prediction/              Prediction engine stubs
-    risk/                    Risk scoring stubs
-    qa/                      QA scenario runner
+      builder.py             Canonical knowledge graph builder
+      structural_graphs.py   Residue/atom graph builder (PyG/DGL/NetworkX)
+      connectors.py          STRING/Reactome/BioGRID connectors
+      identifier_map.py      Cross-database identifier mapping
+    features/
+      builder.py             Feature materializer
+      microstate.py          Electrostatic microstate assignment
+      physics_features.py    Local physics feature builder
+      mm_features.py         Molecular mechanics features
+      pathway.py             Pathway feature extraction
+    training/
+      assembler.py           Training example assembly
+      generator.py           Training data generator
+    models/
+      baseline_memory.py     Ligand-memory baseline model
+      tabular_affinity.py    Tabular supervised affinity model
+      affinity_models.py     Affinity model definitions
+      off_target_models.py   Off-target model definitions
+    prediction/
+      engine.py              Prediction workflow engine
+      ligand_screening.py    Ligand screening workflow
+      peptide_binding.py     Peptide binding workflow
+      variant_effects.py     Variant effect prediction
+    risk/
+      summary.py             Pathway risk summary
+      pathway_reasoning.py   Pathway reasoning logic
+      severity_scoring.py    Severity scoring
+    qa/
+      scenario_runner.py     QA scenario framework
+    custom_training_set.py   Custom training set builder
+    release_export.py        Release artifacts + readiness
+    model_comparison.py      Model comparison reporting
+    training_quality.py      Training set quality metrics
+    demo.py                  Demo snapshot export
   configs/
     criteria.yaml            Search criteria
     sources.yaml             Source configuration
-  tests/                     322 unit tests
+  tests/                     326+ unit tests, 48 test files
   specs/                     Specification documents
-  handoffs/                  Agent handoff reports
+  handoffs/                  Agent analysis reports
+  docs/                      Architecture and gap analysis docs
   data/                      All pipeline output (gitignored)
 ```
 
@@ -801,7 +874,17 @@ Save Source Config.
 Your search criteria may be too restrictive. Try widening the resolution
 limit, enabling more experimental methods, or adding direct PDB IDs.
 
-**0-byte files in `data/processed/rcsb/`:**
-Some records fail normalization (e.g. missing required fields). These create
-empty placeholder files. This is a known issue — downstream audit and report
-commands will flag them.
+**Data appears in the wrong directory:**
+The storage root defaults to the current working directory. If you run
+`pbdata` from different directories, output may land in unexpected places.
+Set an explicit storage root in the Options tab or use
+`pbdata --storage-root /path/to/workspace <command>`.
+
+**"No metadata rows found" from engineer-dataset:**
+Run `pbdata harvest-metadata` first. This requires extracted data from a
+prior `pbdata extract` run.
+
+**Empty assay tables after extraction:**
+Assay data comes from external sources (ChEMBL, BindingDB, SKEMPI), not
+from RCSB alone. Enable at least one affinity source in the Sources tab to
+populate assay records.
