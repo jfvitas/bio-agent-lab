@@ -31,6 +31,8 @@ _ADAPTER_VERSION = "0.1.0"
 _BASE_URL = "https://bindingdb.org/axis2/services/BDBService"
 _TIMEOUT  = 30  # seconds
 _DELAY    = 0.35  # inter-request delay (seconds)
+_RETRY_ATTEMPTS = 3
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Multipliers to convert common assay units to nM
 _TO_NM: dict[str, float] = {
@@ -225,10 +227,23 @@ class BindingDBAdapter(BaseAdapter):
         """
         url = f"{_BASE_URL}/getLigandsByPdb"
         params = {"pdb": record_id.upper(), "repr": "json"}
-        resp = requests.get(url, params=params, timeout=_TIMEOUT)
-        resp.raise_for_status()
-        time.sleep(_DELAY)
-        return resp.json()
+        last_error: Exception | None = None
+        for attempt in range(1, _RETRY_ATTEMPTS + 1):
+            try:
+                resp = requests.get(url, params=params, timeout=_TIMEOUT)
+                resp.raise_for_status()
+                time.sleep(_DELAY)
+                return resp.json()
+            except requests.RequestException as exc:
+                last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = status_code in _RETRYABLE_STATUS_CODES or isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                if not retryable or attempt >= _RETRY_ATTEMPTS:
+                    raise
+                time.sleep(_DELAY * attempt)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Unreachable BindingDB request state")
 
     def normalize_record(self, raw: dict[str, Any]) -> CanonicalBindingSample:
         """Return the first CanonicalBindingSample parsed from a raw BindingDB dict.

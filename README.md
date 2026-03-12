@@ -39,6 +39,7 @@ also be run from the Typer CLI.
 12. [Testing](#testing)
 13. [Project layout](#project-layout)
 14. [Troubleshooting](#troubleshooting)
+15. [Internal demo flow](#internal-demo-flow)
 
 ---
 
@@ -105,6 +106,55 @@ python -c "from pbdata.gui import main; main()"   # direct import
 
 The window opens at roughly 1280 x 860 (scales to your screen) and is fully
 resizable. Minimum size is 760 x 520.
+
+---
+
+## Internal demo flow
+
+For a med-school AI team walkthrough, keep the narrative narrow:
+
+1. Show workspace readiness:
+
+   ```bash
+   pbdata status
+   pbdata doctor
+   pbdata demo-readiness
+   pbdata export-demo-snapshot
+   ```
+
+2. Show the data pipeline surface:
+
+   ```bash
+   pbdata ingest --dry-run
+   pbdata extract
+   pbdata normalize
+   pbdata audit
+   pbdata report
+   ```
+
+3. Show downstream engineering artifacts:
+
+   ```bash
+   pbdata build-graph
+   pbdata build-features
+   pbdata build-training-examples
+   pbdata train-baseline-model
+   ```
+
+4. Show predictions carefully:
+
+   ```bash
+   pbdata predict-ligand-screening --smiles "CC(=O)Oc1ccccc1C(=O)O"
+   pbdata predict-peptide-binding --structure-file data/structures/rcsb/1ATP.cif
+   pbdata score-pathway-risk --targets "P00533,P04637"
+   ```
+
+Presentation assumptions:
+- Treat prediction and risk outputs as baseline or scaffold outputs unless a trained artifact is explicitly present.
+- Emphasize reproducible data assembly, provenance, and QA as the current strengths.
+- Avoid framing current outputs as validated biological decision support.
+
+For the exact walkthrough order and screens, see `docs/internal_demo_runbook.md`.
 
 ---
 
@@ -434,7 +484,8 @@ These stages appear under **ML Pipeline** and are optional:
 | Run Scenario Tests              | QA scenario templates                      |
 
 Stages marked "Experimental" or "Preview" require additional dependencies
-(torch, pyarrow) and may not be fully stable.
+(torch, pyarrow) and may not be fully stable. The GUI's **Run Full Pipeline**
+flow skips those stages by default unless you explicitly opt in.
 
 ---
 
@@ -449,6 +500,10 @@ every stage in sequence:
 
 The pipeline stops on the first error. Each stage's status indicator updates
 in real time (idle / running / done / error).
+
+For `build-graph`, `build-features`, and `build-training-examples`, the GUI
+uses strict prerequisite checks so missing upstream data is reported as an
+error instead of silently producing a planned-manifest placeholder.
 
 ---
 

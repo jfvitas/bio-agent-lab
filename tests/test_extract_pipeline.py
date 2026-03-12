@@ -279,6 +279,41 @@ def test_quality_flags_populated(mock_download):
 
 
 @patch("pbdata.pipeline.extract.download_structure_files")
+def test_peptide_cofactor_context_sets_cofactor_flag(mock_download):
+    """Short peptide cofactors should set cofactor_present without losing peptide context."""
+    mock_download.return_value = {}
+    raw = _mock_entry("1COF")
+    raw["struct"]["title"] = "NS3/4A protease inhibitor complex"
+    raw["polymer_entities"].append({
+        "rcsb_id": "1COF_2",
+        "entity_poly": {
+            "pdbx_seq_one_letter_code_can": "KGSVVIVGRIILSGRK",
+            "type": "polypeptide(L)",
+        },
+        "rcsb_polymer_entity": {"pdbx_description": "NONSTRUCTURAL PROTEIN NS4A (P4)"},
+        "rcsb_polymer_entity_container_identifiers": {
+            "auth_asym_ids": ["C"],
+            "uniprot_ids": ["P26662"],
+        },
+        "rcsb_entity_source_organism": [
+            {"ncbi_taxonomy_id": 31645, "ncbi_scientific_name": "Hepatitis C virus"},
+        ],
+    })
+
+    result = extract_rcsb_entry(raw)
+    entry = result["entry"]
+    bound_objects = result["bound_objects"]
+
+    assert entry.cofactor_present is True
+    assert entry.peptide_partner_present is True
+    assert "cofactor_present" in (entry.quality_flags or [])
+    assert any(
+        obj.component_type == "peptide" and obj.component_role == "catalytic_cofactor"
+        for obj in bound_objects
+    )
+
+
+@patch("pbdata.pipeline.extract.download_structure_files")
 def test_extract_can_skip_structure_downloads(mock_download):
     """extract_rcsb_entry should not fetch structure files when disabled."""
     result = extract_rcsb_entry(_mock_entry("1ABC"), download_structures=False)
@@ -820,6 +855,39 @@ def test_cli_extract_respects_storage_root() -> None:
 
     assert result.exit_code == 0
     assert written_outputs == [storage_root / "data" / "extracted"]
+
+
+def test_cli_extract_warns_when_no_assays_are_materialized() -> None:
+    tmp_root = _tmp_dir("extract_no_assays_warning")
+    raw_dir = tmp_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "1ABC.json").write_text('{"rcsb_id":"1ABC","nonpolymer_entities":[]}', encoding="utf-8")
+
+    def _fake_extract_rcsb_entry(*_args, **_kwargs):
+        return {
+            "entry": EntryRecord(source_database="RCSB", source_record_id="1ABC", pdb_id="1ABC"),
+            "chains": [],
+            "bound_objects": [],
+            "interfaces": [],
+            "assays": [],
+            "provenance": [],
+        }
+
+    runner = CliRunner()
+    original_cwd = Path.cwd()
+    os.chdir(tmp_root)
+    try:
+        with patch(
+            "pbdata.cli._load_external_assay_samples", return_value={}
+        ), patch(
+            "pbdata.pipeline.extract.extract_rcsb_entry", side_effect=_fake_extract_rcsb_entry
+        ):
+            result = runner.invoke(app, ["extract", "--no-download-structures"], catch_exceptions=False)
+    finally:
+        os.chdir(original_cwd)
+
+    assert result.exit_code == 0
+    assert "extracted assay table is empty" in result.output
 
 
 def test_gui_close_terminates_active_processes() -> None:

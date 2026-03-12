@@ -286,6 +286,23 @@ class TestBuildBoundObjects:
         assert objs[0].binder_type == "peptide"
         assert objs[0].residue_count == 9
 
+    def test_peptide_cofactor_context_promotes_role(self):
+        raw = {
+            "struct": {"title": "NS3/4A protease inhibitor complex"},
+            "polymer_entities": [],
+            "nonpolymer_entities": [],
+        }
+        pep = _prot_entity(["C"], "PEP_E")
+        pep["entity_poly"]["pdbx_seq_one_letter_code_can"] = "KGSVVIVGRIILSGRK"
+        pep["rcsb_polymer_entity"] = {"pdbx_description": "NONSTRUCTURAL PROTEIN NS4A (P4)"}
+        raw["polymer_entities"] = [pep]
+
+        classified = classify_entry(raw)
+
+        assert len(classified["bound_objects"]) == 1
+        assert classified["bound_objects"][0].binder_type == "peptide"
+        assert classified["bound_objects"][0].role == "cofactor"
+
     def test_long_protein_not_included(self):
         long_prot = _prot_entity(["A"], "PROT_E")
         objs = build_bound_objects([], [long_prot])
@@ -523,6 +540,15 @@ class TestComputeFlags:
                             "comp_id": None, "residue_count": 9}],
         )
         assert "peptide_partner" in compute_flags(r)
+
+    def test_peptide_cofactor_role_sets_cofactor_flag(self):
+        r = _make_record(
+            bound_objects=[{"binder_type": "peptide", "role": "cofactor",
+                            "comp_id": None, "residue_count": 16}],
+        )
+        flags = compute_flags(r)
+        assert "peptide_partner" in flags
+        assert "cofactor_present" in flags
 
     def test_multiple_bound_objects_flag(self):
         r = _make_record(

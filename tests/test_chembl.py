@@ -1,4 +1,5 @@
 from unittest.mock import Mock, patch
+import requests
 
 from pbdata.cli import _fetch_chembl_samples_for_raw
 from pbdata.config import AppConfig, SourceConfig, SourcesConfig
@@ -110,3 +111,18 @@ def test_cli_chembl_enrichment_attaches_pdb_and_receptor_chains() -> None:
     assert enriched[0].chain_ids_receptor == ["A"]
     key = pair_identity_key(enriched[0])
     assert key == "protein_ligand|1ABC|A|AAAA-BBBB|wildtype"
+
+
+def test_chembl_adapter_retries_transient_failure() -> None:
+    transient = requests.HTTPError("busy")
+    transient.response = Mock(status_code=503)
+
+    with patch("pbdata.sources.chembl.requests.get", side_effect=[
+        transient,
+        _response({"targets": [{"target_chembl_id": "CHEMBL_TGT"}]}),
+        _response({"molecules": [{"molecule_chembl_id": "CHEMBL_MOL"}]}),
+        _response({"activities": []}),
+    ]), patch("pbdata.sources.chembl.time.sleep", return_value=None):
+        samples = ChEMBLAdapter().fetch_by_uniprot_and_inchikey("P12345", "AAAA-BBBB")
+
+    assert samples == []

@@ -250,7 +250,12 @@ def test_export_source_state_csv_flattens_source_manifests() -> None:
         "cache_path": "C:/cache/1ABC.json",
         "generated_at": "2026-03-08T00:00:00+00:00",
         "notes": "BindingDB enrichment loaded and normalized.",
-        "extra": {"configured_local_dir": "C:/cache"},
+        "extra": {
+            "configured_local_dir": "C:/cache",
+            "attempt_count": 3,
+            "total_records_observed": 5,
+            "status_counts": {"ready": 2, "error": 1},
+        },
     }), encoding="utf-8")
 
     out_path = export_source_state_csv(layout, repo_root=tmp_root)
@@ -262,6 +267,9 @@ def test_export_source_state_csv_flattens_source_manifests() -> None:
     assert rows[0]["source_name"] == "BindingDB"
     assert rows[0]["mode"] == "local_cache"
     assert rows[0]["configured_local_dir"] == "C:/cache"
+    assert rows[0]["attempt_count"] == "3"
+    assert rows[0]["total_records_observed"] == "5"
+    assert "ready" in rows[0]["status_counts"]
 
 
 def test_extract_cli_refreshes_root_master_csv() -> None:

@@ -109,6 +109,8 @@ def fetch_chembl_samples_for_raw(
     raw: dict,
     chem_descriptors: dict[str, dict[str, str]],
     config: AppConfig,
+    *,
+    layout: StorageLayout | None = None,
 ) -> list:
     if not config.sources.chembl.enabled:
         return []
@@ -118,11 +120,25 @@ def fetch_chembl_samples_for_raw(
     accession_ids = _raw_uniprot_ids(raw)
     inchikeys = _raw_ligand_inchikeys(raw, chem_descriptors)
     if not accession_ids or not inchikeys:
+        if layout is not None:
+            write_source_state(
+                layout,
+                source_name="ChEMBL",
+                status="missing_identifiers",
+                mode="live_api",
+                record_id=str(raw.get("rcsb_id") or "").upper() or None,
+                notes="No UniProt accession or ligand InChIKey was available for ChEMBL lookup.",
+                extra={
+                    "accession_count": len(accession_ids),
+                    "inchikey_count": len(inchikeys),
+                },
+            )
         return []
 
     adapter = ChEMBLAdapter()
     results: list = []
     seen: set[str] = set()
+    failed_lookup_count = 0
     raw_pdb_id = str(raw.get("rcsb_id") or "").upper()
     chain_ids_by_uniprot = _raw_chain_ids_by_uniprot(raw)
     for accession in accession_ids:
@@ -136,6 +152,17 @@ def fetch_chembl_samples_for_raw(
                     inchikey,
                     exc,
                 )
+                failed_lookup_count += 1
+                if layout is not None:
+                    write_source_state(
+                        layout,
+                        source_name="ChEMBL",
+                        status="error",
+                        mode="live_api",
+                        record_id=f"{accession}|{inchikey}",
+                        notes=str(exc),
+                        extra={"pdb_id": raw_pdb_id or None},
+                    )
                 continue
             for sample in samples:
                 if sample.sample_id in seen:
@@ -157,6 +184,21 @@ def fetch_chembl_samples_for_raw(
                     "chain_ids_receptor": chain_ids or sample.chain_ids_receptor,
                     "provenance": provenance,
                 }))
+    if layout is not None:
+        write_source_state(
+            layout,
+            source_name="ChEMBL",
+            status="ready" if results else ("lookup_failed" if failed_lookup_count else "no_matches"),
+            mode="live_api",
+            record_id=raw_pdb_id or None,
+            record_count=len(results),
+            notes="ChEMBL enrichment lookup completed.",
+            extra={
+                "accession_count": len(accession_ids),
+                "inchikey_count": len(inchikeys),
+                "failed_lookup_count": failed_lookup_count,
+            },
+        )
     return results
 
 

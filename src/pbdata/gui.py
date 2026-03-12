@@ -22,7 +22,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -31,6 +30,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import yaml
+from pbdata.config import AppConfig, load_config
 from pbdata.criteria import (
     EXPERIMENTAL_METHODS,
     RESOLUTION_OPTIONS,
@@ -39,6 +39,18 @@ from pbdata.criteria import (
     resolution_label_to_value,
     resolution_value_to_label,
     save_criteria,
+)
+from pbdata.gui_overview import (
+    build_curation_review_summary as _build_curation_review_summary,
+    build_gui_overview_snapshot,
+    build_review_health_summary as _build_review_health_summary,
+    build_training_set_builder_summary as _build_training_set_builder_summary,
+    build_training_set_kpis as _build_training_set_kpis,
+    build_training_set_workflow_status as _build_training_set_workflow_status,
+    count_files as _count_files_impl,
+    load_csv_dict_rows as _load_csv_dict_rows_impl,
+    load_json_dict as _load_json_dict_impl,
+    review_export_paths as _review_export_paths_impl,
 )
 from pbdata.storage import (
     build_storage_layout,
@@ -83,7 +95,7 @@ _SOURCE_INGEST_NOTES: dict[str, str] = {
 _SUBPROCESS_STAGES = [
     "extract", "normalize", "audit", "report",
     "setup-workspace", "harvest-metadata", "build-structural-graphs", "engineer-dataset",
-    "report-bias",
+    "report-bias", "export-demo-snapshot",
     "build-conformational-states", "build-graph", "build-microstates", "build-physics-features", "build-microstate-refinement", "build-mm-job-manifests", "run-mm-jobs", "run-feature-pipeline", "export-analysis-queue", "ingest-physics-results", "train-site-physics-surrogate", "build-features", "build-training-examples", "build-splits", "train-baseline-model", "evaluate-baseline-model", "build-custom-training-set", "build-release", "run-scenario-tests",
 ]
 
@@ -92,6 +104,7 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ("Workflow Engine", [
         ("setup-workspace", "Setup Workspace"),
         ("harvest-metadata", "Harvest Metadata"),
+        ("export-demo-snapshot", "Export Demo Snapshot"),
     ]),
     ("Data Acquisition", [
         ("ingest", "Ingest Sources"),
@@ -107,17 +120,10 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("ML Pipeline", [
         ("build-structural-graphs", "Build Structural Graphs"),
-        ("build-conformational-states", "Build Conformational States (Preview)"),
         ("build-graph", "Build Graph"),
         ("build-microstates", "Build Microstates"),
         ("build-physics-features", "Build Physics Features"),
-        ("build-microstate-refinement", "Build Microstate Refinement (Experimental)"),
-        ("build-mm-job-manifests", "Build MM Job Manifests (Experimental)"),
-        ("run-mm-jobs", "Run MM Jobs (Experimental)"),
         ("run-feature-pipeline", "Run Site-Centric Feature Pipeline"),
-        ("export-analysis-queue", "Export Analysis Queue (Experimental)"),
-        ("ingest-physics-results", "Ingest Physics Results (Experimental)"),
-        ("train-site-physics-surrogate", "Train Site-Physics Surrogate (Experimental)"),
         ("build-features", "Build Features"),
         ("build-training-examples", "Build Training Examples"),
         ("build-splits", "Build Splits"),
@@ -127,6 +133,15 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("engineer-dataset", "Engineer Dataset"),
         ("build-release", "Build Release Snapshot"),
         ("run-scenario-tests", "Run Scenario Tests"),
+    ]),
+    ("Experimental & Preview", [
+        ("build-conformational-states", "Build Conformational States (Preview)"),
+        ("build-microstate-refinement", "Build Microstate Refinement (Experimental)"),
+        ("build-mm-job-manifests", "Build MM Job Manifests (Experimental)"),
+        ("run-mm-jobs", "Run MM Jobs (Experimental)"),
+        ("export-analysis-queue", "Export Analysis Queue (Experimental)"),
+        ("ingest-physics-results", "Ingest Physics Results (Experimental)"),
+        ("train-site-physics-surrogate", "Train Site-Physics Surrogate (Experimental)"),
     ]),
 ]
 
@@ -176,6 +191,15 @@ _REVIEW_ISSUE_OPTIONS = [
 _REVIEW_CONFIDENCE_OPTIONS = ["All", "Non-high", "Medium", "Low"]
 _FILTERED_REVIEW_CSV_NAME = "master_pdb_review_filtered.csv"
 _PIPELINE_EXECUTION_MODES = ["legacy", "site-centric", "hybrid"]
+_EXPERIMENTAL_STAGE_KEYS = {
+    "build-conformational-states",
+    "build-microstate-refinement",
+    "build-mm-job-manifests",
+    "run-mm-jobs",
+    "export-analysis-queue",
+    "ingest-physics-results",
+    "train-site-physics-surrogate",
+}
 
 _T = TypeVar("_T")
 
@@ -313,9 +337,7 @@ def _call_on_tk_thread(root: Any, fn: Callable[[], _T]) -> _T:
 
 def _count_files(directory: Path, pattern: str = "*.json") -> int:
     """Count files matching a glob pattern in a directory."""
-    if not directory.exists():
-        return 0
-    return sum(1 for _ in directory.glob(pattern))
+    return _count_files_impl(directory, pattern)
 
 
 def _mousewheel_units(event: Any) -> int:
@@ -325,20 +347,11 @@ def _mousewheel_units(event: Any) -> int:
 
 
 def _load_csv_dict_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+    return _load_csv_dict_rows_impl(path)
 
 
 def _load_json_dict(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    return _load_json_dict_impl(path)
 
 
 def _row_has_non_high_confidence(row: dict[str, str]) -> bool:
@@ -492,157 +505,27 @@ def build_filtered_review_rows(
 
 
 def build_review_health_summary(coverage: dict[str, Any]) -> dict[str, str]:
-    """Build compact review guidance from the coverage summary artifact.
-
-    Assumption:
-    - This is an operational summary, not scientific inference. It only
-      interprets already-computed counts and release-policy outputs.
-    """
-    counts = coverage.get("counts") or {}
-    release = coverage.get("release") or {}
-    issue_types = (coverage.get("coverage") or {}).get("issue_types") or {}
-
-    entry_count = int(counts.get("entry_count") or 0)
-    pair_count = int(counts.get("pair_count") or 0)
-    model_ready = int(counts.get("model_ready_pair_count") or 0)
-    conflicts = int(counts.get("pairs_with_source_conflicts") or 0)
-    exclusions = int(release.get("model_ready_exclusion_count") or 0)
-    structures = int(counts.get("entries_with_structure_file") or 0)
-    missing_structures = int(issue_types.get("missing_structure_file") or 0)
-    low_conf = int(issue_types.get("non_high_confidence_fields") or 0) + int(issue_types.get("non_high_confidence_assay_fields") or 0)
-
-    readiness = "Not ready"
-    if pair_count > 0 and exclusions == 0 and conflicts == 0:
-        readiness = "Release-ready"
-    elif model_ready > 0:
-        readiness = "Partially ready"
-    elif entry_count > 0:
-        readiness = "Needs review"
-
-    coverage_text = (
-        f"{entry_count:,} entries, {pair_count:,} pairs, {model_ready:,} model-ready, "
-        f"{structures:,} with structures"
-    )
-    quality_text = (
-        f"{conflicts:,} conflicted pairs, {low_conf:,} non-high-confidence issues, "
-        f"{missing_structures:,} missing structures"
-    )
-
-    if conflicts > 0:
-        next_action = "Review master_pdb_conflicts.csv and master_pdb_issues.csv before release."
-    elif missing_structures > 0:
-        next_action = "Repair missing structure files before trusting model-ready outputs."
-    elif exclusions > 0:
-        next_action = "Review model_ready_exclusions.csv to resolve or accept blocked pairs."
-    elif model_ready > 0:
-        next_action = "Build or inspect the latest release snapshot."
-    else:
-        next_action = "Run ingest and extract to populate review artifacts."
-
-    return {
-        "readiness": readiness,
-        "coverage": coverage_text,
-        "quality": quality_text,
-        "next_action": next_action,
-    }
+    return _build_review_health_summary(coverage)
 
 
 def build_training_set_builder_summary(
     scorecard: dict[str, Any],
     benchmark_rows: list[dict[str, str]],
 ) -> dict[str, str]:
-    """Build a compact GUI summary for custom training-set curation.
-
-    Assumption:
-    - This is an operational curation summary. It reports selected diversity and
-      grouping pressure from the generated scorecard/benchmark artifacts. It does
-      not claim model performance.
-    """
-    selected_count = int(scorecard.get("selected_count") or 0)
-    candidate_pool_count = int(scorecard.get("candidate_pool_count") or 0)
-    diversity = scorecard.get("diversity") or {}
-    quality = scorecard.get("quality") or {}
-    exclusions = scorecard.get("exclusions") or {}
-
-    receptor_clusters = int(diversity.get("selected_receptor_clusters") or 0)
-    pair_families = int(diversity.get("selected_pair_families") or 0)
-    mean_quality = float(quality.get("mean_quality_score") or 0.0)
-    exclusion_count = int(exclusions.get("count") or 0)
-
-    dominant_benchmark = max(
-        benchmark_rows,
-        key=lambda row: float(str(row.get("largest_group_fraction") or "0") or 0.0),
-        default={},
-    )
-    benchmark_mode = str(dominant_benchmark.get("benchmark_mode") or "n/a")
-    benchmark_fraction = float(str(dominant_benchmark.get("largest_group_fraction") or "0") or 0.0)
-
-    readiness = "Not built"
-    if selected_count > 0 and benchmark_fraction <= 0.35:
-        readiness = "Strong diversity"
-    elif selected_count > 0:
-        readiness = "Needs tuning"
-
-    next_action = "Build custom training set from model-ready pairs."
-    if selected_count > 0 and benchmark_fraction > 0.35:
-        next_action = (
-            "Reduce dominance by changing selection mode or lowering the per-receptor "
-            "cluster cap before releasing the set."
-        )
-    elif selected_count > 0:
-        next_action = "Inspect exclusions and split benchmark, then freeze a release snapshot."
-
-    return {
-        "status": readiness,
-        "coverage": (
-            f"{selected_count:,} selected from {candidate_pool_count:,}; "
-            f"{receptor_clusters:,} receptor clusters, {pair_families:,} pair families"
-        ),
-        "quality": (
-            f"mean quality {mean_quality:.3f}; {exclusion_count:,} excluded; "
-            f"largest benchmark group {benchmark_mode}={benchmark_fraction:.2%}"
-        ),
-        "next_action": next_action,
-    }
+    return _build_training_set_builder_summary(scorecard, benchmark_rows)
 
 
 def build_training_set_kpis(
     scorecard: dict[str, Any],
     benchmark_rows: list[dict[str, str]],
 ) -> dict[str, str]:
-    """Build compact KPI tiles for the GUI curation dashboard."""
-    selected_count = int(scorecard.get("selected_count") or 0)
-    diversity = scorecard.get("diversity") or {}
-    quality = scorecard.get("quality") or {}
-    exclusions = scorecard.get("exclusions") or {}
-    largest_fraction = max(
-        (float(str(row.get("largest_group_fraction") or "0") or 0.0) for row in benchmark_rows),
-        default=0.0,
-    )
-    return {
-        "selected": f"{selected_count:,}",
-        "clusters": f"{int(diversity.get('selected_receptor_clusters') or 0):,}",
-        "quality": f"{float(quality.get('mean_quality_score') or 0.0):.3f}",
-        "dominance": f"{largest_fraction:.1%}",
-        "excluded": f"{int(exclusions.get('count') or 0):,}",
-    }
+    return _build_training_set_kpis(scorecard, benchmark_rows)
 
 
 def build_training_set_workflow_status(
     review_paths: dict[str, str],
 ) -> list[tuple[str, str]]:
-    """Return simple workflow status tuples for the GUI curation path."""
-    def _exists(key: str) -> bool:
-        value = str(review_paths.get(key) or "").strip()
-        return bool(value) and Path(value).exists()
-
-    return [
-        ("Model-ready pool", "ready" if _exists("model_ready_pairs_csv") else "missing"),
-        ("Custom set", "ready" if _exists("custom_training_set_csv") else "pending"),
-        ("Scorecard", "ready" if _exists("custom_training_scorecard_json") else "pending"),
-        ("Benchmark", "ready" if _exists("custom_training_split_benchmark_csv") else "pending"),
-        ("Release", "ready" if _exists("release_manifest_json") else "pending"),
-    ]
+    return _build_training_set_workflow_status(review_paths)
 
 
 def build_curation_review_summary(
@@ -650,36 +533,7 @@ def build_curation_review_summary(
     conflict_rows: list[dict[str, str]],
     issue_rows: list[dict[str, str]],
 ) -> dict[str, str]:
-    """Summarize the main curation blockers from current root artifacts."""
-    exclusion_counts = Counter(str(row.get("reason") or "unknown") for row in exclusion_rows)
-    conflict_bands = Counter(str(row.get("source_agreement_band") or "unknown") for row in conflict_rows)
-    issue_counts = Counter(str(row.get("issue_type") or "unknown") for row in issue_rows)
-
-    top_exclusions = ", ".join(
-        f"{reason}={count}"
-        for reason, count in exclusion_counts.most_common(3)
-    ) or "none"
-    top_issues = ", ".join(
-        f"{issue}={count}"
-        for issue, count in issue_counts.most_common(3)
-    ) or "none"
-    conflict_summary = ", ".join(
-        f"{band}={count}"
-        for band, count in conflict_bands.most_common(3)
-    ) or "none"
-
-    next_action = "Build custom set and review exclusions."
-    if conflict_rows:
-        next_action = "Review conflicted pairs before freezing a release."
-    elif exclusion_rows:
-        next_action = "Inspect top exclusion reasons and retune selection mode or cluster cap."
-
-    return {
-        "exclusions": f"{len(exclusion_rows):,} rows; top reasons: {top_exclusions}",
-        "conflicts": f"{len(conflict_rows):,} rows; agreement bands: {conflict_summary}",
-        "issues": f"{len(issue_rows):,} rows; top issue types: {top_issues}",
-        "next_action": next_action,
-    }
+    return _build_curation_review_summary(exclusion_rows, conflict_rows, issue_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +608,7 @@ class PbdataGUI:
         self._download_pdb_var        = tk.BooleanVar(value=False)
         self._workers_var             = tk.StringVar(value="1")
         self._pipeline_execution_mode_var = tk.StringVar(value="hybrid")
+        self._skip_experimental_stages_var = tk.BooleanVar(value=True)
         self._site_pipeline_degraded_mode_var = tk.BooleanVar(value=True)
         self._site_pipeline_run_id_var = tk.StringVar(value="")
         self._site_physics_batch_id_var = tk.StringVar(value="")
@@ -813,11 +668,61 @@ class PbdataGUI:
             "benchmark": tk.StringVar(value="--"),
             "release": tk.StringVar(value="--"),
         }
+        self._training_quality_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "coverage": tk.StringVar(value="--"),
+            "quality": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._training_quality_kpi_vars: dict[str, tk.StringVar] = {
+            "examples": tk.StringVar(value="--"),
+            "supervised": tk.StringVar(value="--"),
+            "targets": tk.StringVar(value="--"),
+            "ligands": tk.StringVar(value="--"),
+            "conflicts": tk.StringVar(value="--"),
+        }
+        self._model_comparison_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._model_comparison_kpi_vars: dict[str, tk.StringVar] = {
+            "baseline": tk.StringVar(value="--"),
+            "tabular": tk.StringVar(value="--"),
+            "val_winner": tk.StringVar(value="--"),
+            "test_winner": tk.StringVar(value="--"),
+            "val_gap": tk.StringVar(value="--"),
+        }
+        self._prediction_status_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "method": tk.StringVar(value="--"),
+            "preference": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+        }
+        self._prediction_status_kpi_vars: dict[str, tk.StringVar] = {
+            "targets": tk.StringVar(value="--"),
+            "top_target": tk.StringVar(value="--"),
+            "confidence": tk.StringVar(value="--"),
+            "query_features": tk.StringVar(value="--"),
+        }
+        self._workflow_guidance_vars: dict[str, tk.StringVar] = {
+            "phase": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "step_1": tk.StringVar(value="--"),
+            "step_2": tk.StringVar(value="--"),
+            "step_3": tk.StringVar(value="--"),
+        }
         self._curation_review_vars: dict[str, tk.StringVar] = {
             "exclusions": tk.StringVar(value="--"),
             "conflicts": tk.StringVar(value="--"),
             "issues": tk.StringVar(value="--"),
             "next_action": tk.StringVar(value="--"),
+        }
+        self._demo_readiness_vars: dict[str, tk.StringVar] = {
+            "readiness": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "blockers": tk.StringVar(value="--"),
+            "warnings": tk.StringVar(value="--"),
         }
 
         # Serialise "Run All"
@@ -1572,6 +1477,11 @@ class PbdataGUI:
             text="Allow degraded site physics proxies when no surrogate is available",
             variable=self._site_pipeline_degraded_mode_var,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(
+            pipeline_mode_frame,
+            text="Skip Experimental/Preview stages during Run Full Pipeline",
+            variable=self._skip_experimental_stages_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
         row += 1
 
         ttk.Label(
@@ -1717,7 +1627,7 @@ class PbdataGUI:
                 ttk.Combobox(
                     split_frame,
                     textvariable=var,
-                    values=["auto", "pair-aware", "legacy-sequence", "hash"],
+                    values=["auto", "pair-aware", "legacy-sequence", "hash", "scaffold", "family", "mutation", "source", "time"],
                     width=16,
                     state="readonly",
                 ).grid(row=i, column=1, sticky="w", padx=(6, 0), pady=2)
@@ -2177,8 +2087,168 @@ class PbdataGUI:
             command=lambda: self._spawn_stage("build-release"),
         ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=2)
 
+        quality_frame = ttk.LabelFrame(overview, text="Training Example Quality", padding=8, style="Section.TLabelframe")
+        quality_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        quality_frame.columnconfigure(1, weight=1)
+        quality_items = [
+            ("status", "Corpus status:"),
+            ("coverage", "Coverage snapshot:"),
+            ("quality", "Quality snapshot:"),
+            ("next_action", "Recommended next step:"),
+        ]
+        for r, (key, label) in enumerate(quality_items):
+            ttk.Label(
+                quality_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                quality_frame,
+                textvariable=self._training_quality_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        quality_metrics = ttk.Frame(quality_frame)
+        quality_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            quality_metrics.columnconfigure(index, weight=1)
+        quality_metric_labels = [
+            ("examples", "Examples"),
+            ("supervised", "Supervised"),
+            ("targets", "Targets"),
+            ("ligands", "Ligands"),
+            ("conflicts", "Conflict rate"),
+        ]
+        for index, (key, label) in enumerate(quality_metric_labels):
+            card = ttk.Frame(quality_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._training_quality_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            quality_frame,
+            text="Export Quality Report",
+            command=lambda: self._spawn_stage("report-training-set-quality"),
+        ).grid(row=0, column=2, rowspan=len(quality_items), sticky="ns", padx=(8, 0))
+
+        comparison_frame = ttk.LabelFrame(overview, text="Model Comparison", padding=8, style="Section.TLabelframe")
+        comparison_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        comparison_frame.columnconfigure(1, weight=1)
+        comparison_items = [
+            ("status", "Comparison status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]
+        for r, (key, label) in enumerate(comparison_items):
+            ttk.Label(
+                comparison_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                comparison_frame,
+                textvariable=self._model_comparison_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        comparison_metrics = ttk.Frame(comparison_frame)
+        comparison_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            comparison_metrics.columnconfigure(index, weight=1)
+        comparison_metric_labels = [
+            ("baseline", "Baseline"),
+            ("tabular", "Tabular"),
+            ("val_winner", "Val winner"),
+            ("test_winner", "Test winner"),
+            ("val_gap", "Val gap"),
+        ]
+        for index, (key, label) in enumerate(comparison_metric_labels):
+            card = ttk.Frame(comparison_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._model_comparison_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            comparison_frame,
+            text="Export Model Comparison",
+            command=lambda: self._spawn_stage("report-model-comparison"),
+        ).grid(row=0, column=2, rowspan=len(comparison_items), sticky="ns", padx=(8, 0))
+
+        prediction_frame = ttk.LabelFrame(overview, text="Prediction Status", padding=8, style="Section.TLabelframe")
+        prediction_frame.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        prediction_frame.columnconfigure(1, weight=1)
+        prediction_items = [
+            ("status", "Prediction status:"),
+            ("method", "Selected model:"),
+            ("preference", "Current preference:"),
+            ("summary", "Interpretation:"),
+        ]
+        for r, (key, label) in enumerate(prediction_items):
+            ttk.Label(
+                prediction_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                prediction_frame,
+                textvariable=self._prediction_status_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        prediction_metrics = ttk.Frame(prediction_frame)
+        prediction_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            prediction_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("targets", "Targets"),
+            ("top_target", "Top target"),
+            ("confidence", "Confidence"),
+            ("query_features", "Query features"),
+        ]):
+            card = ttk.Frame(prediction_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._prediction_status_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        workflow_frame = ttk.LabelFrame(overview, text="Recommended Workflow", padding=8, style="Section.TLabelframe")
+        workflow_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        workflow_frame.columnconfigure(1, weight=1)
+        workflow_items = [
+            ("phase", "Current phase:"),
+            ("summary", "Why this is next:"),
+            ("step_1", "Step 1:"),
+            ("step_2", "Step 2:"),
+            ("step_3", "Step 3:"),
+        ]
+        for r, (key, label) in enumerate(workflow_items):
+            ttk.Label(
+                workflow_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                workflow_frame,
+                textvariable=self._workflow_guidance_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+
         curation_frame = ttk.LabelFrame(overview, text="Curation Review", padding=8, style="Section.TLabelframe")
-        curation_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        curation_frame.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         curation_frame.columnconfigure(1, weight=1)
         curation_items = [
             ("exclusions", "Exclusion review:"),
@@ -2219,8 +2289,36 @@ class PbdataGUI:
             command=lambda: self._open_path(self._existing_review_path("conflict_csv")),
         ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=2)
 
+        demo_frame = ttk.LabelFrame(overview, text="Demo Readiness", padding=8, style="Section.TLabelframe")
+        demo_frame.grid(row=14, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        demo_frame.columnconfigure(1, weight=1)
+        demo_items = [
+            ("readiness", "Current state:"),
+            ("summary", "Summary:"),
+            ("blockers", "Blockers:"),
+            ("warnings", "Warnings:"),
+        ]
+        for r, (key, label) in enumerate(demo_items):
+            ttk.Label(
+                demo_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                demo_frame,
+                textvariable=self._demo_readiness_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        ttk.Button(
+            demo_frame,
+            text="Export Demo Snapshot",
+            command=lambda: self._spawn_stage("export-demo-snapshot"),
+        ).grid(row=0, column=2, rowspan=len(demo_items), sticky="ns", padx=(8, 0))
+
         health_frame = ttk.LabelFrame(overview, text="Review Health", padding=8, style="Section.TLabelframe")
-        health_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        health_frame.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         health_frame.columnconfigure(1, weight=1)
         health_items = [
             ("readiness", "Release readiness:"),
@@ -2243,7 +2341,7 @@ class PbdataGUI:
             ).grid(row=r, column=1, sticky="w", pady=1)
 
         help_frame = ttk.LabelFrame(overview, text="Interpretation Guide", padding=8, style="Section.TLabelframe")
-        help_frame.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        help_frame.grid(row=16, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         help_frame.columnconfigure(0, weight=1)
         help_lines = [
             "High confidence means a field came from direct structured data or a deterministic merge with no unresolved ambiguity.",
@@ -2261,7 +2359,7 @@ class PbdataGUI:
             ).grid(row=r, column=0, sticky="w", pady=1)
 
         actions_frame = ttk.LabelFrame(overview, text="Quick Actions", padding=8, style="Section.TLabelframe")
-        actions_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        actions_frame.grid(row=17, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         for index in range(7):
             actions_frame.columnconfigure(index, weight=1)
         ttk.Button(
@@ -2302,93 +2400,61 @@ class PbdataGUI:
 
     def _refresh_overview(self) -> None:
         layout = self._storage_layout()
-        counts = {
-            "raw_rcsb":      _count_files(layout.raw_rcsb_dir),
-            "raw_skempi":    "Yes" if (layout.raw_skempi_dir / "skempi_v2.csv").exists() else "No",
-            "processed":     _count_files(layout.processed_rcsb_dir),
-            "extracted":     _count_files(layout.extracted_dir / "entry"),
-            "chains":        _count_files(layout.extracted_dir / "chains"),
-            "bound_objects": _count_files(layout.extracted_dir / "bound_objects"),
-            "assays":        _count_files(layout.extracted_dir / "assays"),
-            "graph_nodes":   _count_files(layout.graph_dir, "graph_nodes*"),
-            "graph_edges":   _count_files(layout.graph_dir, "graph_edges*"),
-            "splits":        _count_files(layout.splits_dir, "*.txt"),
-        }
-        for key, val in counts.items():
-            display = str(val) if isinstance(val, str) else f"{val:,}"
-            self._overview_vars[key].set(display)
-        for key, path in self._review_export_paths().items():
+        try:
+            cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+        except Exception:
+            cfg = AppConfig(storage_root=str(layout.root))
+        snapshot = build_gui_overview_snapshot(layout, cfg, repo_root=Path.cwd())
+
+        for key, value in snapshot.counts.items():
+            self._overview_vars[key].set(value)
+        for key, path in snapshot.review_paths.items():
             self._review_export_vars[key].set(path if path else "--")
-        coverage_path = self._existing_review_path("scientific_coverage_json")
-        summary = build_review_health_summary(_load_json_dict(coverage_path)) if coverage_path else build_review_health_summary({})
-        for key, value in summary.items():
+        for key, value in snapshot.review_health.items():
             if key in self._review_health_vars:
                 self._review_health_vars[key].set(value)
-        scorecard_path = self._existing_review_path("custom_training_scorecard_json")
-        benchmark_path = self._existing_review_path("custom_training_split_benchmark_csv")
-        training_summary = build_training_set_builder_summary(
-            _load_json_dict(scorecard_path) if scorecard_path else {},
-            _load_csv_dict_rows(benchmark_path) if benchmark_path else [],
-        )
-        for key, value in training_summary.items():
+        for key, value in snapshot.training_summary.items():
             if key in self._training_set_vars:
                 self._training_set_vars[key].set(value)
-        training_kpis = build_training_set_kpis(
-            _load_json_dict(scorecard_path) if scorecard_path else {},
-            _load_csv_dict_rows(benchmark_path) if benchmark_path else [],
-        )
-        for key, value in training_kpis.items():
+        for key, value in snapshot.training_kpis.items():
             if key in self._training_kpi_vars:
                 self._training_kpi_vars[key].set(value)
-        workflow_status = build_training_set_workflow_status(self._review_export_paths())
-        workflow_key_map = {
-            "Model-ready pool": "model_ready",
-            "Custom set": "custom_set",
-            "Scorecard": "scorecard",
-            "Benchmark": "benchmark",
-            "Release": "release",
-        }
-        for label, value in workflow_status:
-            key = workflow_key_map.get(label)
-            if key and key in self._training_workflow_vars:
+        for key, value in snapshot.training_workflow.items():
+            if key in self._training_workflow_vars:
                 self._training_workflow_vars[key].set(value)
-        exclusion_path = self._existing_review_path("custom_training_exclusions_csv")
-        conflict_path = self._existing_review_path("conflict_csv")
-        issue_path = self._existing_review_path("issue_csv")
-        curation_summary = build_curation_review_summary(
-            _load_csv_dict_rows(exclusion_path) if exclusion_path else [],
-            _load_csv_dict_rows(conflict_path) if conflict_path else [],
-            _load_csv_dict_rows(issue_path) if issue_path else [],
-        )
-        for key, value in curation_summary.items():
+        for key, value in snapshot.training_quality_summary.items():
+            if key in self._training_quality_vars:
+                self._training_quality_vars[key].set(value)
+        for key, value in snapshot.training_quality_kpis.items():
+            if key in self._training_quality_kpi_vars:
+                self._training_quality_kpi_vars[key].set(value)
+        for key, value in snapshot.model_comparison_summary.items():
+            if key in self._model_comparison_vars:
+                self._model_comparison_vars[key].set(value)
+        for key, value in snapshot.model_comparison_kpis.items():
+            if key in self._model_comparison_kpi_vars:
+                self._model_comparison_kpi_vars[key].set(value)
+        for key, value in snapshot.prediction_status_summary.items():
+            if key in self._prediction_status_vars:
+                self._prediction_status_vars[key].set(value)
+        for key, value in snapshot.prediction_status_kpis.items():
+            if key in self._prediction_status_kpi_vars:
+                self._prediction_status_kpi_vars[key].set(value)
+        for key, value in snapshot.workflow_guidance.items():
+            if key in self._workflow_guidance_vars:
+                self._workflow_guidance_vars[key].set(value)
+        for key, value in snapshot.curation_summary.items():
             if key in self._curation_review_vars:
                 self._curation_review_vars[key].set(value)
+        self._demo_readiness_vars["readiness"].set(snapshot.demo_readiness.readiness or "--")
+        self._demo_readiness_vars["summary"].set(snapshot.demo_readiness.summary or "--")
+        blockers = snapshot.demo_readiness.blockers
+        warnings = snapshot.demo_readiness.warnings
+        self._demo_readiness_vars["blockers"].set(", ".join(str(item) for item in blockers) if blockers else "none")
+        self._demo_readiness_vars["warnings"].set(", ".join(str(item) for item in warnings) if warnings else "none")
 
     def _review_export_paths(self) -> dict[str, str]:
-        repo_root = Path.cwd()
-        latest_release_path = self._storage_layout().releases_dir / "latest_release.json"
-        names = {
-            "master_csv": "master_pdb_repository.csv",
-            "pair_csv": "master_pdb_pairs.csv",
-            "issue_csv": "master_pdb_issues.csv",
-            "conflict_csv": "master_pdb_conflicts.csv",
-            "source_state_csv": "master_source_state.csv",
-            "model_ready_pairs_csv": "model_ready_pairs.csv",
-            "custom_training_set_csv": "custom_training_set.csv",
-            "custom_training_exclusions_csv": "custom_training_exclusions.csv",
-            "custom_training_summary_json": "custom_training_summary.json",
-            "custom_training_scorecard_json": "custom_training_scorecard.json",
-            "custom_training_split_benchmark_csv": "custom_training_split_benchmark.csv",
-            "release_manifest_json": "dataset_release_manifest.json",
-            "split_summary_csv": "split_summary.csv",
-            "scientific_coverage_json": "scientific_coverage_summary.json",
-        }
-        paths: dict[str, str] = {}
-        for key, filename in names.items():
-            path = repo_root / filename if not Path(filename).is_absolute() else Path(filename)
-            paths[key] = str(path) if path.exists() else ""
-        paths["latest_release_json"] = str(latest_release_path) if latest_release_path.exists() else ""
-        return paths
+        return _review_export_paths_impl(self._storage_layout(), repo_root=Path.cwd())
 
     def _refresh_review_exports(self) -> None:
         from pbdata.master_export import refresh_master_exports
@@ -2738,8 +2804,10 @@ class PbdataGUI:
     # ------------------------------------------------------------------
 
     def _set_status(self, stage: str, status: str) -> None:
-        self._status_vars[stage].set(status)
-        self._status_labels[stage].configure(fg=_STATUS_COLORS.get(status, "#888"))
+        if stage in self._status_vars:
+            self._status_vars[stage].set(status)
+        if stage in self._status_labels:
+            self._status_labels[stage].configure(fg=_STATUS_COLORS.get(status, "#888"))
 
     # ------------------------------------------------------------------
     # Subprocess stages
@@ -2853,7 +2921,85 @@ class PbdataGUI:
             if release_tag:
                 cmd.extend(["--tag", release_tag])
 
+        if stage in {"build-graph", "build-features", "build-training-examples"}:
+            cmd.append("--strict-prereqs")
+
         return cmd
+
+    def _pipeline_stages_for_mode(self, mode: str) -> list[str]:
+        auto_excluded = {"ingest-physics-results", "train-site-physics-surrogate"}
+        if mode == "legacy":
+            stages = [
+                stage for stage in _SUBPROCESS_STAGES
+                if stage not in {"run-feature-pipeline", "export-analysis-queue", *auto_excluded}
+            ]
+        elif mode == "site-centric":
+            stages = [
+                "setup-workspace",
+                "extract",
+                "harvest-metadata",
+                "build-structural-graphs",
+                "run-feature-pipeline",
+                "export-analysis-queue",
+                "engineer-dataset",
+            ]
+        else:
+            stages = [stage for stage in _SUBPROCESS_STAGES if stage not in auto_excluded]
+
+        if self._skip_experimental_stages_var.get():
+            stages = [stage for stage in stages if stage not in _EXPERIMENTAL_STAGE_KEYS]
+        return stages
+
+    def _stage_prerequisite_message(self, stage: str) -> str | None:
+        layout = self._storage_layout()
+        checks: dict[str, list[tuple[Path, str]]] = {
+            "engineer-dataset": [
+                (
+                    layout.workspace_metadata_dir / "protein_metadata.csv",
+                    "Run 'harvest-metadata' first.",
+                ),
+            ],
+            "build-custom-training-set": [
+                (
+                    layout.root / "model_ready_pairs.csv",
+                    "Run 'report' and upstream graph/feature/training stages first so model-ready pairs exist.",
+                ),
+            ],
+            "build-release": [
+                (
+                    layout.root / "model_ready_pairs.csv",
+                    "Run 'report' and upstream graph/feature/training stages first so model-ready pairs exist.",
+                ),
+            ],
+            "build-physics-features": [
+                (layout.microstates_dir / "microstate_records.json", "Run 'build-microstates' first."),
+            ],
+            "build-microstate-refinement": [
+                (layout.microstates_dir / "microstate_records.json", "Run 'build-microstates' first."),
+            ],
+            "build-mm-job-manifests": [
+                (
+                    layout.microstate_refinement_dir / "microstate_refinement_records.json",
+                    "Run 'build-microstate-refinement' first.",
+                ),
+            ],
+            "build-features": [
+                (layout.extracted_dir / "assays", "Run 'extract' first."),
+                (layout.graph_dir / "graph_edges.json", "Run 'build-graph' first."),
+            ],
+            "build-graph": [
+                (layout.extracted_dir / "entry", "Run 'extract' first."),
+            ],
+            "build-training-examples": [
+                (layout.extracted_dir / "assays", "Run 'extract' first."),
+                (layout.features_dir / "feature_records.json", "Run 'build-features' first."),
+                (layout.graph_dir / "graph_nodes.json", "Run 'build-graph' first."),
+            ],
+        }
+        missing = [message for path, message in checks.get(stage, []) if not path.exists()]
+        if not missing:
+            return None
+        return "Missing prerequisites: " + " ".join(missing)
 
     def _run_stage(self, stage: str) -> str:
         """Run one CLI stage via subprocess (call from a background thread).
@@ -2866,6 +3012,12 @@ class PbdataGUI:
         self._root.after(0, self._log_line, f"\n{'─' * 40}")
         self._root.after(0, self._log_line, f"  {stage}")
         self._root.after(0, self._log_line, f"{'─' * 40}")
+
+        prereq_message = self._stage_prerequisite_message(stage)
+        if prereq_message:
+            self._root.after(0, self._log_line, prereq_message)
+            self._root.after(0, self._set_status, stage, "error")
+            return "error"
 
         cmd = self._build_stage_cmd(stage)
         try:
@@ -3267,24 +3419,15 @@ class PbdataGUI:
                 return
 
             mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
-            auto_excluded = {"ingest-physics-results", "train-site-physics-surrogate"}
-            if mode == "legacy":
-                stages = [
-                    stage for stage in _SUBPROCESS_STAGES
-                    if stage not in {"run-feature-pipeline", "export-analysis-queue", *auto_excluded}
-                ]
-            elif mode == "site-centric":
-                stages = [
-                    "setup-workspace",
-                    "extract",
-                    "harvest-metadata",
-                    "build-structural-graphs",
-                    "run-feature-pipeline",
-                    "export-analysis-queue",
-                    "engineer-dataset",
-                ]
-            else:
-                stages = [stage for stage in _SUBPROCESS_STAGES if stage not in auto_excluded]
+            stages = self._pipeline_stages_for_mode(mode)
+            if self._skip_experimental_stages_var.get():
+                skipped = [stage for stage in _EXPERIMENTAL_STAGE_KEYS if stage in _SUBPROCESS_STAGES and stage not in stages]
+                if skipped:
+                    self._root.after(
+                        0,
+                        self._log_line,
+                        f"  Skipping experimental/preview stages: {', '.join(sorted(skipped))}",
+                    )
 
             # Remaining stages via subprocess
             for stage in stages:

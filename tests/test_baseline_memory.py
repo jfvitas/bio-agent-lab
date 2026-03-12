@@ -91,6 +91,13 @@ def test_train_ligand_memory_model_writes_artifact() -> None:
     assert manifest["status"] == "trained"
     assert manifest["training_example_count"] == 2
     assert manifest["training_exemplar_count"] == 2
+    assert "scoring_weights" in manifest
+    assert set(manifest["scoring_weights"]) == {
+        "intercept",
+        "affinity_strength",
+        "target_prior_score",
+        "query_context_alignment",
+    }
     saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["target_count"] == 2
     assert "graph_features.network_degree" in saved["numeric_feature_keys"]
@@ -126,7 +133,20 @@ def test_evaluate_ligand_memory_model_scores_validation_split() -> None:
     assert out_path.exists()
     assert summary["status"] == "evaluated"
     assert summary["splits"]["val"]["evaluated_count"] == 1
+    assert summary["splits"]["val"]["no_prediction_count"] == 0
     assert summary["splits"]["val"]["top1_target_accuracy"] == 1.0
+    assert summary["splits"]["val"]["top3_target_accuracy"] == 1.0
+    assert summary["splits"]["val"]["same_ligand_in_train_count"] == 1
+    assert summary["splits"]["val"]["same_target_in_train_count"] == 1
+    assert summary["splits"]["val"]["exact_pair_seen_in_train_count"] == 0
+    assert summary["splits"]["val"]["novel_case_count"] == 0
+    assert summary["splits"]["val"]["affinity_mae_log10"] is not None
+    assert set(summary["scoring_weights"]) == {
+        "intercept",
+        "affinity_strength",
+        "target_prior_score",
+        "query_context_alignment",
+    }
 
 
 def test_train_and_evaluate_baseline_model_cli() -> None:

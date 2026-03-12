@@ -73,7 +73,10 @@ def summarize_case_outcomes(
     metal_mediated = "metal_mediated_binding_possible" in flags
     alkali_counterion_possible = any((b.comp_id or "").upper() in _ALKALI_COUNTERIONS for b in bound_objects)
     metal_object_count = sum(_bound_object_instance_count(b) for b in metal_objects)
-    cofactor_present = any(b.binder_type == "cofactor" for b in bound_objects)
+    cofactor_present = any(
+        b.binder_type == "cofactor" or b.role == "cofactor"
+        for b in bound_objects
+    )
     small_molecule_present = any(b.binder_type == "small_molecule" for b in bound_objects)
 
     # Immune-complex peptides and alkali counterions can disappear from the

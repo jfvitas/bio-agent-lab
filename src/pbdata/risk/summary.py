@@ -24,6 +24,47 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _protein_pathway_map(layout: StorageLayout) -> tuple[dict[str, set[str]], dict[str, set[str]], bool]:
+    nodes = _read_json(layout.graph_dir / "graph_nodes.json")
+    edges = _read_json(layout.graph_dir / "graph_edges.json")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return {}, {}, False
+
+    pathway_node_ids = {
+        str(row.get("node_id") or "")
+        for row in nodes
+        if isinstance(row, dict) and str(row.get("node_type") or "") == "Pathway"
+    }
+    placeholder_pathways = {
+        str(row.get("node_id") or "")
+        for row in nodes
+        if isinstance(row, dict)
+        and str(row.get("node_type") or "") == "Pathway"
+        and bool((row.get("metadata") or {}).get("placeholder"))
+    }
+    protein_to_pathways: dict[str, set[str]] = {}
+    pathway_sources: dict[str, set[str]] = {}
+    for edge in edges:
+        if not isinstance(edge, dict) or str(edge.get("edge_type") or "") != "ProteinPathway":
+            continue
+        src = str(edge.get("source_node_id") or "")
+        tgt = str(edge.get("target_node_id") or "")
+        protein_node = ""
+        pathway_node = ""
+        if tgt in pathway_node_ids and src.startswith("protein:"):
+            protein_node = src
+            pathway_node = tgt
+        elif src in pathway_node_ids and tgt.startswith("protein:"):
+            protein_node = tgt
+            pathway_node = src
+        if not protein_node or not pathway_node or pathway_node in placeholder_pathways:
+            continue
+        protein_id = protein_node.split("protein:", 1)[-1]
+        protein_to_pathways.setdefault(protein_id, set()).add(pathway_node)
+        pathway_sources.setdefault(protein_id, set()).add(str(edge.get("source_database") or ""))
+    return protein_to_pathways, pathway_sources, bool(protein_to_pathways)
+
+
 def build_pathway_risk_summary(
     layout: StorageLayout,
     *,
@@ -34,6 +75,7 @@ def build_pathway_risk_summary(
     coverage_path = layout.root / "scientific_coverage_summary.json"
     coverage = json.loads(coverage_path.read_text(encoding="utf-8")) if coverage_path.exists() else {}
     target_set = {target.strip() for target in (targets or []) if target.strip()}
+    protein_to_pathways, pathway_sources, graph_pathway_ready = _protein_pathway_map(layout)
 
     matching_rows = []
     for row in pair_rows:
@@ -61,12 +103,38 @@ def build_pathway_risk_summary(
                 continue
         if values:
             predicted_affinity = sum(values) / len(values)
-    pathway_similarity = 1.0 if coverage else 0.0
-    # Placeholder scaffold weights until real pathway-overlap and calibrated risk
-    # models are implemented.
-    binding_weight = 0.7
-    pathway_overlap_weight = 0.3
-    risk_score = (binding_weight * predicted_affinity) + (pathway_overlap_weight * pathway_similarity)
+    pair_target_set: set[str] = set()
+    for row in matching_rows:
+        pair_target_set.update(
+            value.strip()
+            for value in str(row.get("receptor_uniprot_ids") or "").split(";")
+            if value.strip()
+        )
+    requested_pathways = set().union(*(protein_to_pathways.get(target_id, set()) for target_id in target_set)) if target_set else set()
+    matched_pair_pathways = set().union(*(protein_to_pathways.get(target_id, set()) for target_id in pair_target_set)) if pair_target_set else set()
+    overlap_count = len(requested_pathways.intersection(matched_pair_pathways))
+    union_count = len(requested_pathways.union(matched_pair_pathways))
+    pathway_similarity = (overlap_count / union_count) if union_count else (1.0 if coverage and matching_rows else 0.0)
+    conflict_fraction = (source_conflicts / len(matching_rows)) if matching_rows else 0.0
+    prediction_rows = ligand_prediction.get("ranked_target_list") if isinstance(ligand_prediction, dict) else []
+    prediction_confidences = [
+        float(row.get("confidence_score") or 0.0)
+        for row in (prediction_rows or [])
+        if isinstance(row, dict) and (not target_set or str(row.get("target_id") or "") in target_set)
+    ]
+    prediction_support = max(prediction_confidences) if prediction_confidences else 0.0
+    binding_strength = max(0.0, min(1.0, 1.0 - (predicted_affinity / 6.0))) if matching_rows else 0.0
+    binding_weight = 0.45
+    pathway_overlap_weight = 0.35
+    prediction_support_weight = 0.20
+    conflict_penalty_weight = 0.25
+    risk_score = (
+        (binding_weight * binding_strength)
+        + (pathway_overlap_weight * pathway_similarity)
+        + (prediction_support_weight * prediction_support)
+        - (conflict_penalty_weight * conflict_fraction)
+    )
+    risk_score = max(risk_score, 0.0)
     predicted_targets = []
     if isinstance(ligand_prediction, dict):
         for row in ligand_prediction.get("ranked_target_list") or []:
@@ -82,15 +150,18 @@ def build_pathway_risk_summary(
                 })
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "status": "dataset_context_summary_not_model_score",
+        "status": "graph_context_summary_not_clinical_risk_model",
         "targets_requested": sorted(target_set),
         "matching_pair_count": len(matching_rows),
         "assay_types_present": assay_types,
         "source_conflict_pair_count": source_conflicts,
-        "pathway_context_available": bool(coverage),
+        "pathway_context_available": bool(coverage) or graph_pathway_ready,
         "binding_weight": binding_weight,
         "pathway_overlap_weight": pathway_overlap_weight,
+        "prediction_support_weight": prediction_support_weight,
+        "conflict_penalty_weight": conflict_penalty_weight,
         "predicted_affinity_proxy": predicted_affinity,
+        "binding_strength_proxy": round(binding_strength, 4),
         "prediction_context_available": bool(predicted_targets),
         "prediction_method": (
             str(ligand_prediction.get("prediction_method") or "")
@@ -98,17 +169,25 @@ def build_pathway_risk_summary(
             else None
         ),
         "predicted_target_matches": predicted_targets,
-        "pathway_similarity_proxy": pathway_similarity,
-        "pathway_similarity_method": "binary_coverage_proxy",
-        "risk_score_is_placeholder": True,
-        "risk_score": risk_score,
-        "pathway_activation_probability": None,
-        "pathway_conflict_score": None,
-        "severity_level": "high" if risk_score >= 2.0 else "medium" if risk_score >= 0.75 else "low",
+        "pathway_overlap_count": overlap_count,
+        "pathway_union_count": union_count,
+        "pathway_source_databases": sorted(set().union(*(pathway_sources.get(target_id, set()) for target_id in target_set))) if target_set else [],
+        "pathway_similarity_proxy": round(pathway_similarity, 4),
+        "pathway_similarity_method": (
+            "target_pair_pathway_jaccard"
+            if union_count
+            else ("graph_pathways_unavailable_fallback" if not graph_pathway_ready else "no_pathway_overlap")
+        ),
+        "risk_score_is_placeholder": False,
+        "risk_score": round(risk_score, 4),
+        "pathway_activation_probability": round(max(0.0, min(1.0, (0.55 * pathway_similarity) + (0.45 * prediction_support))), 4),
+        "pathway_conflict_score": round(conflict_fraction, 4),
+        "severity_level": "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.35 else "low",
         "notes": (
-            "This is a pathway/risk readiness summary from current dataset and graph coverage. "
-            "The score uses placeholder weights and a binary pathway-coverage proxy, not a "
-            "real pathway-overlap or trained risk model."
+            "This is a graph-and-prediction context summary built from matched assay rows, "
+            "ProteinPathway edges, prediction confidence, and source-conflict penalties. "
+            "It is more informative than the old binary coverage proxy, but it is still not "
+            "a trained or clinically calibrated risk model."
         ),
     }
     out_dir = layout.risk_dir

@@ -272,6 +272,10 @@ def _polymer_chain_ids(entity: dict[str, Any]) -> list[str] | None:
     return list(ids) if ids else None
 
 
+def _polymer_description(entity: dict[str, Any]) -> str:
+    return str(((entity.get("rcsb_polymer_entity") or {}).get("pdbx_description") or ""))
+
+
 def _entity_suffix(entity: dict[str, Any]) -> str | None:
     entity_id = entity.get("entity_id")
     if entity_id:
@@ -569,6 +573,70 @@ def build_bound_objects(
         ))
 
     return objects
+
+
+def _is_peptide_cofactor_entity(
+    raw_entry: dict[str, Any],
+    peptide_entity: dict[str, Any],
+) -> bool:
+    """Return True when a short peptide is acting as a biological cofactor.
+
+    Biological assumption:
+    - Small-molecule cofactors are identified by curated CCD IDs.
+    - Some short peptides are also bona fide cofactors or activators.
+      We only promote these when the entry metadata says so explicitly,
+      or for the well-known NS4A cofactor context in HCV NS3/4A protease
+      complexes.
+    """
+    description = _polymer_description(peptide_entity).lower()
+    title = str(((raw_entry.get("struct") or {}).get("title") or "")).lower()
+
+    if not description and not title:
+        return False
+
+    if "cofactor" in description or "cofactor" in title:
+        return True
+    if any(keyword in description for keyword in ("co-activator", "coactivator", "activator peptide")):
+        return True
+    return "ns4a" in description and ("ns3/4a" in title or ("ns3" in title and "protease" in title))
+
+
+def _apply_peptide_cofactor_context_heuristic(
+    raw_entry: dict[str, Any],
+    peptide_entities: list[dict[str, Any]],
+    bound_objects: list[BoundObject],
+) -> list[BoundObject]:
+    """Promote explicit peptide cofactors to role='cofactor' without changing type."""
+    if not peptide_entities or not bound_objects:
+        return bound_objects
+
+    peptide_roles: dict[str, str] = {}
+    peptide_descriptions: dict[str, str] = {}
+    for entity in peptide_entities:
+        entity_id = str(entity.get("rcsb_id") or "")
+        if not entity_id or not _is_peptide_cofactor_entity(raw_entry, entity):
+            continue
+        peptide_roles[entity_id] = "cofactor"
+        peptide_descriptions[entity_id] = _polymer_description(entity)
+
+    if not peptide_roles:
+        return bound_objects
+
+    updated: list[BoundObject] = []
+    for obj in bound_objects:
+        if obj.binder_type != "peptide" or not obj.entity_id or obj.entity_id not in peptide_roles:
+            updated.append(obj)
+            continue
+        rationale = obj.classification_rationale
+        if rationale:
+            rationale += "; "
+        rationale += "entry metadata indicates peptide cofactor context"
+        updated.append(obj.model_copy(update={
+            "role": "cofactor",
+            "name": obj.name or peptide_descriptions.get(obj.entity_id) or None,
+            "classification_rationale": rationale,
+        }))
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +948,11 @@ def classify_entry(
         peptide_entities,
         other_poly_entities=other_poly,
         chem_descriptors=chem_descriptors,
+    )
+    bound_objects = _apply_peptide_cofactor_context_heuristic(
+        raw_entry,
+        peptide_entities,
+        bound_objects,
     )
     bound_objects = disambiguate_roles(bound_objects)
     bound_objects = _apply_covalent_context_heuristic(raw_entry, bound_objects)

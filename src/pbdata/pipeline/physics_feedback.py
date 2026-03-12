@@ -4,8 +4,9 @@ Assumptions:
 - External ORCA/APBS/OpenMM jobs are run outside the normal project runtime.
 - Project code only consumes parsed, machine-readable result tables from the
   expected external-analysis directories.
-- The initial surrogate is a deterministic linear model over site environment
-  descriptors plus motif identity, not a full equivariant GNN.
+- The current surrogate remains lightweight and deterministic, but now includes
+  local geometry-sensitive distance features from the existing site graph. It
+  is still not a full equivariant GNN.
 """
 
 from __future__ import annotations
@@ -42,6 +43,9 @@ TARGET_COLUMNS = [
 ]
 _SURROGATE_FILE = "site_physics_surrogate.pt"
 _LATEST_FILE = "latest_surrogate_checkpoint.json"
+_SURROGATE_VERSION = "site_physics_surrogate_v1_1"
+_MLP_HIDDEN_DIM = 32
+_MLP_EPOCHS = 250
 
 
 def _utc_now() -> str:
@@ -215,10 +219,34 @@ def ingest_external_analysis_results(layout: StorageLayout, *, batch_id: str) ->
 def _site_feature_rows(layout: StorageLayout, source_run_id: str) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     env_dir = layout.base_features_artifacts_dir / source_run_id
+    graph_dir = layout.graphs_artifacts_dir / source_run_id
     for env_path in sorted(env_dir.glob("*.env_vectors.parquet")):
         env_df = read_dataframe(env_path)
         if env_df.empty:
             continue
+        pdb_id = env_path.stem.replace(".env_vectors", "")
+        edge_path = graph_dir / f"{pdb_id}.edges.parquet"
+        edge_df = read_dataframe(edge_path) if edge_path.exists() else pd.DataFrame()
+        edge_stats: dict[str, dict[str, float]] = defaultdict(dict)
+        if not edge_df.empty:
+            grouped_distances: dict[str, list[float]] = defaultdict(list)
+            for edge in edge_df.to_dict(orient="records"):
+                source_site_id = str(edge.get("source_site_id") or "")
+                target_site_id = str(edge.get("target_site_id") or "")
+                distance = _as_float(edge.get("distance"))
+                if distance is None:
+                    continue
+                if source_site_id:
+                    grouped_distances[source_site_id].append(distance)
+                if target_site_id:
+                    grouped_distances[target_site_id].append(distance)
+            for site_id, distances in grouped_distances.items():
+                edge_stats[site_id] = {
+                    "geometry.neighbor_site_count": float(len(distances)),
+                    "geometry.min_site_distance": float(min(distances)),
+                    "geometry.mean_site_distance": float(sum(distances) / len(distances)),
+                    "geometry.max_site_distance": float(max(distances)),
+                }
         for site_id, site_df in env_df.groupby("site_id", sort=True):
             motif_class = str(site_df["motif_class"].iloc[0])
             feature_row: dict[str, Any] = {"site_id": site_id, "motif_class": motif_class}
@@ -237,6 +265,12 @@ def _site_feature_rows(layout: StorageLayout, source_run_id: str) -> pd.DataFram
                     "acceptor_count",
                 ):
                     feature_row[f"{prefix}.{key}"] = float(row.get(key) or 0.0)
+            feature_row.update({
+                "geometry.neighbor_site_count": float(edge_stats.get(site_id, {}).get("geometry.neighbor_site_count", 0.0)),
+                "geometry.min_site_distance": float(edge_stats.get(site_id, {}).get("geometry.min_site_distance", 0.0)),
+                "geometry.mean_site_distance": float(edge_stats.get(site_id, {}).get("geometry.mean_site_distance", 0.0)),
+                "geometry.max_site_distance": float(edge_stats.get(site_id, {}).get("geometry.max_site_distance", 0.0)),
+            })
             rows.append(feature_row)
     return pd.DataFrame(rows)
 
@@ -251,6 +285,7 @@ def _build_training_matrix(
     feature_columns = sorted(
         column for column in merged.columns
         if any(column.startswith(f"{shell}.") for shell in ("shell_1", "shell_2", "shell_3"))
+        or column.startswith("geometry.")
     )
     motif_classes = sorted(set(str(value) for value in merged["motif_class"]))
     motif_index = {motif: idx for idx, motif in enumerate(motif_classes)}
@@ -264,6 +299,26 @@ def _build_training_matrix(
         x_rows.append(features + one_hot + [1.0])
         y_rows.append([float(row.get(column) or 0.0) for column in TARGET_COLUMNS])
     return x_rows, y_rows, feature_columns, motif_classes, TARGET_COLUMNS
+
+
+def _standardize_rows(x_rows: list[list[float]]) -> tuple[list[list[float]], list[float], list[float]]:
+    if not x_rows:
+        return [], [], []
+    column_count = len(x_rows[0])
+    means: list[float] = []
+    stds: list[float] = []
+    for col_idx in range(column_count):
+        values = [row[col_idx] for row in x_rows]
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / max(len(values), 1)
+        std = max(variance ** 0.5, 1e-6)
+        means.append(mean)
+        stds.append(std)
+    standardized = [
+        [(value - means[idx]) / stds[idx] for idx, value in enumerate(row)]
+        for row in x_rows
+    ]
+    return standardized, means, stds
 
 
 def _transpose(matrix: list[list[float]]) -> list[list[float]]:
@@ -311,6 +366,81 @@ def _least_squares_weights(x_rows: list[list[float]], y_rows: list[list[float]])
     return _matmul(_invert_square_matrix(xtx), xty)
 
 
+def _train_torch_mlp_surrogate(
+    x_rows: list[list[float]],
+    y_rows: list[list[float]],
+    *,
+    feature_columns: list[str],
+    motif_classes: list[str],
+    target_columns: list[str],
+) -> tuple[dict[str, Any], list[float]]:
+    assert torch is not None
+    standardized_rows, input_mean, input_std = _standardize_rows(x_rows)
+    x_tensor = torch.tensor(standardized_rows, dtype=torch.float32)
+    y_tensor = torch.tensor(y_rows, dtype=torch.float32)
+    torch.manual_seed(7)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(len(standardized_rows[0]), _MLP_HIDDEN_DIM),
+        torch.nn.ReLU(),
+        torch.nn.Linear(_MLP_HIDDEN_DIM, len(target_columns)),
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.03)
+    for _ in range(_MLP_EPOCHS):
+        optimizer.zero_grad()
+        predictions = model(x_tensor)
+        loss = torch.nn.functional.mse_loss(predictions, y_tensor)
+        loss.backward()
+        optimizer.step()
+    with torch.no_grad():
+        predictions = model(x_tensor)
+        mse_values = torch.mean((predictions - y_tensor) ** 2, dim=0).tolist()
+    checkpoint_payload = {
+        "version": _SURROGATE_VERSION,
+        "model_family": "geometry_aware_mlp_surrogate",
+        "source_batch_id": None,
+        "source_run_id": None,
+        "feature_columns": feature_columns,
+        "motif_classes": motif_classes,
+        "target_columns": target_columns,
+        "checkpoint_format": "torch_state_dict",
+        "input_mean": input_mean,
+        "input_std": input_std,
+        "hidden_dim": _MLP_HIDDEN_DIM,
+        "state_dict": model.state_dict(),
+    }
+    return checkpoint_payload, [float(value) for value in mse_values]
+
+
+def _predict_with_torch_mlp(model: dict[str, Any], vector: list[float], target_columns: list[str]) -> dict[str, float]:
+    assert torch is not None
+    input_mean = [float(value) for value in model.get("input_mean", [])]
+    input_std = [max(float(value), 1e-6) for value in model.get("input_std", [])]
+    standardized = [
+        (value - input_mean[idx]) / input_std[idx]
+        for idx, value in enumerate(vector)
+    ]
+    state_dict = model["state_dict"]
+    if "weight" in state_dict and "bias" in state_dict:
+        # Backward-compatible inference for older torch checkpoints that stored
+        # a single linear layer instead of the newer MLP surrogate.
+        network = torch.nn.Linear(len(standardized), len(target_columns))
+        network.load_state_dict(state_dict)
+    else:
+        network = torch.nn.Sequential(
+            torch.nn.Linear(len(standardized), int(model.get("hidden_dim") or _MLP_HIDDEN_DIM)),
+            torch.nn.ReLU(),
+            torch.nn.Linear(int(model.get("hidden_dim") or _MLP_HIDDEN_DIM), len(target_columns)),
+        )
+        network.load_state_dict(state_dict)
+    network.eval()
+    with torch.no_grad():
+        prediction = network(torch.tensor([standardized], dtype=torch.float32))
+    return {
+        column: float(prediction[0, idx].item())
+        for idx, column in enumerate(target_columns)
+    }
+
+
 def train_site_physics_surrogate(
     layout: StorageLayout,
     *,
@@ -327,13 +457,15 @@ def train_site_physics_surrogate(
     if not x_rows or not y_rows:
         raise ValueError("No training rows available after joining physics targets with archetype site features.")
     if torch is not None:
-        x_tensor = torch.tensor(x_rows, dtype=torch.float32)
-        y_tensor = torch.tensor(y_rows, dtype=torch.float32)
-        solution = torch.linalg.lstsq(x_tensor, y_tensor).solution
-        predictions = x_tensor @ solution
-        mse_values = torch.mean((predictions - y_tensor) ** 2, dim=0).tolist()
-        weights_payload: Any = solution
-        checkpoint_format = "torch_tensor"
+        checkpoint_payload, mse_values = _train_torch_mlp_surrogate(
+            x_rows,
+            y_rows,
+            feature_columns=feature_columns,
+            motif_classes=motif_classes,
+            target_columns=target_columns,
+        )
+        checkpoint_payload["source_batch_id"] = batch_id
+        checkpoint_payload["source_run_id"] = source_run_id
     else:
         solution = _least_squares_weights(x_rows, y_rows)
         predictions = _matmul(x_rows, solution)
@@ -341,23 +473,22 @@ def train_site_physics_surrogate(
         for idx in range(len(target_columns)):
             deltas = [(prediction[idx] - actual[idx]) ** 2 for prediction, actual in zip(predictions, y_rows)]
             mse_values.append(sum(deltas) / max(len(deltas), 1))
-        weights_payload = solution
-        checkpoint_format = "json_matrix"
+        checkpoint_payload = {
+            "version": _SURROGATE_VERSION,
+            "source_batch_id": batch_id,
+            "source_run_id": source_run_id,
+            "model_family": "geometry_sensitive_linear_surrogate",
+            "feature_columns": feature_columns,
+            "motif_classes": motif_classes,
+            "target_columns": target_columns,
+            "weights": solution,
+            "checkpoint_format": "json_matrix",
+        }
 
     out_dir = layout.surrogate_training_artifacts_dir / surrogate_run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / _SURROGATE_FILE
     manifest_path = out_dir / "surrogate_manifest.json"
-    checkpoint_payload = {
-        "version": "site_physics_surrogate_v1",
-        "source_batch_id": batch_id,
-        "source_run_id": source_run_id,
-        "feature_columns": feature_columns,
-        "motif_classes": motif_classes,
-        "target_columns": target_columns,
-        "weights": weights_payload,
-        "checkpoint_format": checkpoint_format,
-    }
     if torch is not None:
         torch.save(checkpoint_payload, checkpoint_path)
     else:
@@ -371,6 +502,8 @@ def train_site_physics_surrogate(
         "training_row_count": len(x_rows),
         "feature_count": len(feature_columns),
         "motif_class_count": len(motif_classes),
+        "model_family": checkpoint_payload["model_family"],
+        "geometry_feature_count": len([column for column in feature_columns if column.startswith("geometry.")]),
         "target_columns": target_columns,
         "per_target_mse": {
             column: round(float(mse_values[idx]), 8)
@@ -418,12 +551,17 @@ def predict_site_physics_from_surrogate(
     feature_columns = list(model["feature_columns"])
     motif_classes = list(model["motif_classes"])
     target_columns = list(model["target_columns"])
-    weights = model["weights"]
     row = [float(feature_values.get(column, 0.0)) for column in feature_columns]
     one_hot = [0.0] * len(motif_classes)
     if motif_class in motif_classes:
         one_hot[motif_classes.index(motif_class)] = 1.0
     vector = row + one_hot + [1.0]
+    model_family = str(model.get("model_family") or "")
+    if model_family == "geometry_aware_mlp_surrogate":
+        if torch is None:
+            raise RuntimeError("geometry_aware_mlp_surrogate requires torch for inference")
+        return _predict_with_torch_mlp(model, vector, target_columns)
+    weights = model["weights"]
     if torch is not None and hasattr(weights, "shape"):
         prediction = torch.tensor([vector], dtype=torch.float32) @ weights
         return {

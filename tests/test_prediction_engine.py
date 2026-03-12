@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from pbdata.cli import app
 from pbdata.models.baseline_memory import train_ligand_memory_model
+from pbdata.models.tabular_affinity import evaluate_tabular_affinity_model, train_tabular_affinity_model
 from pbdata.prediction.engine import run_ligand_screening_workflow, run_peptide_binding_workflow
 from pbdata.schemas.prediction_input import PredictionInputRecord
 from pbdata.storage import build_storage_layout
@@ -138,10 +139,103 @@ def test_ligand_screening_prefers_trained_memory_model() -> None:
     out_path, manifest = run_ligand_screening_workflow(layout, smiles="CCO")
 
     assert out_path.exists()
-    assert manifest["status"] == "trained_baseline_predictions_generated"
+    assert manifest["status"] == "trained_supervised_predictions_generated"
     assert manifest["prediction_method"] == "trained_ligand_memory_model"
     assert manifest["ranked_target_list"][0]["target_id"] == "P12345"
     assert manifest["ranked_target_list"][0]["target_prior_score"] is not None
+    assert manifest["model_artifact_path"] is not None
+
+
+def test_ligand_screening_prefers_tabular_model_when_validation_winner() -> None:
+    tmp_root = _tmp_dir("prediction_ligand_tabular")
+    layout = build_storage_layout(tmp_root)
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(
+        json.dumps([
+            {
+                "example_id": "train:1ABC:0",
+                "structure": {"pdb_id": "1ABC", "resolution": 2.0},
+                "protein": {"uniprot_id": "P12345", "sequence_length": 220, "charged_fraction": 0.12},
+                "ligand": {"ligand_id": "ATP", "smiles": "CCO", "molecular_weight": 507.0},
+                "interaction": {"microstate_record_count": 2, "opposite_charge_contact_count": 3, "acidic_cluster_penalty": 0.2},
+                "experiment": {"affinity_type": "Kd", "reported_measurement_count": 2},
+                "graph_features": {"network_degree": 6, "pathway_count": 2},
+                "labels": {"binding_affinity_log10": 0.8, "affinity_type": "Kd"},
+                "provenance": {
+                    "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+                    "source_database": "PDBbind",
+                    "source_agreement_band": "high",
+                },
+            },
+            {
+                "example_id": "train:2DEF:1",
+                "structure": {"pdb_id": "2DEF", "resolution": 2.7},
+                "protein": {"uniprot_id": "Q99999", "sequence_length": 240, "charged_fraction": 0.20},
+                "ligand": {"ligand_id": "GTP", "smiles": "NNNN", "molecular_weight": 523.0},
+                "interaction": {"microstate_record_count": 1, "opposite_charge_contact_count": 0, "acidic_cluster_penalty": 1.6},
+                "experiment": {"affinity_type": "Kd", "reported_measurement_count": 1},
+                "graph_features": {"network_degree": 2, "pathway_count": 0},
+                "labels": {"binding_affinity_log10": 2.5, "affinity_type": "Kd"},
+                "provenance": {
+                    "pair_identity_key": "protein_ligand|2DEF|A|GTP|wt",
+                    "source_database": "BindingDB",
+                    "source_agreement_band": "low",
+                },
+            },
+            {
+                "example_id": "val:3GHI:2",
+                "structure": {"pdb_id": "3GHI", "resolution": 2.1},
+                "protein": {"uniprot_id": "P12345", "sequence_length": 221, "charged_fraction": 0.11},
+                "ligand": {"ligand_id": "ATP", "smiles": "CCO", "molecular_weight": 507.0},
+                "interaction": {"microstate_record_count": 3, "opposite_charge_contact_count": 4, "acidic_cluster_penalty": 0.1},
+                "experiment": {"affinity_type": "Kd", "reported_measurement_count": 2},
+                "graph_features": {"network_degree": 7, "pathway_count": 3},
+                "labels": {"binding_affinity_log10": 0.9, "affinity_type": "Kd"},
+                "provenance": {
+                    "pair_identity_key": "protein_ligand|3GHI|A|ATP|wt",
+                    "source_database": "PDBbind",
+                    "source_agreement_band": "high",
+                },
+            },
+        ]),
+        encoding="utf-8",
+    )
+    (layout.splits_dir / "train.txt").write_text("train:1ABC:0\ntrain:2DEF:1\n", encoding="utf-8")
+    (layout.splits_dir / "val.txt").write_text("val:3GHI:2\n", encoding="utf-8")
+    (layout.splits_dir / "test.txt").write_text("", encoding="utf-8")
+    train_ligand_memory_model(layout)
+    train_tabular_affinity_model(layout)
+    evaluate_tabular_affinity_model(layout)
+    (layout.models_dir / "ligand_memory_evaluation.json").write_text(
+        json.dumps({
+            "status": "evaluated",
+            "splits": {
+                "val": {"affinity_mae_log10": 0.9, "top1_target_accuracy": 1.0},
+                "test": {"affinity_mae_log10": None, "top1_target_accuracy": None},
+            },
+        }),
+        encoding="utf-8",
+    )
+    (layout.models_dir / "tabular_affinity_evaluation.json").write_text(
+        json.dumps({
+            "status": "trained",
+            "splits": {
+                "val": {"affinity_mae_log10": 0.2, "affinity_rmse_log10": 0.25},
+                "test": {"affinity_mae_log10": None, "affinity_rmse_log10": None},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    out_path, manifest = run_ligand_screening_workflow(layout, smiles="CCO")
+
+    assert out_path.exists()
+    assert manifest["status"] == "trained_supervised_predictions_generated"
+    assert manifest["prediction_method"] == "trained_tabular_affinity_model"
+    assert manifest["selected_model_preference"] == "tabular_affinity"
+    assert manifest["ranked_target_list"][0]["target_id"] == "P12345"
+    assert manifest["ranked_target_list"][0]["predicted_affinity_log10"] is not None
     assert manifest["model_artifact_path"] is not None
 
 

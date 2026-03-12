@@ -11,18 +11,15 @@ Assumptions:
 
 from __future__ import annotations
 
-import hashlib
 import json
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 
 import gemmi
 import pandas as pd
-import yaml
 
 try:
     import torch
@@ -33,8 +30,30 @@ from pbdata.pipeline.physics_feedback import (
     load_latest_site_physics_surrogate,
     predict_site_physics_from_surrogate,
 )
+from pbdata.pipeline.feature_post_pipeline import (
+    build_analysis_queue_batches,
+    build_archetype_rows,
+    build_cluster_summary_rows,
+    build_representative_archetype_rows,
+    export_representative_fragment_inputs,
+    write_analysis_queue_yaml,
+)
+from pbdata.pipeline.feature_pipeline_stages import build_feature_pipeline_stages
+from pbdata.pipeline.feature_pipeline_runtime import (
+    append_structured_error as _append_structured_error,
+    default_run_id as _default_run_id,
+    json_dump as _json_dump,
+    load_stage_status as _load_stage_status,
+    run_stage as _run_stage,
+    stage_manifest_path as _stage_manifest_path,
+    structured_error_path as _structured_error_path,
+    utc_now as _utc_now,
+    write_df as _write_df,
+    write_input_manifest as _write_input_manifest,
+    write_stage_status as _write_stage_status,
+)
 from pbdata.storage import StorageLayout
-from pbdata.table_io import read_dataframe, write_dataframe
+from pbdata.table_io import read_dataframe
 
 PIPELINE_VERSION = "site_feature_pipeline_v1"
 SITE_PHYSICS_SPEC_VERSION = "1.0"
@@ -68,26 +87,6 @@ class FeaturePipelineConfig:
     gpu_enabled: bool = False
     cpu_workers: int = 1
 
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _default_run_id() -> str:
-    return datetime.now(timezone.utc).strftime("feature_run_%Y%m%dT%H%M%SZ")
-
-
-def _json_dump(path: Path, payload: Any) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return path
-
-
-def _write_df(path: Path, rows: list[dict[str, Any]]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return write_dataframe(pd.DataFrame(rows), path)
-
-
 def _read_json_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -105,63 +104,6 @@ def _load_table_rows(table_dir: Path) -> list[dict[str, Any]]:
         rows.extend(_read_json_rows(path))
     return rows
 
-
-def _stage_manifest_path(layout: StorageLayout, run_id: str, stage_name: str) -> Path:
-    return layout.artifact_manifests_dir / f"{run_id}_{stage_name}_status.json"
-
-
-def _structured_error_path(layout: StorageLayout, run_id: str) -> Path:
-    return layout.artifact_logs_dir / f"{run_id}_structured_errors.jsonl"
-
-
-def _append_structured_error(layout: StorageLayout, run_id: str, payload: dict[str, Any]) -> None:
-    path = _structured_error_path(layout, run_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
-
-
-def _write_stage_status(
-    layout: StorageLayout,
-    *,
-    run_id: str,
-    stage_name: str,
-    start_time: str,
-    end_time: str,
-    status: str,
-    records_attempted: int,
-    records_succeeded: int,
-    records_failed: int,
-    upstream_dependencies: list[str],
-    output_artifacts: list[str],
-    warnings: list[str],
-) -> Path:
-    return _json_dump(
-        _stage_manifest_path(layout, run_id, stage_name),
-        {
-            "stage_name": stage_name,
-            "run_id": run_id,
-            "start_time": start_time,
-            "end_time": end_time,
-            "status": status,
-            "records_attempted": records_attempted,
-            "records_succeeded": records_succeeded,
-            "records_failed": records_failed,
-            "upstream_dependencies": upstream_dependencies,
-            "output_artifacts": output_artifacts,
-            "warnings": warnings,
-        },
-    )
-
-
-def _load_stage_status(layout: StorageLayout, run_id: str, stage_name: str) -> dict[str, Any] | None:
-    path = _stage_manifest_path(layout, run_id, stage_name)
-    if not path.exists():
-        return None
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    return raw if isinstance(raw, dict) else None
-
-
 def _canonical_input_rows(layout: StorageLayout) -> dict[str, list[dict[str, Any]]]:
     return {
         "entry": _load_table_rows(layout.extracted_dir / "entry"),
@@ -171,27 +113,6 @@ def _canonical_input_rows(layout: StorageLayout) -> dict[str, list[dict[str, Any
         "assay": _load_table_rows(layout.extracted_dir / "assays"),
         "provenance": _load_table_rows(layout.extracted_dir / "provenance"),
     }
-
-
-def _write_input_manifest(layout: StorageLayout, config: FeaturePipelineConfig, row_counts: dict[str, int]) -> Path:
-    return _json_dump(
-        layout.artifact_manifests_dir / f"{config.run_id}_input_manifest.json",
-        {
-            "schema_version": SCHEMA_VERSION,
-            "pipeline_version": PIPELINE_VERSION,
-            "site_physics_spec_version": SITE_PHYSICS_SPEC_VERSION,
-            "graph_representation_version": GRAPH_REPRESENTATION_VERSION,
-            "training_example_version": TRAINING_EXAMPLE_VERSION,
-            "source_dataset_versions": {"canonical_tables": "derived_from_extracted_tables"},
-            "git_commit_hash": None,
-            "run_timestamp": _utc_now(),
-            "task_id": config.run_id,
-            "row_counts_by_entity_table": row_counts,
-            "run_mode": config.run_mode,
-            "gpu_unavailable": not config.gpu_enabled,
-        },
-    )
-
 
 def _element_charge_proxy(element: str, residue_name: str) -> float:
     if residue_name in _NEGATIVE_RESIDUES and element == "O":
@@ -574,44 +495,6 @@ def _training_example_rows(record_id: str, pair_rows: list[dict[str, Any]], grap
     return example_rows, label_rows, meta_rows
 
 
-def _run_stage(layout: StorageLayout, config: FeaturePipelineConfig, *, stage_name: str, dependencies: list[str], runner) -> dict[str, Any]:
-    if config.run_mode == "resume":
-        existing = _load_stage_status(layout, config.run_id, stage_name)
-        if existing and str(existing.get("status") or "") == "passed":
-            return {"status": "skipped", "warnings": ["resume_reused_existing_stage"]}
-    start = _utc_now()
-    t0 = perf_counter()
-    attempted = succeeded = failed = 0
-    warnings: list[str] = []
-    outputs: list[str] = []
-    status = "passed"
-    try:
-        attempted, succeeded, failed, outputs, warnings = runner()
-        status = "partial" if failed and succeeded else "failed" if failed and not succeeded else "passed"
-    except Exception as exc:
-        status = "failed"
-        failed = max(failed, 1)
-        warnings.append(str(exc))
-        _append_structured_error(layout, config.run_id, {"stage_name": stage_name, "run_id": config.run_id, "error": str(exc), "generated_at": _utc_now()})
-        if config.fail_hard:
-            raise
-    _write_stage_status(
-        layout,
-        run_id=config.run_id,
-        stage_name=stage_name,
-        start_time=start,
-        end_time=_utc_now(),
-        status=status,
-        records_attempted=attempted,
-        records_succeeded=succeeded,
-        records_failed=failed,
-        upstream_dependencies=dependencies,
-        output_artifacts=outputs,
-        warnings=warnings + [f"elapsed_seconds={round(perf_counter() - t0, 3)}"],
-    )
-    return {"status": status, "warnings": warnings}
-
-
 def run_feature_pipeline(
     layout: StorageLayout,
     *,
@@ -633,204 +516,41 @@ def run_feature_pipeline(
         cpu_workers=cpu_workers,
     )
     rows = _canonical_input_rows(layout)
-    input_manifest = _write_input_manifest(layout, config, {key: len(value) for key, value in rows.items()})
-
-    def stage1():
-        entries = rows["entry"]
-        chain_counts: dict[str, int] = defaultdict(int)
-        for chain in rows["chain"]:
-            pdb_id = str(chain.get("pdb_id") or "")
-            if pdb_id:
-                chain_counts[pdb_id] += 1
-        resolved: list[dict[str, Any]] = []
-        rejected: list[dict[str, Any]] = []
-        for entry in entries:
-            pdb_id = str(entry.get("pdb_id") or "")
-            cif_path = str(entry.get("structure_file_cif_path") or "")
-            if not pdb_id or not cif_path:
-                rejected.append({"pdb_id": pdb_id, "reason": "missing_structure_reference"})
-                continue
-            if not Path(cif_path).exists():
-                rejected.append({"pdb_id": pdb_id, "reason": "structure_file_missing_on_disk"})
-                continue
-            resolved.append({"record_id": pdb_id, "pdb_id": pdb_id, "structure_file_cif_path": cif_path, "chain_count": chain_counts.get(pdb_id, 0), "experimental_method": entry.get("experimental_method"), "structure_resolution": entry.get("structure_resolution")})
-        resolved_path = _write_df(layout.artifact_manifests_dir / f"{config.run_id}_stage1_resolved_records.parquet", resolved)
-        rejected_path = _write_df(layout.artifact_manifests_dir / f"{config.run_id}_stage1_rejections.parquet", rejected)
-        manifest_path = _json_dump(layout.artifact_manifests_dir / f"{config.run_id}_stage1_manifest.json", {"generated_at": _utc_now(), "status": "resolved", "resolved_count": len(resolved), "rejected_count": len(rejected)})
-        return len(entries), len(resolved), len(rejected), [str(resolved_path), str(rejected_path), str(manifest_path)], []
-
-    def stage2():
-        df = read_dataframe(layout.artifact_manifests_dir / f"{config.run_id}_stage1_resolved_records.parquet")
-        outputs: list[str] = []
-        warnings: list[str] = []
-        attempted = len(df.index)
-        succeeded = failed = 0
-        for row in df.to_dict(orient="records"):
-            pdb_id = str(row["pdb_id"])
-            try:
-                atom_rows, site_rows = _site_candidates_from_structure(pdb_id, Path(str(row["structure_file_cif_path"])))
-                outputs.append(str(_write_df(layout.prepared_structures_artifacts_dir / config.run_id / f"{pdb_id}.prepared.parquet", [{"record_id": pdb_id, "pdb_id": pdb_id, "structure_file_cif_path": row["structure_file_cif_path"], "chain_count": row.get("chain_count"), "atom_count": len(atom_rows), "site_count": len(site_rows)}])))
-                outputs.append(str(_write_df(layout.prepared_structures_artifacts_dir / config.run_id / f"{pdb_id}.sites.parquet", site_rows)))
-                outputs.append(str(_write_df(layout.site_envs_artifacts_dir / config.run_id / f"{pdb_id}.atoms.parquet", atom_rows)))
-                succeeded += 1
-            except Exception as exc:
-                failed += 1
-                warnings.append(f"{pdb_id}: {exc}")
-        outputs.append(str(_json_dump(layout.artifact_manifests_dir / f"{config.run_id}_stage2_manifest.json", {"generated_at": _utc_now(), "status": "prepared", "records": succeeded})))
-        return attempted, succeeded, failed, outputs, warnings
-
-    def stage3():
-        prepared_dir = layout.prepared_structures_artifacts_dir / config.run_id
-        attempted = succeeded = failed = 0
-        outputs: list[str] = []
-        warnings: list[str] = []
-        for prepared_path in sorted(prepared_dir.glob("*.prepared.parquet")):
-            pdb_id = prepared_path.stem.replace(".prepared", "")
-            attempted += 1
-            try:
-                sites = read_dataframe(prepared_dir / f"{pdb_id}.sites.parquet").to_dict(orient="records")
-                atoms = read_dataframe(layout.site_envs_artifacts_dir / config.run_id / f"{pdb_id}.atoms.parquet").to_dict(orient="records")
-                env_rows, node_rows = _shell_descriptor_rows(pdb_id, sites, atoms)
-                edge_rows = _edge_rows_from_sites(pdb_id, sites)
-                outputs.extend([
-                    str(_write_df(layout.base_features_artifacts_dir / config.run_id / f"{pdb_id}.env_vectors.parquet", env_rows)),
-                    str(_write_df(layout.base_features_artifacts_dir / config.run_id / f"{pdb_id}.node_base.parquet", node_rows)),
-                    str(_write_df(layout.base_features_artifacts_dir / config.run_id / f"{pdb_id}.edge_base.parquet", edge_rows)),
-                    str(_json_dump(layout.base_features_artifacts_dir / config.run_id / f"{pdb_id}.global_base.json", {"generated_at": _utc_now(), "record_id": pdb_id, "site_count": len(sites), "env_row_count": len(env_rows), "edge_candidate_count": len(edge_rows)})),
-                ])
-                succeeded += 1
-            except Exception as exc:
-                failed += 1
-                warnings.append(f"{pdb_id}: {exc}")
-        return attempted, succeeded, failed, outputs, warnings
-
-    def stage4():
-        surrogate_model = None if config.degraded_mode else load_latest_site_physics_surrogate(layout)
-        if not config.degraded_mode and surrogate_model is None:
-            raise RuntimeError("site_physics_enrichment requires a trained surrogate checkpoint when degraded_mode=false")
-        attempted = succeeded = failed = 0
-        outputs: list[str] = []
-        warnings: list[str] = []
-        for env_path in sorted((layout.base_features_artifacts_dir / config.run_id).glob("*.env_vectors.parquet")):
-            pdb_id = env_path.stem.replace(".env_vectors", "")
-            attempted += 1
-            try:
-                env_rows = read_dataframe(env_path).to_dict(orient="records")
-                if surrogate_model is not None:
-                    refined_rows, provenance_rows, cache_stats = _site_refined_rows_from_surrogate(env_rows, surrogate_model)
-                else:
-                    refined_rows, provenance_rows, cache_stats = _site_refined_rows(env_rows, degraded_mode=config.degraded_mode)
-                outputs.extend([
-                    str(_write_df(layout.site_physics_artifacts_dir / config.run_id / f"{pdb_id}.site_refined.parquet", refined_rows)),
-                    str(_write_df(layout.site_physics_artifacts_dir / config.run_id / f"{pdb_id}.physics_provenance.parquet", provenance_rows)),
-                    str(_json_dump(layout.site_physics_artifacts_dir / config.run_id / f"{pdb_id}.cache_stats.json", cache_stats)),
-                ])
-                succeeded += 1
-            except Exception as exc:
-                failed += 1
-                warnings.append(f"{pdb_id}: {exc}")
-        outputs.append(str(_json_dump(layout.artifact_caches_dir / f"{config.run_id}_cache_manifest.json", {"generated_at": _utc_now(), "schema_version": SCHEMA_VERSION, "feature_pipeline_version": PIPELINE_VERSION, "motif_taxonomy_version": SITE_PHYSICS_SPEC_VERSION, "surrogate_checkpoint_id": None if surrogate_model is None else str(surrogate_model.get("version") or "site_physics_surrogate"), "graph_representation_version": GRAPH_REPRESENTATION_VERSION, "training_example_version": TRAINING_EXAMPLE_VERSION, "degraded_mode": config.degraded_mode})))
-        return attempted, succeeded, failed, outputs, warnings
-
-    def stage5():
-        attempted = succeeded = failed = 0
-        outputs: list[str] = []
-        warnings: list[str] = []
-        base_dir = layout.base_features_artifacts_dir / config.run_id
-        site_dir = layout.site_physics_artifacts_dir / config.run_id
-        for node_path in sorted(base_dir.glob("*.node_base.parquet")):
-            pdb_id = node_path.stem.replace(".node_base", "")
-            attempted += 1
-            try:
-                graph_nodes, graph_edges, meta = _graph_rows(
-                    read_dataframe(node_path).to_dict(orient="records"),
-                    read_dataframe(base_dir / f"{pdb_id}.edge_base.parquet").to_dict(orient="records"),
-                    read_dataframe(site_dir / f"{pdb_id}.site_refined.parquet").to_dict(orient="records"),
-                )
-                graph_pt = layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.graph.pt"
-                graph_pt.parent.mkdir(parents=True, exist_ok=True)
-                graph_payload = {"nodes": graph_nodes, "edges": graph_edges, "meta": meta}
-                if torch is not None:
-                    torch.save(graph_payload, graph_pt)
-                else:
-                    graph_pt.write_text(json.dumps(graph_payload, indent=2), encoding="utf-8")
-                outputs.extend([
-                    str(_write_df(layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.nodes.parquet", graph_nodes)),
-                    str(_write_df(layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.edges.parquet", graph_edges)),
-                    str(_json_dump(layout.graphs_artifacts_dir / config.run_id / f"{pdb_id}.graph_meta.json", meta)),
-                    str(graph_pt),
-                ])
-                succeeded += 1
-            except Exception as exc:
-                failed += 1
-                warnings.append(f"{pdb_id}: {exc}")
-        return attempted, succeeded, failed, outputs, warnings
-
-    def stage6():
-        pairs_by_pdb: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in rows["assay"]:
-            pdb_id = str(row.get("pdb_id") or "")
-            if pdb_id:
-                pairs_by_pdb[pdb_id].append(row)
-        attempted = succeeded = failed = 0
-        outputs: list[str] = []
-        warnings: list[str] = []
-        manifest_rows: list[dict[str, Any]] = []
-        for graph_meta_path in sorted((layout.graphs_artifacts_dir / config.run_id).glob("*.graph_meta.json")):
-            pdb_id = graph_meta_path.stem.replace(".graph_meta", "")
-            attempted += 1
-            try:
-                graph_meta = json.loads(graph_meta_path.read_text(encoding="utf-8"))
-                examples, labels, metas = _training_example_rows(pdb_id, pairs_by_pdb.get(pdb_id, []), graph_meta, config.degraded_mode)
-                for index, meta in enumerate(metas):
-                    record_id = str(meta["record_id"])
-                    if index < len(examples):
-                        example_path = layout.training_examples_artifacts_dir / config.run_id / f"{record_id}_{index}.example.pt"
-                        example_path.parent.mkdir(parents=True, exist_ok=True)
-                        if torch is not None:
-                            torch.save(examples[index], example_path)
-                        else:
-                            example_path.write_text(json.dumps(examples[index], indent=2), encoding="utf-8")
-                        outputs.append(str(example_path))
-                    if index < len(labels):
-                        outputs.append(str(_json_dump(layout.training_examples_artifacts_dir / config.run_id / f"{record_id}_{index}.label.json", labels[index])))
-                    outputs.append(str(_json_dump(layout.training_examples_artifacts_dir / config.run_id / f"{record_id}_{index}.meta.json", meta)))
-                    manifest_rows.append({"record_id": record_id, "example_id": meta.get("example_id"), "supervised_label_available": bool(meta.get("supervised_label_available")), "task_type": meta.get("task_type"), "degraded_mode": bool(meta.get("degraded_mode"))})
-                succeeded += 1
-            except Exception as exc:
-                failed += 1
-                warnings.append(f"{pdb_id}: {exc}")
-        outputs.append(str(_write_df(layout.training_examples_artifacts_dir / config.run_id / "manifest.parquet", manifest_rows)))
-        return attempted, succeeded, failed, outputs, warnings
-
-    def stage7():
-        payloads = [payload for name in ("canonical_input_resolution", "structure_preparation", "base_feature_extraction", "site_physics_enrichment", "graph_construction", "training_example_assembly") if (payload := _load_stage_status(layout, config.run_id, name))]
-        summary = [f"# Feature Pipeline Summary: {config.run_id}", "", f"- Pipeline version: {PIPELINE_VERSION}", f"- Run mode: {config.run_mode}", f"- Degraded mode: {config.degraded_mode}", "", "## Stage outcomes"]
-        for payload in payloads:
-            attempted = int(payload["records_attempted"])
-            succeeded = int(payload["records_succeeded"])
-            if attempted == 0 and str(payload["status"]) == "passed":
-                line = f"- {payload['stage_name']}: passed (0 records; upstream input was empty)"
-            else:
-                line = f"- {payload['stage_name']}: {payload['status']} ({succeeded}/{attempted} succeeded)"
-            summary.append(line)
-        summary_path = layout.feature_reports_dir / f"{config.run_id}_summary.md"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text("\n".join(summary), encoding="utf-8")
-        coverage = _json_dump(layout.feature_reports_dir / f"{config.run_id}_coverage.json", {"run_id": config.run_id, "stages": {payload['stage_name']: payload['records_succeeded'] for payload in payloads}, "degraded_mode": config.degraded_mode})
-        failures = _json_dump(layout.feature_reports_dir / f"{config.run_id}_failures.json", {"run_id": config.run_id, "failed_stages": [payload for payload in payloads if payload.get('status') in {'failed', 'partial'}]})
-        performance = _json_dump(layout.feature_reports_dir / f"{config.run_id}_performance.json", {"run_id": config.run_id, "gpu_unavailable": not config.gpu_enabled, "stage_statuses": {payload['stage_name']: payload['status'] for payload in payloads}})
-        return 1, 1, 0, [str(summary_path), str(coverage), str(failures), str(performance)], []
-
-    stages = [
-        ("canonical_input_resolution", [], stage1),
-        ("structure_preparation", ["canonical_input_resolution"], stage2),
-        ("base_feature_extraction", ["structure_preparation"], stage3),
-        ("site_physics_enrichment", ["base_feature_extraction"], stage4),
-        ("graph_construction", ["site_physics_enrichment"], stage5),
-        ("training_example_assembly", ["graph_construction"], stage6),
-        ("validation_reporting_export", ["training_example_assembly"], stage7),
-    ]
+    input_manifest = _write_input_manifest(
+        layout,
+        config=config,
+        row_counts={key: len(value) for key, value in rows.items()},
+        schema_version=SCHEMA_VERSION,
+        pipeline_version=PIPELINE_VERSION,
+        site_physics_spec_version=SITE_PHYSICS_SPEC_VERSION,
+        graph_representation_version=GRAPH_REPRESENTATION_VERSION,
+        training_example_version=TRAINING_EXAMPLE_VERSION,
+    )
+    stages = build_feature_pipeline_stages(
+        layout,
+        config=config,
+        rows=rows,
+        helpers={
+            "utc_now": _utc_now,
+            "json_dump": _json_dump,
+            "write_df": _write_df,
+            "load_stage_status": _load_stage_status,
+            "site_candidates_from_structure": _site_candidates_from_structure,
+            "shell_descriptor_rows": _shell_descriptor_rows,
+            "edge_rows_from_sites": _edge_rows_from_sites,
+            "site_refined_rows": _site_refined_rows,
+            "site_refined_rows_from_surrogate": _site_refined_rows_from_surrogate,
+            "load_latest_site_physics_surrogate": load_latest_site_physics_surrogate,
+            "graph_rows": _graph_rows,
+            "training_example_rows": _training_example_rows,
+            "torch": torch,
+            "schema_version": SCHEMA_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
+            "site_physics_spec_version": SITE_PHYSICS_SPEC_VERSION,
+            "graph_representation_version": GRAPH_REPRESENTATION_VERSION,
+            "training_example_version": TRAINING_EXAMPLE_VERSION,
+        },
+    )
     if config.run_mode == "stage_only":
         if not config.stage_only:
             raise ValueError("stage_only run mode requires --stage-name")
@@ -851,25 +571,50 @@ def run_feature_pipeline(
 
 
 def export_analysis_queue(layout: StorageLayout, *, run_id: str) -> dict[str, str]:
-    env_dir = layout.base_features_artifacts_dir / run_id
-    archetype_rows: list[dict[str, Any]] = []
-    for env_path in sorted(env_dir.glob("*.env_vectors.parquet")):
-        env_df = read_dataframe(env_path)
-        if env_df.empty:
-            continue
-        for site_id, site_df in env_df.groupby("site_id", sort=True):
-            motif_class = str(site_df["motif_class"].iloc[0])
-            descriptor_hash = hashlib.sha256(site_df[["shell_name", "neighbor_atom_count", "sum_partial_charge", "electric_field_magnitude", "donor_count", "acceptor_count"]].to_json(orient="records").encode("utf-8")).hexdigest()
-            archetype_rows.append({"run_id": run_id, "site_id": site_id, "motif_class": motif_class, "archetype_id": f"{motif_class}:{descriptor_hash[:12]}", "descriptor_hash": descriptor_hash})
+    archetype_rows = build_archetype_rows(layout, run_id=run_id)
     archetype_df = pd.DataFrame(archetype_rows)
     archetype_path = _write_df(layout.archetypes_artifacts_dir / run_id / "archetypes.parquet", archetype_df.drop_duplicates(subset=["archetype_id"]).to_dict(orient="records") if not archetype_df.empty else [])
-    queue_rows = []
-    if not archetype_df.empty:
-        for motif_class, motif_df in archetype_df.drop_duplicates(subset=["archetype_id"]).groupby("motif_class", sort=True):
-            queue_rows.append({"motif_class": motif_class, "archetype_ids": motif_df.head(20)["archetype_id"].tolist(), "analysis_types": ["orca", "apbs", "openmm"]})
+    representative_rows = build_representative_archetype_rows(archetype_df)
+    representative_path = _write_df(layout.archetypes_artifacts_dir / run_id / "representative_archetypes.parquet", representative_rows)
+    cluster_summary_rows = build_cluster_summary_rows(archetype_df)
+    cluster_summary_path = _write_df(layout.archetypes_artifacts_dir / run_id / "cluster_summary.parquet", cluster_summary_rows)
+    fragment_rows = export_representative_fragment_inputs(layout, run_id=run_id, representative_rows=representative_rows)
+    fragment_manifest_path = _write_df(layout.archetypes_artifacts_dir / run_id / "representative_fragments.parquet", fragment_rows)
+    queue_rows = build_analysis_queue_batches(archetype_df)
+    fragment_by_archetype = {str(row["archetype_id"]): row for row in fragment_rows}
+    for queue_row in queue_rows:
+        queue_row["fragments"] = [
+            {
+                "archetype_id": archetype_id,
+                "fragment_id": fragment_by_archetype[archetype_id]["fragment_id"],
+                "fragment_file": fragment_by_archetype[archetype_id]["fragment_file"],
+                "metadata_file": fragment_by_archetype[archetype_id]["metadata_file"],
+            }
+            for archetype_id in queue_row["archetype_ids"]
+            if archetype_id in fragment_by_archetype
+        ]
     queue_path = layout.external_analysis_artifacts_dir / f"{run_id}_analysis_queue.yaml"
-    queue_path.parent.mkdir(parents=True, exist_ok=True)
-    with queue_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump({"run_id": run_id, "batches": queue_rows}, handle, sort_keys=False)
-    batch_manifest = _json_dump(layout.external_analysis_artifacts_dir / f"{run_id}_analysis_batch_manifest.json", {"generated_at": _utc_now(), "run_id": run_id, "motif_class_count": len(queue_rows), "archetype_count": int(len(archetype_df.index))})
-    return {"archetypes": str(archetype_path), "queue": str(queue_path), "batch_manifest": str(batch_manifest)}
+    write_analysis_queue_yaml(queue_path, run_id=run_id, queue_rows=queue_rows)
+    batch_manifest = _json_dump(
+        layout.external_analysis_artifacts_dir / f"{run_id}_analysis_batch_manifest.json",
+        {
+            "generated_at": _utc_now(),
+            "run_id": run_id,
+            "motif_class_count": len(queue_rows),
+            "archetype_count": int(len(archetype_df.index)),
+            "representative_archetype_count": len(representative_rows),
+            "cluster_count": len(cluster_summary_rows),
+            "cluster_summary_path": str(cluster_summary_path),
+            "representative_archetypes_path": str(representative_path),
+            "representative_fragments_path": str(fragment_manifest_path),
+            "fragment_count": len(fragment_rows),
+        },
+    )
+    return {
+        "archetypes": str(archetype_path),
+        "representatives": str(representative_path),
+        "cluster_summary": str(cluster_summary_path),
+        "fragments": str(fragment_manifest_path),
+        "queue": str(queue_path),
+        "batch_manifest": str(batch_manifest),
+    }

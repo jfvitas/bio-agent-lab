@@ -57,6 +57,12 @@ _NUMERIC_FEATURE_KEYS: tuple[tuple[str, str], ...] = (
     ("structural_graph", "pi_stacking_count"),
     ("structural_graph", "metal_coordination_count"),
 )
+_DEFAULT_SCORING_WEIGHTS = {
+    "intercept": 0.52,
+    "affinity_strength": 0.23,
+    "target_prior_score": 0.15,
+    "query_context_alignment": 0.10,
+}
 
 
 def _read_json(path: Path) -> Any:
@@ -173,6 +179,81 @@ def _target_profiles(exemplars: list[dict[str, Any]]) -> dict[str, dict[str, Any
     return profiles
 
 
+def _transpose(matrix: list[list[float]]) -> list[list[float]]:
+    return [list(column) for column in zip(*matrix)] if matrix else []
+
+
+def _matmul(left: list[list[float]], right: list[list[float]]) -> list[list[float]]:
+    if not left or not right:
+        return []
+    right_t = _transpose(right)
+    return [[sum(lval * rval for lval, rval in zip(row, column)) for column in right_t] for row in left]
+
+
+def _invert_square_matrix(matrix: list[list[float]]) -> list[list[float]]:
+    size = len(matrix)
+    augmented = [
+        [float(value) for value in row] + [1.0 if idx == row_idx else 0.0 for idx in range(size)]
+        for row_idx, row in enumerate(matrix)
+    ]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda row_idx: abs(augmented[row_idx][col]))
+        if abs(augmented[pivot][col]) < 1e-12:
+            augmented[col][col] += 1e-6
+            pivot = col
+        augmented[col], augmented[pivot] = augmented[pivot], augmented[col]
+        pivot_value = augmented[col][col]
+        augmented[col] = [value / pivot_value for value in augmented[col]]
+        for row_idx in range(size):
+            if row_idx == col:
+                continue
+            factor = augmented[row_idx][col]
+            augmented[row_idx] = [
+                current - factor * pivoted
+                for current, pivoted in zip(augmented[row_idx], augmented[col])
+            ]
+    return [row[size:] for row in augmented]
+
+
+def _least_squares_vector(x_rows: list[list[float]], y_values: list[float]) -> list[float]:
+    if not x_rows or not y_values:
+        return [float(_DEFAULT_SCORING_WEIGHTS[key]) for key in ("intercept", "affinity_strength", "target_prior_score", "query_context_alignment")]
+    x_t = _transpose(x_rows)
+    xtx = _matmul(x_t, x_rows)
+    for idx in range(len(xtx)):
+        xtx[idx][idx] += 1e-6
+    y_matrix = [[value] for value in y_values]
+    xty = _matmul(x_t, y_matrix)
+    solved = _matmul(_invert_square_matrix(xtx), xty)
+    return [float(row[0]) for row in solved]
+
+
+def _fit_scoring_weights(exemplars: list[dict[str, Any]], target_profiles: dict[str, dict[str, Any]]) -> dict[str, float]:
+    x_rows: list[list[float]] = []
+    y_values: list[float] = []
+    for exemplar in exemplars:
+        affinity_log10 = _safe_float(exemplar.get("affinity_log10"))
+        target_id = str(exemplar.get("target_id") or "")
+        if affinity_log10 is None or not target_id:
+            continue
+        target_profile = target_profiles.get(target_id) or {}
+        target_prior = _safe_float(target_profile.get("target_prior_score")) or 0.0
+        query_context_alignment = score_query_context_against_target_profile(
+            exemplar.get("numeric_features") if isinstance(exemplar.get("numeric_features"), dict) else None,
+            target_profile,
+        )
+        strength = affinity_strength_from_log10(affinity_log10)
+        x_rows.append([1.0, strength, target_prior, query_context_alignment])
+        y_values.append(affinity_log10)
+    intercept, strength_w, prior_w, context_w = _least_squares_vector(x_rows, y_values)
+    return {
+        "intercept": round(intercept, 6),
+        "affinity_strength": round(strength_w, 6),
+        "target_prior_score": round(prior_w, 6),
+        "query_context_alignment": round(context_w, 6),
+    }
+
+
 def score_query_context_against_target_profile(
     query_numeric_features: dict[str, float] | None,
     target_profile: dict[str, Any] | None,
@@ -272,7 +353,12 @@ def _predict_from_exemplars(
     *,
     target_profiles: dict[str, dict[str, Any]] | None = None,
     query_numeric_features: dict[str, float] | None = None,
+    scoring_weights: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
+    active_weights = {
+        **_DEFAULT_SCORING_WEIGHTS,
+        **(scoring_weights or {}),
+    }
     target_rows: dict[str, dict[str, Any]] = {}
     for exemplar in exemplars:
         similarity = ligand_similarity_score(query_smiles, exemplar.get("ligand_smiles"))
@@ -291,12 +377,13 @@ def _predict_from_exemplars(
             query_numeric_features,
             target_profile if isinstance(target_profile, dict) else None,
         )
-        raw_score = support * (
-            0.52
-            + (0.23 * strength)
-            + (0.15 * target_prior)
-            + (0.10 * query_context_alignment)
+        calibrated_signal = (
+            float(active_weights["intercept"])
+            + (float(active_weights["affinity_strength"]) * strength)
+            + (float(active_weights["target_prior_score"]) * target_prior)
+            + (float(active_weights["query_context_alignment"]) * query_context_alignment)
         )
+        raw_score = support * max(calibrated_signal, 0.01)
         row = target_rows.setdefault(target_id, {
             "target_id": target_id,
             "raw_score": 0.0,
@@ -363,6 +450,26 @@ def _predict_from_exemplars(
     return ranked
 
 
+def _training_overlap_sets(exemplars: list[dict[str, Any]]) -> dict[str, set[str]]:
+    return {
+        "ligand_smiles": {
+            str(item.get("ligand_smiles") or "")
+            for item in exemplars
+            if str(item.get("ligand_smiles") or "")
+        },
+        "target_ids": {
+            str(item.get("target_id") or "")
+            for item in exemplars
+            if str(item.get("target_id") or "")
+        },
+        "pair_keys": {
+            str(item.get("pair_identity_key") or "")
+            for item in exemplars
+            if str(item.get("pair_identity_key") or "")
+        },
+    }
+
+
 def train_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str, Any]]:
     examples_by_id = _training_examples_by_id(layout)
     train_ids = _read_split_ids(layout.splits_dir / "train.txt")
@@ -377,6 +484,7 @@ def train_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str, An
         )) is not None
     ]
     target_profiles = _target_profiles(exemplars)
+    scoring_weights = _fit_scoring_weights(exemplars, target_profiles)
     model = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "trained" if exemplars else "no_training_exemplars_available",
@@ -392,6 +500,7 @@ def train_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str, An
             "Graph and electrostatic-like pair features contribute only as modest target priors, not as a mechanistic simulation.",
             "This baseline does not infer new binding mechanisms beyond observed training examples.",
         ],
+        "scoring_weights": scoring_weights,
         "exemplars": exemplars,
         "target_profiles": target_profiles,
     }
@@ -423,11 +532,13 @@ def predict_with_ligand_memory_model(
     if model is None:
         return None, []
     target_profiles = model.get("target_profiles") if isinstance(model.get("target_profiles"), dict) else {}
+    scoring_weights = model.get("scoring_weights") if isinstance(model.get("scoring_weights"), dict) else {}
     ranked = _predict_from_exemplars(
         query_smiles,
         model.get("exemplars") or [],
         target_profiles=target_profiles,
         query_numeric_features=query_numeric_features,
+        scoring_weights=scoring_weights,
     )
     return model, ranked
 
@@ -448,11 +559,22 @@ def evaluate_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str,
         )) is not None
     ]
     train_target_profiles = _target_profiles(train_exemplars)
+    scoring_weights = _fit_scoring_weights(train_exemplars, train_target_profiles)
+    overlap_sets = _training_overlap_sets(train_exemplars)
 
     def _evaluate_split(split_name: str, split_ids: set[str]) -> dict[str, Any]:
         evaluated = 0
         top1_hits = 0
+        top3_hits = 0
         affinity_errors: list[float] = []
+        affinity_log10_errors: list[float] = []
+        best_similarities: list[float] = []
+        same_ligand_in_train_count = 0
+        same_target_in_train_count = 0
+        exact_pair_seen_in_train_count = 0
+        novel_case_count = 0
+        novel_top1_hits = 0
+        no_prediction_count = 0
         for example_id in sorted(split_ids):
             example = examples_by_id.get(example_id)
             if not isinstance(example, dict):
@@ -467,22 +589,56 @@ def evaluate_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str,
                 str(exemplar.get("ligand_smiles") or ""),
                 train_exemplars,
                 target_profiles=train_target_profiles,
+                scoring_weights=scoring_weights,
             )
             if not ranked:
+                no_prediction_count += 1
                 continue
             evaluated += 1
+            ligand_smiles = str(exemplar.get("ligand_smiles") or "")
+            target_id = str(exemplar.get("target_id") or "")
+            pair_identity_key = str(exemplar.get("pair_identity_key") or "")
+            same_ligand = ligand_smiles in overlap_sets["ligand_smiles"]
+            same_target = target_id in overlap_sets["target_ids"]
+            exact_pair_seen = pair_identity_key in overlap_sets["pair_keys"]
+            if same_ligand:
+                same_ligand_in_train_count += 1
+            if same_target:
+                same_target_in_train_count += 1
+            if exact_pair_seen:
+                exact_pair_seen_in_train_count += 1
+            if not same_ligand and not same_target:
+                novel_case_count += 1
             top_target = ranked[0]
-            if str(top_target.get("target_id") or "") == str(exemplar.get("target_id") or ""):
+            best_similarities.append(float(_safe_float(top_target.get("ligand_similarity")) or 0.0))
+            if str(top_target.get("target_id") or "") == target_id:
                 top1_hits += 1
+                if not same_ligand and not same_target:
+                    novel_top1_hits += 1
+            if any(str(item.get("target_id") or "") == target_id for item in ranked[:3]):
+                top3_hits += 1
             predicted_kd = _safe_float(top_target.get("predicted_kd_nM"))
             actual_log10 = _safe_float(exemplar.get("affinity_log10"))
             actual_kd = None if actual_log10 is None else 10 ** actual_log10
             if predicted_kd is not None and actual_kd is not None:
                 affinity_errors.append(abs(predicted_kd - actual_kd))
+            predicted_delta_g = _safe_float(top_target.get("predicted_delta_g_proxy"))
+            if predicted_delta_g is not None and actual_log10 is not None:
+                predicted_log10 = -predicted_delta_g / 1.364
+                affinity_log10_errors.append(abs(predicted_log10 - actual_log10))
         return {
             "evaluated_count": evaluated,
+            "no_prediction_count": no_prediction_count,
             "top1_target_accuracy": round(top1_hits / evaluated, 4) if evaluated else None,
+            "top3_target_accuracy": round(top3_hits / evaluated, 4) if evaluated else None,
             "affinity_mae_nM": round(sum(affinity_errors) / len(affinity_errors), 4) if affinity_errors else None,
+            "affinity_mae_log10": round(sum(affinity_log10_errors) / len(affinity_log10_errors), 4) if affinity_log10_errors else None,
+            "mean_best_ligand_similarity": round(sum(best_similarities) / len(best_similarities), 4) if best_similarities else None,
+            "same_ligand_in_train_count": same_ligand_in_train_count,
+            "same_target_in_train_count": same_target_in_train_count,
+            "exact_pair_seen_in_train_count": exact_pair_seen_in_train_count,
+            "novel_case_count": novel_case_count,
+            "novel_top1_target_accuracy": round(novel_top1_hits / novel_case_count, 4) if novel_case_count else None,
         }
 
     summary = {
@@ -490,13 +646,16 @@ def evaluate_ligand_memory_model(layout: StorageLayout) -> tuple[Path, dict[str,
         "status": "evaluated" if train_exemplars else "no_training_exemplars_available",
         "model_type": "ligand_memory_baseline",
         "train_exemplar_count": len(train_exemplars),
+        "scoring_weights": scoring_weights,
         "splits": {
             "val": _evaluate_split("val", val_ids),
             "test": _evaluate_split("test", test_ids),
         },
         "notes": (
             "Evaluation uses the current train split as the memory bank and predicts held-out "
-            "ligands by ligand-string similarity against known training exemplars."
+            "ligands by ligand-string similarity against known training exemplars. "
+            "Split summaries include overlap diagnostics so familiar ligand/target cases are distinguishable "
+            "from more novel held-out examples."
         ),
     }
     layout.models_dir.mkdir(parents=True, exist_ok=True)

@@ -253,16 +253,19 @@ class StorageLayout:
 
 
 def resolve_storage_root(storage_root: str | Path | None) -> Path:
+    """Resolve a user-supplied storage root to an absolute local path."""
     if storage_root is None:
         return Path.cwd().resolve()
     return Path(storage_root).expanduser().resolve()
 
 
 def build_storage_layout(storage_root: str | Path | None) -> StorageLayout:
+    """Construct the canonical workspace path layout for a storage root."""
     return StorageLayout(root=resolve_storage_root(storage_root))
 
 
 def validate_rcsb_raw_json(path: Path, *, expected_pdb_id: str | None = None) -> bool:
+    """Return True when a cached RCSB JSON payload is structurally usable."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -279,6 +282,7 @@ def validate_rcsb_raw_json(path: Path, *, expected_pdb_id: str | None = None) ->
 
 
 def validate_skempi_csv(path: Path) -> bool:
+    """Return True when a SKEMPI CSV has the required delimiter and headers."""
     try:
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle, delimiter=";")
@@ -290,6 +294,7 @@ def validate_skempi_csv(path: Path) -> bool:
 
 
 def validate_bindingdb_raw_json(path: Path, *, expected_pdb_id: str | None = None) -> bool:
+    """Return True when a cached BindingDB JSON payload matches the expected shape."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -304,6 +309,7 @@ def validate_bindingdb_raw_json(path: Path, *, expected_pdb_id: str | None = Non
 
 
 def validate_mmcif_file(path: Path) -> bool:
+    """Return True when a local mmCIF file exists and parses with gemmi."""
     try:
         if not path.exists() or path.stat().st_size <= 0:
             return False
@@ -314,6 +320,7 @@ def validate_mmcif_file(path: Path) -> bool:
 
 
 def validate_pdb_file(path: Path) -> bool:
+    """Return True when a local PDB file looks structurally valid."""
     try:
         if not path.exists() or path.stat().st_size <= 0:
             return False

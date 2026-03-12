@@ -24,6 +24,8 @@ _ADAPTER_VERSION = "0.1.0"
 _BASE_URL = "https://www.ebi.ac.uk/chembl/api/data"
 _TIMEOUT = 30
 _DELAY = 0.2
+_RETRY_ATTEMPTS = 3
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _SUPPORTED_TYPES = {"kd", "ki", "ic50", "ec50", "dg", "Δg"}
 _TO_NM = {
     "fm": 0.000001,
@@ -37,14 +39,27 @@ _MUTATION_RE = re.compile(r"\b[A-Z]\d+[A-Z]\b")
 
 
 def _get_json(resource: str, params: dict[str, Any]) -> dict[str, Any]:
-    resp = requests.get(
-        f"{_BASE_URL}/{resource}.json",
-        params=params,
-        timeout=_TIMEOUT,
-    )
-    resp.raise_for_status()
-    time.sleep(_DELAY)
-    return resp.json()
+    last_error: Exception | None = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            resp = requests.get(
+                f"{_BASE_URL}/{resource}.json",
+                params=params,
+                timeout=_TIMEOUT,
+            )
+            resp.raise_for_status()
+            time.sleep(_DELAY)
+            return resp.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status_code in _RETRYABLE_STATUS_CODES or isinstance(exc, (requests.Timeout, requests.ConnectionError))
+            if not retryable or attempt >= _RETRY_ATTEMPTS:
+                raise
+            time.sleep(_DELAY * attempt)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unreachable ChEMBL request state")
 
 
 def _normalize_type(value: str | None) -> str | None:

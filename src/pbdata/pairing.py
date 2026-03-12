@@ -22,6 +22,7 @@ class ParsedPairKey:
     raw_key: str
     task_type: str
     pdb_id: str | None = None
+    subject_key: str | None = None
     receptor_chain_ids: tuple[str, ...] = ()
     partner_chain_ids: tuple[str, ...] = ()
     ligand_key: str | None = None
@@ -30,6 +31,18 @@ class ParsedPairKey:
 
 def parse_pair_identity_key(key: str) -> ParsedPairKey | None:
     parts = key.split("|")
+    if len(parts) == 4:
+        task_type, pdb_id, subject_key, mutation_key = parts
+        if task_type in {"protein_ligand", "protein_protein"}:
+            return None
+        return ParsedPairKey(
+            raw_key=key,
+            task_type=task_type,
+            pdb_id=pdb_id or None,
+            subject_key=subject_key or None,
+            mutation_key=mutation_key or None,
+        )
+
     if len(parts) != 5:
         return None
 
@@ -39,6 +52,7 @@ def parse_pair_identity_key(key: str) -> ParsedPairKey | None:
             raw_key=key,
             task_type=task_type,
             pdb_id=pdb_id or None,
+            subject_key=right or None,
             receptor_chain_ids=tuple(split_chain_group(left)),
             ligand_key=right or None,
             mutation_key=mutation_key or None,
@@ -48,6 +62,7 @@ def parse_pair_identity_key(key: str) -> ParsedPairKey | None:
             raw_key=key,
             task_type=task_type,
             pdb_id=pdb_id or None,
+            subject_key=right or None,
             receptor_chain_ids=tuple(split_chain_group(left)),
             partner_chain_ids=tuple(split_chain_group(right)),
             mutation_key=mutation_key or None,
@@ -56,6 +71,7 @@ def parse_pair_identity_key(key: str) -> ParsedPairKey | None:
         raw_key=key,
         task_type=task_type,
         pdb_id=pdb_id or None,
+        subject_key=right or None,
         mutation_key=mutation_key or None,
     )
 

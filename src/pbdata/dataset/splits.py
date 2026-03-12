@@ -63,6 +63,11 @@ class PairSplitItem:
     receptor_identity: str
     representation_key: str
     hard_group_key: str
+    scaffold_key: str = ""
+    family_key: str = ""
+    mutation_group_key: str = ""
+    source_group_key: str = ""
+    release_date: str | None = None
 
 
 def _validate_split_fractions(train_frac: float, val_frac: float) -> None:
@@ -404,6 +409,183 @@ def build_pair_aware_splits(
         "sequence_cluster_count": len(cluster_to_group_ids),
         "representation_counts": dict(representation_counts_total),
         "targets": target_sizes,
+    }
+    return result, metadata
+
+
+def build_grouped_pair_splits(
+    items: list[PairSplitItem],
+    *,
+    grouping: str,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+    seed: int = 42,
+    log_fn: object = print,
+) -> tuple[SplitResult, dict[str, object]]:
+    """Split pair-level rows by an explicit proxy grouping key.
+
+    Assumptions:
+    - ``scaffold`` uses ligand InChIKey/SMILES/ligand-id proxies already present
+      in training examples. It is a conservative ligand-identity proxy, not a
+      Murcko-scaffold implementation.
+    - ``family`` uses exact receptor identity proxies (UniProt IDs or extracted
+      receptor-sequence composites), not curated protein family annotations.
+    - ``mutation`` uses the exact parsed mutation token within a receptor/partner
+      family so wildtype and specific mutation series can be isolated together.
+    """
+    _validate_split_fractions(train_frac, val_frac)
+    grouping_map = {
+        "scaffold": "scaffold_key",
+        "family": "family_key",
+        "mutation": "mutation_group_key",
+        "source": "source_group_key",
+    }
+    key_name = grouping_map.get(grouping)
+    if key_name is None:
+        raise ValueError(f"Unsupported grouping mode: {grouping}")
+    if not items:
+        return SplitResult(), {
+            "mode": f"{grouping}_grouped",
+            "group_count": 0,
+            "representation_counts": {},
+            "biological_assumptions": [],
+        }
+
+    groups: dict[str, list[PairSplitItem]] = defaultdict(list)
+    for item in items:
+        group_key = str(getattr(item, key_name, "") or "").strip() or item.hard_group_key or item.item_id
+        groups[group_key].append(item)
+
+    log_fn(f"Grouped split mode '{grouping}': {len(items):,} rows -> {len(groups):,} groups.")
+
+    total_items = len(items)
+    train_target = int(total_items * train_frac)
+    val_target = int(total_items * val_frac)
+    target_sizes = {"train": train_target, "val": val_target, "test": total_items - train_target - val_target}
+    representation_counts_total: Counter[str] = Counter(item.representation_key for item in items)
+    split_repr_counts: dict[str, Counter[str]] = {
+        "train": Counter(),
+        "val": Counter(),
+        "test": Counter(),
+    }
+    split_sizes = {"train": 0, "val": 0, "test": 0}
+    result = SplitResult()
+
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda entry: (
+            -len(entry[1]),
+            hashlib.md5(f"{seed}:{entry[0]}".encode()).hexdigest(),
+            entry[0],
+        ),
+    )
+
+    def _group_score(split_name: str, rows: list[PairSplitItem]) -> tuple[float, float, str]:
+        size_after = split_sizes[split_name] + len(rows)
+        size_target = max(target_sizes[split_name], 1)
+        size_penalty = size_after / size_target
+
+        repr_penalty = 0.0
+        group_repr = Counter(row.representation_key for row in rows)
+        for rep_key, count in group_repr.items():
+            total_for_key = max(representation_counts_total.get(rep_key, 1), 1)
+            after = split_repr_counts[split_name][rep_key] + count
+            target = max(int(round(total_for_key * (target_sizes[split_name] / max(total_items, 1)))), 1)
+            repr_penalty += after / target
+        return (size_penalty, repr_penalty, split_name)
+
+    for _, rows in ordered_groups:
+        split_name = min(
+            ("train", "val", "test"),
+            key=lambda name: _group_score(name, rows),
+        )
+        getattr(result, split_name).extend(row.item_id for row in rows)
+        split_sizes[split_name] += len(rows)
+        split_repr_counts[split_name].update(row.representation_key for row in rows)
+
+    assumptions = {
+        "scaffold": [
+            "Ligand grouping uses InChIKey, SMILES, or ligand-id proxies already present in the training corpus.",
+            "This is a conservative ligand-identity split, not a chemistry-toolkit Murcko scaffold split.",
+        ],
+        "family": [
+            "Family grouping uses exact receptor identity proxies from UniProt IDs or extracted receptor sequences.",
+            "It reduces receptor-identity leakage but does not replace curated homology-family annotations.",
+        ],
+        "mutation": [
+            "Mutation grouping uses the exact parsed mutation token within a receptor/partner family.",
+            "It is intended to keep wildtype and specific mutation-series leakage under control.",
+        ],
+        "source": [
+            "Source grouping uses the preferred assay/source database assigned during merge.",
+            "It reduces source-specific leakage but does not normalize away all protocol differences within a source.",
+        ],
+    }
+    metadata = {
+        "mode": f"{grouping}_grouped",
+        "group_count": len(groups),
+        "representation_counts": dict(representation_counts_total),
+        "targets": target_sizes,
+        "biological_assumptions": assumptions[grouping],
+    }
+    return result, metadata
+
+
+def build_temporal_pair_splits(
+    items: list[PairSplitItem],
+    *,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+    seed: int = 42,
+    log_fn: object = print,
+) -> tuple[SplitResult, dict[str, object]]:
+    """Chronological split by entry release date.
+
+    Assumptions:
+    - Uses extracted RCSB entry release dates already present in the workspace.
+    - Older released structures go to train first, then validation, then test.
+    - Missing dates are treated as latest/unknown and pushed to the back so they
+      do not silently contaminate earlier chronological partitions.
+    """
+    _validate_split_fractions(train_frac, val_frac)
+    if not items:
+        return SplitResult(), {
+            "mode": "time_ordered",
+            "dated_item_count": 0,
+            "undated_item_count": 0,
+            "biological_assumptions": [],
+        }
+
+    total = len(items)
+    train_target = int(total * train_frac)
+    val_target = int(total * val_frac)
+    sorted_items = sorted(
+        items,
+        key=lambda item: (
+            str(item.release_date or "9999-12-31"),
+            hashlib.md5(f"{seed}:{item.item_id}".encode()).hexdigest(),
+            item.item_id,
+        ),
+    )
+    dated_count = sum(1 for item in sorted_items if item.release_date)
+    undated_count = total - dated_count
+    log_fn(
+        f"Temporal split: {dated_count:,} dated items, {undated_count:,} undated items "
+        f"(older releases assigned to train first)."
+    )
+
+    result = SplitResult()
+    result.train.extend(item.item_id for item in sorted_items[:train_target])
+    result.val.extend(item.item_id for item in sorted_items[train_target:train_target + val_target])
+    result.test.extend(item.item_id for item in sorted_items[train_target + val_target:])
+    metadata = {
+        "mode": "time_ordered",
+        "dated_item_count": dated_count,
+        "undated_item_count": undated_count,
+        "biological_assumptions": [
+            "Temporal grouping uses extracted RCSB release dates already present in the workspace.",
+            "Undated items are treated conservatively as latest/unknown and pushed to later partitions.",
+        ],
     }
     return result, metadata
 

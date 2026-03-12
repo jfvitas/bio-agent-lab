@@ -10,6 +10,7 @@ from pbdata.pipeline.feature_execution import run_feature_pipeline, export_analy
 from pbdata.pipeline.physics_feedback import (
     ingest_external_analysis_results,
     load_latest_site_physics_surrogate,
+    torch,
     train_site_physics_surrogate,
 )
 from pbdata.storage import build_storage_layout
@@ -123,9 +124,14 @@ def test_train_site_physics_surrogate_and_load_latest() -> None:
     assert Path(result["checkpoint"]).exists()
     manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
     assert manifest["status"] == "trained"
+    expected_family = "geometry_aware_mlp_surrogate" if torch is not None else "geometry_sensitive_linear_surrogate"
+    assert manifest["model_family"] == expected_family
+    assert manifest["geometry_feature_count"] >= 1
     model = load_latest_site_physics_surrogate(layout)
     assert model is not None
-    assert model["version"] == "site_physics_surrogate_v1"
+    assert model["version"] == "site_physics_surrogate_v1_1"
+    assert model["model_family"] == expected_family
+    assert any(str(column).startswith("geometry.") for column in model["feature_columns"])
 
 
 def test_cli_ingest_and_train_site_physics_surrogate() -> None:
@@ -157,3 +163,55 @@ def test_cli_ingest_and_train_site_physics_surrogate() -> None:
     assert ingest_result.exit_code == 0
     assert train_result.exit_code == 0
     assert (layout.surrogate_training_artifacts_dir / "sur1" / "surrogate_manifest.json").exists()
+
+
+def test_surrogate_prediction_accepts_geometry_features() -> None:
+    from pbdata.pipeline.physics_feedback import predict_site_physics_from_surrogate
+
+    if torch is None:
+        model = {
+            "feature_columns": ["geometry.neighbor_site_count", "geometry.mean_site_distance"],
+            "motif_classes": ["asp_carboxylate_oxygen"],
+            "target_columns": ["electrostatic_potential"],
+            "model_family": "geometry_sensitive_linear_surrogate",
+            "weights": [
+                [0.5],
+                [0.25],
+                [1.0],
+                [0.1],
+            ],
+        }
+        result = predict_site_physics_from_surrogate(
+            model,
+            motif_class="asp_carboxylate_oxygen",
+            feature_values={
+                "geometry.neighbor_site_count": 2.0,
+                "geometry.mean_site_distance": 4.0,
+            },
+        )
+        assert round(float(result["electrostatic_potential"]), 6) == 3.1
+        return
+
+    linear = torch.nn.Linear(4, 1)
+    with torch.no_grad():
+        linear.weight.copy_(torch.tensor([[0.5, 0.25, 1.0, 0.1]], dtype=torch.float32))
+        linear.bias.copy_(torch.tensor([0.0], dtype=torch.float32))
+    model = {
+        "feature_columns": ["geometry.neighbor_site_count", "geometry.mean_site_distance"],
+        "motif_classes": ["asp_carboxylate_oxygen"],
+        "target_columns": ["electrostatic_potential"],
+        "model_family": "geometry_aware_mlp_surrogate",
+        "input_mean": [0.0, 0.0, 0.0, 0.0],
+        "input_std": [1.0, 1.0, 1.0, 1.0],
+        "hidden_dim": 4,
+        "state_dict": linear.state_dict(),
+    }
+    result = predict_site_physics_from_surrogate(
+        model,
+        motif_class="asp_carboxylate_oxygen",
+        feature_values={
+            "geometry.neighbor_site_count": 2.0,
+            "geometry.mean_site_distance": 4.0,
+        },
+    )
+    assert round(float(result["electrostatic_potential"]), 6) == 3.1

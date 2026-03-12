@@ -71,6 +71,11 @@ def test_string_fetch_interactions(mock_post: MagicMock) -> None:
         assert edge.source_database == "STRING"
         assert edge.evidence_score is not None
         assert edge.evidence_score >= 0.4
+        assert edge.provenance is not None
+        assert edge.provenance["source"] == "STRING"
+        assert edge.provenance["source_record_key"].startswith("string_ppi:")
+        assert edge.provenance["extraction_method"] == "string_network_api_normalization"
+        assert "retrieved_at" in edge.provenance
 
     # Check canonical ordering (sorted node IDs)
     for edge in edges:
@@ -189,6 +194,10 @@ def test_reactome_fetch_pathways(mock_get: MagicMock) -> None:
         assert edge.source_database == "Reactome"
         assert edge.source_node_id == "protein:P04637"
         assert edge.target_node_id.startswith("pathway:")
+        assert edge.provenance is not None
+        assert edge.provenance["source"] == "Reactome"
+        assert edge.provenance["source_record_key"].startswith("P04637:R-HSA-")
+        assert edge.provenance["extraction_method"] == "reactome_content_service_membership_lookup"
 
 
 @patch("pbdata.graph.connectors.requests.get")

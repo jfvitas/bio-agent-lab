@@ -24,6 +24,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,22 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 60
 _DELAY = 0.25
+
+
+def _edge_provenance(
+    *,
+    source: str,
+    confidence: str,
+    source_record_key: str,
+    extraction_method: str,
+) -> dict[str, str]:
+    return {
+        "source": source,
+        "confidence": confidence,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_record_key": source_record_key,
+        "extraction_method": extraction_method,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +199,12 @@ class STRINGConnector:
                     "string_id_a": string_a,
                     "string_id_b": string_b,
                 },
+                provenance=_edge_provenance(
+                    source="STRING",
+                    confidence="high" if score >= 900 else "medium",
+                    source_record_key=edge_id,
+                    extraction_method="string_network_api_normalization",
+                ),
             ))
 
         return nodes, edges
@@ -251,6 +274,12 @@ class ReactomeConnector:
                         "pathway_id": pathway_id,
                         "pathway_name": pathway_name,
                     },
+                    provenance=_edge_provenance(
+                        source="Reactome",
+                        confidence="medium",
+                        source_record_key=f"{uniprot_id}:{pathway_id}",
+                        extraction_method="reactome_content_service_membership_lookup",
+                    ),
                 ))
 
         return list(pathway_nodes.values()), list(edges.values())
@@ -424,6 +453,12 @@ class BioGRIDConnector:
                     "experimental_system": exp_system,
                     "pubmed_id": pubmed,
                 },
+                provenance=_edge_provenance(
+                    source="BioGRID",
+                    confidence="medium",
+                    source_record_key=biogrid_id or edge_id,
+                    extraction_method="biogrid_interaction_api_normalization",
+                ),
             ))
 
         return nodes, edges

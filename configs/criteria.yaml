@@ -8,13 +8,18 @@ experimental_methods:
 max_resolution_angstrom: 3.0
 task_types:
 - protein_protein
-membrane_only: false
+membrane_only: true
 require_multimer: false
 require_protein: true
 require_ligand: false
+require_branched_entities: false
 min_protein_entities: null
 min_nonpolymer_entities: null
 max_nonpolymer_entities: null
+min_branched_entities: null
+max_branched_entities: null
+min_assembly_count: null
+max_assembly_count: null
 max_deposited_atom_count: null
 min_release_year: null
 max_release_year: null

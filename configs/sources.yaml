@@ -1,6 +1,4 @@
 sources:
-  rcsb:
-    enabled: true
   bindingdb:
     enabled: false
     extra: {}
@@ -12,6 +10,11 @@ sources:
   pdbbind:
     enabled: false
     extra: {}
+  rcsb:
+    enabled: true
+    extra:
+      structure_mirror: rcsb
   skempi:
     enabled: false
     extra: {}
+storage_root: C:\Users\jfvit\documents\bio-agent-lab

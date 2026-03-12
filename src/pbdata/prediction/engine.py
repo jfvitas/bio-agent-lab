@@ -22,6 +22,8 @@ from pbdata.models.baseline_memory import (
     predict_with_ligand_memory_model,
     score_query_context_against_target_profile,
 )
+from pbdata.models.tabular_affinity import predict_with_tabular_affinity_model
+from pbdata.model_comparison import build_model_comparison_report
 from pbdata.schemas.prediction_input import PredictionInputRecord
 from pbdata.storage import StorageLayout
 
@@ -239,6 +241,18 @@ def _detect_input_type(
     raise ValueError("One input is required: smiles, sdf, structure_file, or fasta")
 
 
+def _preferred_ligand_screening_model(layout: StorageLayout) -> str:
+    report = build_model_comparison_report(layout)
+    status = str(report.get("status") or "missing_models")
+    available = report.get("available_models") or {}
+    val = (report.get("splits") or {}).get("val") or {}
+    if status == "comparison_ready" and str(val.get("winner") or "") == "tabular_affinity":
+        return "tabular_affinity"
+    if not available.get("baseline_ready") and available.get("tabular_ready"):
+        return "tabular_affinity"
+    return "ligand_memory_baseline"
+
+
 def run_ligand_screening_workflow(
     layout: StorageLayout,
     *,
@@ -256,22 +270,41 @@ def run_ligand_screening_workflow(
     )
     pair_rows = _pair_rows_for_prediction(layout)
     query_smiles = str(smiles or "")
+    query_numeric_features = (
+        _query_numeric_features_from_structure(structure_file)
+        if structure_file
+        else None
+    )
+    preferred_model = _preferred_ligand_screening_model(layout)
     model_info = None
     ranked_targets: list[dict[str, Any]] = []
-    if query_smiles:
+    selected_model = "baseline_heuristic"
+    if query_smiles and preferred_model == "tabular_affinity":
+        model_info, ranked_targets = predict_with_tabular_affinity_model(
+            layout,
+            query_smiles=query_smiles,
+            query_numeric_features=query_numeric_features,
+        )
+        if ranked_targets:
+            selected_model = "tabular_affinity"
+    if query_smiles and not ranked_targets:
         model_info, ranked_targets = predict_with_ligand_memory_model(layout, query_smiles=query_smiles)
+        if ranked_targets:
+            selected_model = "ligand_memory_baseline"
     if not ranked_targets:
         ranked_rows = _rank_target_rows(layout, query_smiles, pair_rows) if query_smiles else []
         ranked_targets = _aggregate_targets(ranked_rows)
+        if ranked_targets:
+            selected_model = "baseline_heuristic"
     graph_ready = (layout.graph_dir / "graph_nodes.json").exists() and (layout.graph_dir / "graph_edges.json").exists()
     coverage_ready = (layout.root / "scientific_coverage_summary.json").exists()
     top_target = ranked_targets[0] if ranked_targets else None
-    using_trained_model = model_info is not None and bool(ranked_targets)
+    using_trained_model = selected_model in {"ligand_memory_baseline", "tabular_affinity"} and bool(ranked_targets)
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": (
-            "trained_baseline_predictions_generated"
+            "trained_supervised_predictions_generated"
             if using_trained_model
             else "baseline_heuristic_predictions_generated"
         ) if ranked_targets else "no_candidate_predictions_available",
@@ -285,24 +318,46 @@ def run_ligand_screening_workflow(
         "pathway_context_available": graph_ready and coverage_ready,
         "predicted_kd": top_target["predicted_kd_nM"] if top_target else None,
         "predicted_delta_g": top_target["predicted_delta_g_proxy"] if top_target else None,
-        "binding_probability": top_target["ligand_similarity"] if top_target else None,
+        "binding_probability": (
+            top_target.get("ligand_similarity")
+            if top_target and top_target.get("ligand_similarity") is not None
+            else (top_target.get("confidence_score") if top_target else None)
+        ),
         "confidence_score": top_target["confidence_score"] if top_target else None,
-        "prediction_method": (
-            "trained_ligand_memory_model"
-            if using_trained_model
-            else "baseline_heuristic_similarity_affinity_proxy"
-        ),
+        "prediction_method": {
+            "tabular_affinity": "trained_tabular_affinity_model",
+            "ligand_memory_baseline": "trained_ligand_memory_model",
+            "baseline_heuristic": "baseline_heuristic_similarity_affinity_proxy",
+        }.get(selected_model, "baseline_heuristic_similarity_affinity_proxy"),
+        "selected_model_preference": preferred_model,
         "model_artifact_path": (
-            str(layout.models_dir / "ligand_memory_model.json")
-            if using_trained_model
-            else None
+            str(layout.models_dir / "tabular_affinity_model.json")
+            if selected_model == "tabular_affinity"
+            else (
+                str(layout.models_dir / "ligand_memory_model.json")
+                if selected_model == "ligand_memory_baseline"
+                else None
+            )
         ),
-        "notes": (
+        "query_numeric_feature_count": len(query_numeric_features or {}),
+    }
+    if selected_model == "tabular_affinity":
+        manifest["notes"] = (
+            "Predictions use the supervised tabular affinity model because current validation-time "
+            "comparison artifacts prefer it over the ligand-memory baseline. The model reuses known "
+            "target-context templates from training examples and remains a conservative early supervised surface."
+        )
+    elif selected_model == "ligand_memory_baseline":
+        manifest["notes"] = (
             "Predictions use a split-aware ligand-memory baseline when a trained model artifact "
             "is available; otherwise they fall back to a heuristic over ligand-string similarity, "
             "observed assay strength, and source-quality penalties."
-        ),
-    }
+        )
+    else:
+        manifest["notes"] = (
+            "Predictions fall back to a heuristic over ligand-string similarity, observed assay "
+            "strength, and source-quality penalties because no preferred trained model path was available."
+        )
 
     out_dir = layout.prediction_dir / "ligand_screening"
     out_dir.mkdir(parents=True, exist_ok=True)

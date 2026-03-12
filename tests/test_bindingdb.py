@@ -1,10 +1,13 @@
 import json
 from pathlib import Path
 from uuid import uuid4
+from unittest.mock import Mock, patch
+
+import requests
 
 from pbdata.cli import _fetch_bindingdb_samples_for_pdb
 from pbdata.config import AppConfig, SourceConfig, SourcesConfig
-from pbdata.sources.bindingdb import _parse_affinity, _parse_monomer
+from pbdata.sources.bindingdb import BindingDBAdapter, _parse_affinity, _parse_monomer
 from pbdata.storage import build_storage_layout
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
@@ -90,3 +93,19 @@ def test_fetch_bindingdb_samples_prefers_local_cache_dir() -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["mode"] == "local_cache"
     assert state["record_count"] == 1
+
+
+def test_bindingdb_adapter_retries_transient_failure() -> None:
+    transient = requests.HTTPError("busy")
+    transient.response = Mock(status_code=503)
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"pdb_id": "1ABC", "monomers": []}
+
+    with patch("pbdata.sources.bindingdb.requests.get", side_effect=[transient, response]), patch(
+        "pbdata.sources.bindingdb.time.sleep",
+        return_value=None,
+    ):
+        payload = BindingDBAdapter().fetch_metadata("1ABC")
+
+    assert payload["pdb_id"] == "1ABC"

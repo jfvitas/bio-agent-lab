@@ -137,6 +137,42 @@ def test_feature_pipeline_cli_and_analysis_queue_export() -> None:
     assert batch_manifest["motif_class_count"] >= 1
 
 
+def test_export_analysis_queue_cli_uses_latest_run_when_run_id_omitted() -> None:
+    tmp_root = _tmp_dir("site_feature_pipeline_latest_run")
+    layout = build_storage_layout(tmp_root)
+    _write_extracted_fixture(layout)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "run-feature-pipeline", "--run-id", "latest_queue_run", "--degraded-mode"],
+        catch_exceptions=False,
+    )
+    queue_result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "export-analysis-queue"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert queue_result.exit_code == 0
+    assert "Feature pipeline run id: latest_queue_run" in queue_result.stdout
+
+
+def test_export_analysis_queue_cli_requires_run_id_without_prior_runs() -> None:
+    tmp_root = _tmp_dir("site_feature_pipeline_no_runs")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "export-analysis-queue"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert "Error: --run-id is required until at least one site-centric feature run exists." in result.stdout
+
+
 def test_run_feature_pipeline_uses_surrogate_when_not_degraded() -> None:
     from pbdata.pipeline.physics_feedback import ingest_external_analysis_results, train_site_physics_surrogate
 
@@ -177,3 +213,41 @@ def test_run_feature_pipeline_uses_surrogate_when_not_degraded() -> None:
     site_refined = read_dataframe(layout.site_physics_artifacts_dir / "surrogate_run" / "1ABC.site_refined.parquet")
     assert not site_refined.empty
     assert bool(site_refined.iloc[0]["degraded_mode"]) is False
+
+
+def test_run_feature_pipeline_stage_only_uses_extracted_stage_registry() -> None:
+    tmp_root = _tmp_dir("site_feature_pipeline_stage_only")
+    layout = build_storage_layout(tmp_root)
+    _write_extracted_fixture(layout)
+
+    stage1_result = run_feature_pipeline(
+        layout,
+        run_mode="stage_only",
+        stage_only="canonical_input_resolution",
+        run_id="stageonly",
+        degraded_mode=True,
+    )
+    stage2_result = run_feature_pipeline(
+        layout,
+        run_mode="stage_only",
+        stage_only="structure_preparation",
+        run_id="stageonly",
+        degraded_mode=True,
+    )
+
+    assert stage1_result["stage_statuses"] == {"canonical_input_resolution": "passed"}
+    assert stage2_result["stage_statuses"] == {"structure_preparation": "passed"}
+    assert (layout.prepared_structures_artifacts_dir / "stageonly" / "1ABC.sites.parquet").exists()
+
+
+def test_run_feature_pipeline_resume_reuses_passed_stage_statuses() -> None:
+    tmp_root = _tmp_dir("site_feature_pipeline_resume")
+    layout = build_storage_layout(tmp_root)
+    _write_extracted_fixture(layout)
+
+    first_result = run_feature_pipeline(layout, run_id="resume_run", degraded_mode=True)
+    resume_result = run_feature_pipeline(layout, run_id="resume_run", run_mode="resume", degraded_mode=True)
+
+    assert first_result["stage_statuses"]["canonical_input_resolution"] == "passed"
+    assert resume_result["stage_statuses"]["canonical_input_resolution"] == "skipped"
+    assert resume_result["stage_statuses"]["validation_reporting_export"] == "skipped"

@@ -1,8 +1,25 @@
 split_strategies:
-  - random
-  - sequence_cluster
-  - time_split
-  - source_split
-  - scaffold_split
-  - family_split
-  - mutation_split
+  - name: random
+    status: implemented
+    cli_mode: hash
+  - name: sequence_cluster
+    status: implemented
+    cli_mode: legacy-sequence
+  - name: pair_aware_grouped
+    status: implemented
+    cli_mode: pair-aware
+  - name: time_split
+    status: implemented
+    cli_mode: time
+  - name: source_split
+    status: implemented
+    cli_mode: source
+  - name: scaffold_split
+    status: implemented
+    cli_mode: scaffold
+  - name: family_split
+    status: implemented
+    cli_mode: family
+  - name: mutation_split
+    status: implemented
+    cli_mode: mutation

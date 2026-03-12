@@ -10,6 +10,7 @@ import pandas as pd
 
 
 def write_dataframe(df: pd.DataFrame, path: Path) -> Path:
+    """Write a dataframe to parquet, or JSON-lines when parquet support is unavailable."""
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         df.to_parquet(path, index=False)
@@ -22,6 +23,7 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> Path:
 
 
 def read_dataframe(path: Path) -> pd.DataFrame:
+    """Read a dataframe from parquet, or JSON-lines fallback if needed."""
     try:
         return pd.read_parquet(path)
     except Exception:

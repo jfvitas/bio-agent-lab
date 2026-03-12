@@ -1,6 +1,7 @@
 """Shared pytest fixtures for pbdata tests."""
 
 from pathlib import Path
+import shutil
 
 import pytest
 import yaml
@@ -39,3 +40,12 @@ def sources_config_path() -> Path:
 def logging_config_path() -> Path:
     """Path to the canonical logging YAML config."""
     return _CONFIGS_DIR / "logging.yaml"
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Remove transient per-test artifacts created under tests/_tmp."""
+    for child in _LOCAL_TMP.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)

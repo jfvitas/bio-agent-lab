@@ -45,6 +45,13 @@ _METALLO_COFACTOR_COMP_IDS: frozenset[str] = frozenset({
 _ALKALI_COUNTERION_COMP_IDS: frozenset[str] = frozenset({"LI", "NA", "K", "RB", "CS"})
 
 
+def _is_cofactor_like(bound_object: dict[str, object]) -> bool:
+    return (
+        bound_object.get("binder_type") == "cofactor"
+        or bound_object.get("role") == "cofactor"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Data-quality flag computation
 # ---------------------------------------------------------------------------
@@ -141,7 +148,7 @@ def compute_flags(record: CanonicalBindingSample) -> list[str]:
         flags.append("metal_mediated_binding_possible")
 
     # Cofactors (biochemical)
-    if any(b.get("binder_type") == "cofactor" for b in bound_objects):
+    if any(_is_cofactor_like(b) for b in bound_objects):
         flags.append("cofactor_present")
 
     # Glycans

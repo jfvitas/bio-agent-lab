@@ -244,7 +244,9 @@ def engineer_dataset(
     metadata_path = layout.workspace_metadata_dir / "protein_metadata.csv"
     rows = _read_csv_rows(metadata_path)
     if not rows:
-        raise ValueError(f"No metadata rows found at {metadata_path}. Run metadata harvest first.")
+        raise ValueError(
+            f"No metadata rows found at {metadata_path}. Run 'harvest-metadata' first."
+        )
 
     backend = _embedding_backend_name(config.embedding_backend)
     vectors = [_row_embedding(row, backend=backend if backend != "esm_unavailable" else "fallback") for row in rows]

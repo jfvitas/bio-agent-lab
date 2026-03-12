@@ -225,7 +225,10 @@ def extract_rcsb_entry(
 
     # ── Bias flags ───────────────────────────────────────────────────
     has_metal = any(b.binder_type == "metal_ion" for b in bound_objects_typed)
-    has_cofactor = any(b.binder_type == "cofactor" for b in bound_objects_typed)
+    has_cofactor = any(
+        b.binder_type == "cofactor" or b.role == "cofactor"
+        for b in bound_objects_typed
+    )
     has_glycan = any(b.binder_type == "glycan" for b in bound_objects_typed)
     has_covalent = any(b.covalent_warhead_flag for b in bound_objects_typed)
     has_peptide = bool(peptide_entities) or any(

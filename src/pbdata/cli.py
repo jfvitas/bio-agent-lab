@@ -1,28 +1,39 @@
 import json
 import logging
 import os
-import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from collections import Counter
 from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 
+from pbdata.cli_reporting import (
+    emit_labeled_values,
+    render_demo_readiness_report,
+    render_doctor_report,
+    render_status_report,
+)
 from pbdata.config import AppConfig, load_config
 from pbdata.logging_config import setup_logging
-from pbdata.pairing import chain_group_key, parse_pair_identity_key
+from pbdata.pairing import parse_pair_identity_key
+from pbdata.pipeline.canonical_workflows import (
+    run_audit_processed_records,
+    run_normalize_rcsb,
+    run_processed_report,
+    run_rcsb_ingest,
+    run_skempi_ingest,
+)
 from pbdata.source_state import write_source_state
 from pbdata.stage_state import write_stage_state
 from pbdata.storage import (
     StorageLayout,
     build_storage_layout,
-    reuse_existing_file,
-    validate_bindingdb_raw_json,
-    validate_rcsb_raw_json,
-    validate_skempi_csv,
+)
+from pbdata.workspace_state import (
+    build_demo_readiness_report as build_demo_readiness_state_report,
+    build_doctor_report as build_doctor_state_report,
+    build_status_report as build_status_state_report,
 )
 
 app = typer.Typer(help="Protein binding dataset platform CLI.")
@@ -49,6 +60,26 @@ def _coerce_workers(workers: int) -> int:
     if workers <= 0:
         return max(os.cpu_count() or 1, 1)
     return workers
+
+
+def _resolve_latest_feature_pipeline_run_id(layout: StorageLayout, explicit_run_id: Optional[str]) -> str:
+    if explicit_run_id:
+        return explicit_run_id
+    manifests = sorted(
+        layout.artifact_manifests_dir.glob("*_input_manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not manifests:
+        typer.echo("Error: --run-id is required until at least one site-centric feature run exists.")
+        raise typer.Exit(code=1)
+    return manifests[0].name.replace("_input_manifest.json", "")
+
+
+def _emit_feature_workflow_output(layout: StorageLayout, items: list[tuple[str, object]]) -> None:
+    typer.echo(f"Storage root: {layout.root}")
+    for label, value in items:
+        typer.echo(f"{label}: {value}")
 
 
 def _is_up_to_date(source_path: Path, output_path: Path) -> bool:
@@ -134,6 +165,10 @@ def _load_table_rows(table_dir: Path) -> list[dict]:
     return rows
 
 
+def _count_extracted_assay_rows(extracted_dir: Path) -> int:
+    return len(_load_table_rows(extracted_dir / "assays"))
+
+
 def _load_external_assay_samples(
     config: AppConfig,
     *,
@@ -203,10 +238,12 @@ def _fetch_chembl_samples_for_raw(
     raw: dict,
     chem_descriptors: dict[str, dict[str, str]],
     config: AppConfig,
+    *,
+    layout: StorageLayout | None = None,
 ) -> list:
     from pbdata.pipeline.enrichment import fetch_chembl_samples_for_raw
 
-    return fetch_chembl_samples_for_raw(raw, chem_descriptors, config)
+    return fetch_chembl_samples_for_raw(raw, chem_descriptors, config, layout=layout)
 
 
 def _count_delimited_rows(path: Path, delimiter: str = ",") -> int | None:
@@ -216,6 +253,19 @@ def _count_delimited_rows(path: Path, delimiter: str = ",") -> int | None:
         return max(len(lines) - 1, 0)
     except OSError:
         return None
+
+
+def _emit_planned_manifest_notice(
+    *,
+    artifact_label: str,
+    manifest_path: Path,
+    missing_steps: list[str],
+) -> None:
+    typer.echo(f"Storage root: {manifest_path.parents[2] if len(manifest_path.parents) >= 3 else manifest_path.parent}")
+    typer.echo(f"{artifact_label} manifest written to {manifest_path}")
+    typer.echo("Prerequisites missing; wrote a planned manifest only.")
+    for step in missing_steps:
+        typer.echo(f"  - {step}")
 
 
 @app.callback()
@@ -299,119 +349,53 @@ def ingest(
       skempi  — SKEMPI v2: download the full mutation-ddG CSV
     """
     source_lower = source.lower()
+    layout = _storage_layout(ctx)
 
     if source_lower == "rcsb":
-        _ingest_rcsb(ctx, dry_run=dry_run, yes=yes, criteria=criteria, output=output)
+        criteria_path = criteria if criteria is not None else _DEFAULT_CRITERIA
+        probe = run_rcsb_ingest(
+            layout=layout,
+            criteria_path=criteria_path,
+            dry_run=True,
+            output_dir=output,
+            log_fn=typer.echo,
+        )
+        typer.echo(f"Found {probe.match_count:,} RCSB entries matching criteria.")
+        if dry_run:
+            return
+        if not yes:
+            typer.confirm(f"Proceed with downloading {probe.match_count:,} entries?", abort=True)
+        run_rcsb_ingest(
+            layout=layout,
+            criteria_path=criteria_path,
+            dry_run=False,
+            output_dir=output,
+            log_fn=typer.echo,
+        )
+        typer.echo("RCSB ingest complete.")
     elif source_lower == "skempi":
-        _ingest_skempi(ctx, dry_run=dry_run, yes=yes, output=output)
+        cached_probe = run_skempi_ingest(layout=layout, dry_run=True, output_dir=output)
+        if cached_probe.status == "cached":
+            typer.echo(f"SKEMPI CSV already present at {cached_probe.csv_path}.  Skipping download.")
+            return
+        typer.echo("SKEMPI v2 will be downloaded from https://life.bsc.es/pid/skempi2/database/download/SKEMPI2_PDBs.tgz")
+        typer.echo("File size is approximately 3 MB.")
+        if dry_run:
+            typer.echo("[dry-run] Would download SKEMPI CSV - skipping.")
+            return
+        if not yes:
+            typer.confirm("Proceed with downloading SKEMPI v2 CSV?", abort=True)
+        result = run_skempi_ingest(layout=layout, dry_run=False, output_dir=output)
+        typer.echo(f"SKEMPI CSV saved to {result.csv_path}")
+        if result.catalog_path is not None:
+            typer.echo(f"Download manifest updated at {result.catalog_path}")
+        typer.echo("Run 'extract' with SKEMPI enabled to merge mutation-ddG assays into extracted tables.")
     else:
         typer.echo(
             f"Unknown source: '{source}'.  Supported: rcsb, skempi.",
             err=True,
         )
         raise typer.Exit(code=1)
-
-
-def _ingest_rcsb(
-    ctx: typer.Context,
-    *,
-    dry_run: bool,
-    yes: bool,
-    criteria: Optional[Path],
-    output: Optional[Path],
-) -> None:
-    from pbdata.criteria import load_criteria
-    from pbdata.sources.rcsb_search import count_entries, search_and_download
-
-    criteria_path = criteria if criteria is not None else _DEFAULT_CRITERIA
-    sc = load_criteria(criteria_path)
-
-    logger.info("Querying RCSB Search API...")
-    count = count_entries(sc)
-    typer.echo(f"Found {count:,} RCSB entries matching criteria.")
-
-    if dry_run:
-        return
-
-    if not yes:
-        typer.confirm(f"Proceed with downloading {count:,} entries?", abort=True)
-
-    layout = _storage_layout(ctx)
-    out_dir = output if output is not None else layout.raw_rcsb_dir
-    search_and_download(sc, out_dir, log_fn=typer.echo, manifest_path=layout.catalog_path)
-    typer.echo("RCSB ingest complete.")
-
-
-def _ingest_skempi(
-    ctx: typer.Context,
-    *,
-    dry_run: bool,
-    yes: bool,
-    output: Optional[Path],
-) -> None:
-    import requests
-
-    from pbdata.catalog import summarize_bulk_file, update_download_manifest
-    from pbdata.sources.skempi import _SKEMPI_URL
-
-    layout = _storage_layout(ctx)
-    out_dir = output if output is not None else layout.raw_skempi_dir
-    csv_path = out_dir / "skempi_v2.csv"
-    downloaded_at = datetime.now(timezone.utc).isoformat()
-
-    if reuse_existing_file(csv_path, validator=validate_skempi_csv):
-        typer.echo(f"SKEMPI CSV already present at {csv_path}.  Skipping download.")
-        row_count = _count_delimited_rows(csv_path, delimiter=";")
-        update_download_manifest([
-            summarize_bulk_file(
-                source_database="SKEMPI",
-                source_record_id="SKEMPI_V2",
-                raw_file_path=csv_path,
-                raw_format="csv",
-                downloaded_at=downloaded_at,
-                title="SKEMPI v2 mutation ddG dataset",
-                task_hint="mutation_ddg",
-                notes=f"rows={row_count}" if row_count is not None else "",
-                status="cached",
-            )
-        ], layout.catalog_path)
-        return
-
-    typer.echo(f"SKEMPI v2 will be downloaded from {_SKEMPI_URL}")
-    typer.echo("File size is approximately 3 MB.")
-
-    if dry_run:
-        typer.echo("[dry-run] Would download SKEMPI CSV — skipping.")
-        return
-
-    if not yes:
-        typer.confirm("Proceed with downloading SKEMPI v2 CSV?", abort=True)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    typer.echo("Downloading SKEMPI v2 CSV...")
-    resp = requests.get(_SKEMPI_URL, timeout=60)
-    resp.raise_for_status()
-    csv_path.write_text(resp.text, encoding="utf-8")
-    if not validate_skempi_csv(csv_path):
-        csv_path.unlink(missing_ok=True)
-        raise RuntimeError("Downloaded SKEMPI CSV failed validation and was removed.")
-    row_count = _count_delimited_rows(csv_path, delimiter=";")
-    update_download_manifest([
-        summarize_bulk_file(
-            source_database="SKEMPI",
-            source_record_id="SKEMPI_V2",
-            raw_file_path=csv_path,
-            raw_format="csv",
-            downloaded_at=downloaded_at,
-            title="SKEMPI v2 mutation ddG dataset",
-            task_hint="mutation_ddg",
-            notes=f"rows={row_count}" if row_count is not None else "",
-        )
-    ], layout.catalog_path)
-    typer.echo(f"SKEMPI CSV saved to {csv_path}")
-    typer.echo(f"Download manifest updated at {layout.catalog_path}")
-    typer.echo("Run 'normalize --source skempi' to convert to canonical records.")
-
 
 # ---------------------------------------------------------------------------
 # normalize
@@ -430,109 +414,19 @@ def normalize_cmd(
     Also fetches ligand SMILES / InChIKey from the RCSB chem-comp API for
     every unique ligand comp_id present in the raw records.
     """
-    from pbdata.sources.rcsb import RCSBAdapter
-    from pbdata.sources.rcsb_search import fetch_chemcomp_descriptors
-
     layout = _storage_layout(ctx)
-    raw_dir = layout.raw_rcsb_dir
-    out_dir = layout.processed_rcsb_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    files = sorted(raw_dir.glob("*.json"))
-    if not files:
-        typer.echo(f"No raw files found in {raw_dir}. Run 'ingest' first.")
-        return
-
-    # Collect all unique ligand comp_ids in one pass before normalizing
-    typer.echo(f"Scanning {len(files):,} RCSB records for ligand IDs...")
-    comp_ids: list[str] = []
-    raw_data: list[tuple[Path, dict]] = []
-    for f in files:
-        try:
-            raw = json.loads(f.read_text())
-            raw_data.append((f, raw))
-            for ent in (raw.get("nonpolymer_entities") or []):
-                cid = (
-                    ((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {})
-                    .get("id", "")
-                )
-                if cid:
-                    comp_ids.append(cid)
-        except Exception as exc:
-            logger.warning("Failed to read %s: %s", f.name, exc)
-
-    # Batch-fetch SMILES / InChIKey (best-effort)
-    chem_descriptors: dict[str, dict[str, str]] = {}
-    if comp_ids:
-        unique = list(dict.fromkeys(comp_ids))
-        typer.echo(f"Fetching chem-comp descriptors for {len(unique):,} unique ligands...")
-        try:
-            chem_descriptors = fetch_chemcomp_descriptors(unique)
-            typer.echo(f"  Got descriptors for {len(chem_descriptors):,} ligands.")
-        except Exception as exc:
-            logger.warning("Chem-comp fetch failed (SMILES will be absent): %s", exc)
-
-    typer.echo(f"Normalizing {len(raw_data):,} RCSB records...")
-    adapter = RCSBAdapter()
-    ok = cached = failed = 0
-    worker_count = _coerce_workers(workers)
-
-    def _normalize_one(item: tuple[Path, dict]) -> tuple[str, str]:
-        path, raw = item
-        out_path = out_dir / path.name
-        if reuse_existing_file(out_path, validator=_validate_processed_record) and _is_up_to_date(path, out_path):
-            return path.name, "cached"
-        out_path.unlink(missing_ok=True)
-        record = adapter.normalize_record(raw, chem_descriptors=chem_descriptors)
-        out_path.write_text(record.model_dump_json(indent=2))
-        return path.name, "ok"
-
-    if worker_count == 1:
-        for item in raw_data:
-            try:
-                _, status = _normalize_one(item)
-                if status == "cached":
-                    cached += 1
-                else:
-                    ok += 1
-            except Exception as exc:
-                logger.warning("Failed to normalize %s: %s", item[0].name, exc)
-                failed += 1
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {executor.submit(_normalize_one, item): item[0].name for item in raw_data}
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    _, status = future.result()
-                    if status == "cached":
-                        cached += 1
-                    else:
-                        ok += 1
-                except Exception as exc:
-                    logger.warning("Failed to normalize %s: %s", name, exc)
-                    failed += 1
-
-    state_path = write_stage_state(
-        layout,
-        stage="normalize",
-        status="completed" if failed == 0 else "completed_with_failures",
-        input_dir=raw_dir,
-        output_dir=out_dir,
-        workers=worker_count,
-        counts={
-            "inputs": len(raw_data),
-            "normalized": ok,
-            "cached": cached,
-            "failed": failed,
-        },
-        notes="Valid cached canonical records were reused when newer than their raw JSON source.",
+    result = run_normalize_rcsb(
+        layout=layout,
+        workers=workers,
+        progress_fn=typer.echo,
     )
-
-    typer.echo(f"Done. Normalized: {ok:,}, Cached: {cached:,}, Failed: {failed:,}")
+    if result is None:
+        typer.echo(f"No raw files found in {layout.raw_rcsb_dir}. Run 'ingest' first.")
+        return
+    typer.echo(f"Done. Normalized: {result.normalized:,}, Cached: {result.cached:,}, Failed: {result.failed:,}")
     typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Output: {out_dir}")
-    typer.echo(f"Stage state: {state_path}")
+    typer.echo(f"Output: {result.output_dir}")
+    typer.echo(f"Stage state: {result.state_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -548,92 +442,21 @@ def audit(
     ] = 1,
 ) -> None:
     """Score and flag all normalized records; write audit summary."""
-    from pbdata.quality.audit import audit_record
-    from pbdata.schemas.canonical_sample import CanonicalBindingSample
-
     layout = _storage_layout(ctx)
-    processed_dir = layout.processed_rcsb_dir
-    files = sorted(processed_dir.glob("*.json")) if processed_dir.exists() else []
-    if not files:
-        typer.echo(f"No processed records found in {processed_dir}. Run 'normalize' first.")
+    result = run_audit_processed_records(
+        layout=layout,
+        workers=workers,
+        progress_fn=typer.echo,
+    )
+    if result is None:
+        typer.echo(f"No processed records found in {layout.processed_rcsb_dir}. Run 'normalize' first.")
         return
 
-    typer.echo(f"Auditing {len(files):,} records...")
-    layout.audit_dir.mkdir(parents=True, exist_ok=True)
-
-    flag_counter: Counter[str] = Counter()
-    scores: list[float] = []
-    ok = failed = 0
-
-    worker_count = _coerce_workers(workers)
-
-    def _audit_one(path: Path) -> CanonicalBindingSample:
-        raw = json.loads(path.read_text())
-        record = CanonicalBindingSample.model_validate(raw)
-        audited = audit_record(record)
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        (processed_dir / path.name).write_text(audited.model_dump_json(indent=2))
-        return audited
-
-    if worker_count == 1:
-        for f in files:
-            try:
-                audited = _audit_one(f)
-                flag_counter.update(audited.quality_flags)
-                scores.append(audited.quality_score)
-                ok += 1
-            except Exception as exc:
-                logger.warning("Failed to audit %s: %s", f.name, exc)
-                failed += 1
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {executor.submit(_audit_one, f): f.name for f in files}
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    audited = future.result()
-                    flag_counter.update(audited.quality_flags)
-                    scores.append(audited.quality_score)
-                    ok += 1
-                except Exception as exc:
-                    logger.warning("Failed to audit %s: %s", name, exc)
-                    failed += 1
-
-    summary = {
-        "total": ok + failed,
-        "audited": ok,
-        "failed": failed,
-        "quality_score": {
-            "mean":   round(statistics.mean(scores), 4) if scores else 0,
-            "median": round(statistics.median(scores), 4) if scores else 0,
-            "min":    round(min(scores), 4) if scores else 0,
-            "max":    round(max(scores), 4) if scores else 0,
-        },
-        "flag_counts": dict(flag_counter.most_common()),
-    }
-
-    summary_path = layout.audit_dir / "audit_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
-    state_path = write_stage_state(
-        layout,
-        stage="audit",
-        status="completed" if failed == 0 else "completed_with_failures",
-        input_dir=processed_dir,
-        output_dir=layout.audit_dir,
-        workers=worker_count,
-        counts={
-            "inputs": len(files),
-            "audited": ok,
-            "failed": failed,
-        },
-        notes="Audit rewrites processed records in place and stores aggregate summaries separately.",
-    )
-
-    typer.echo(f"Audit complete. Mean quality score: {summary['quality_score']['mean']:.3f}")
-    typer.echo(f"Top flags: {dict(flag_counter.most_common(5))}")
+    typer.echo(f"Audit complete. Mean quality score: {result.mean_quality_score:.3f}")
+    typer.echo(f"Top flags: {result.top_flags}")
     typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Summary written to {summary_path}")
-    typer.echo(f"Stage state: {state_path}")
+    typer.echo(f"Summary written to {result.summary_path}")
+    typer.echo(f"Stage state: {result.state_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -643,124 +466,47 @@ def audit(
 @app.command()
 def report(ctx: typer.Context) -> None:
     """Generate a summary statistics report over all processed records."""
-    from pbdata.master_export import (
-        refresh_master_exports,
-    )
-    from pbdata.schemas.canonical_sample import CanonicalBindingSample
-
     layout = _storage_layout(ctx)
-    processed_dir = layout.processed_rcsb_dir
-    files = sorted(processed_dir.glob("*.json")) if processed_dir.exists() else []
-    if not files:
-        typer.echo(f"No processed records found in {processed_dir}. Run 'normalize' first.")
+    result = run_processed_report(layout=layout, progress_fn=typer.echo)
+    if result is None:
+        typer.echo(f"No processed records found in {layout.processed_rcsb_dir}. Run 'normalize' first.")
         return
 
-    typer.echo(f"Generating report for {len(files):,} records...")
-
-    task_counts:   Counter[str]         = Counter()
-    method_counts: Counter[str]         = Counter()
-    resolutions:   list[float]          = []
-    scores:        list[float]          = []
-    field_present: Counter[str]         = Counter()
-    OPTIONAL_FIELDS = [
-        "sequence_receptor", "sequence_partner", "chain_ids_receptor",
-        "uniprot_ids", "taxonomy_ids", "ligand_id", "ligand_smiles",
-        "experimental_method", "structure_resolution",
-    ]
-
-    failed = 0
-    for f in files:
-        try:
-            raw = json.loads(f.read_text())
-            rec = CanonicalBindingSample.model_validate(raw)
-            task_counts[rec.task_type] += 1
-            if rec.experimental_method:
-                method_counts[rec.experimental_method] += 1
-            if rec.structure_resolution is not None:
-                resolutions.append(rec.structure_resolution)
-            scores.append(rec.quality_score)
-            for field in OPTIONAL_FIELDS:
-                val = getattr(rec, field, None)
-                if val is not None and val != [] and val != "":
-                    field_present[field] += 1
-        except Exception as exc:
-            logger.warning("Skipping %s: %s", f.name, exc)
-            failed += 1
-
-    total = len(files) - failed
-
-    def _pct(n: int) -> float:
-        return round(100 * n / total, 1) if total else 0.0
-
-    def _res_stats(vals: list[float]) -> dict:
-        if not vals:
-            return {}
-        qs = statistics.quantiles(vals, n=4)
-        return {
-            "count":  len(vals),
-            "mean":   round(statistics.mean(vals), 2),
-            "median": round(statistics.median(vals), 2),
-            "q1":     round(qs[0], 2),
-            "q3":     round(qs[2], 2),
-            "min":    round(min(vals), 2),
-            "max":    round(max(vals), 2),
-        }
-
-    rep = {
-        "total_records":    total,
-        "parse_failures":   failed,
-        "task_type_counts": dict(task_counts),
-        "experimental_method_counts": dict(method_counts.most_common(10)),
-        "resolution_angstrom": _res_stats(resolutions),
-        "quality_score": _res_stats(scores),
-        "field_coverage_pct": {
-            f: _pct(field_present[f]) for f in OPTIONAL_FIELDS
-        },
-    }
-
-    layout.reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = layout.reports_dir / "summary.json"
-    report_path.write_text(json.dumps(rep, indent=2))
-    export_status = refresh_master_exports(layout)
-
-    typer.echo(f"\n{'─'*40}")
-    typer.echo(f"Total records   : {total:,}")
-    typer.echo(f"Task types      : {dict(task_counts)}")
-    typer.echo(f"Methods         : {dict(method_counts.most_common(3))}")
-    if resolutions:
-        typer.echo(f"Resolution (Å)  : mean={statistics.mean(resolutions):.2f}  "
-                   f"median={statistics.median(resolutions):.2f}")
-    typer.echo(f"Mean quality    : {statistics.mean(scores):.3f}" if scores else "")
+    typer.echo(f"\n{'-'*40}")
+    typer.echo(f"Total records   : {result.total_records:,}")
+    typer.echo(f"Task types      : {result.task_type_counts}")
+    typer.echo(f"Methods         : {result.top_methods}")
+    typer.echo(f"Mean quality    : {result.mean_quality_score:.3f}" if result.mean_quality_score is not None else "")
     typer.echo(f"Storage root    : {layout.root}")
-    typer.echo(f"Report written to {report_path}")
-    if "master_csv" in export_status:
-        typer.echo(f"Master CSV      : {export_status['master_csv']}")
-    if "pair_csv" in export_status:
-        typer.echo(f"Pair CSV        : {export_status['pair_csv']}")
-    if "issue_csv" in export_status:
-        typer.echo(f"Issue CSV       : {export_status['issue_csv']}")
-    if "conflict_csv" in export_status:
-        typer.echo(f"Conflict CSV    : {export_status['conflict_csv']}")
-    if "source_state_csv" in export_status:
-        typer.echo(f"Source State CSV: {export_status['source_state_csv']}")
-    if "model_ready_pairs_csv" in export_status:
-        typer.echo(f"Model-ready CSV : {export_status['model_ready_pairs_csv']}")
-    if "scientific_coverage_json" in export_status:
-        typer.echo(f"Coverage JSON   : {export_status['scientific_coverage_json']}")
-    if "release_manifest_json" in export_status:
-        typer.echo(f"Release Manifest : {export_status['release_manifest_json']}")
-    if "master_csv_error" in export_status:
-        typer.echo(f"Master CSV refresh warning: {export_status['master_csv_error']}")
-    if "pair_csv_error" in export_status:
-        typer.echo(f"Pair CSV refresh warning: {export_status['pair_csv_error']}")
-    if "issue_csv_error" in export_status:
-        typer.echo(f"Issue CSV refresh warning: {export_status['issue_csv_error']}")
-    if "conflict_csv_error" in export_status:
-        typer.echo(f"Conflict CSV refresh warning: {export_status['conflict_csv_error']}")
-    if "source_state_csv_error" in export_status:
-        typer.echo(f"Source State CSV refresh warning: {export_status['source_state_csv_error']}")
-    if "release_exports_error" in export_status:
-        typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
+    typer.echo(f"Report written to {result.report_path}")
+    if "master_csv" in result.export_status:
+        typer.echo(f"Master CSV      : {result.export_status['master_csv']}")
+    if "pair_csv" in result.export_status:
+        typer.echo(f"Pair CSV        : {result.export_status['pair_csv']}")
+    if "issue_csv" in result.export_status:
+        typer.echo(f"Issue CSV       : {result.export_status['issue_csv']}")
+    if "conflict_csv" in result.export_status:
+        typer.echo(f"Conflict CSV    : {result.export_status['conflict_csv']}")
+    if "source_state_csv" in result.export_status:
+        typer.echo(f"Source State CSV: {result.export_status['source_state_csv']}")
+    if "model_ready_pairs_csv" in result.export_status:
+        typer.echo(f"Model-ready CSV : {result.export_status['model_ready_pairs_csv']}")
+    if "scientific_coverage_json" in result.export_status:
+        typer.echo(f"Coverage JSON   : {result.export_status['scientific_coverage_json']}")
+    if "release_manifest_json" in result.export_status:
+        typer.echo(f"Release Manifest : {result.export_status['release_manifest_json']}")
+    if "master_csv_error" in result.export_status:
+        typer.echo(f"Master CSV refresh warning: {result.export_status['master_csv_error']}")
+    if "pair_csv_error" in result.export_status:
+        typer.echo(f"Pair CSV refresh warning: {result.export_status['pair_csv_error']}")
+    if "issue_csv_error" in result.export_status:
+        typer.echo(f"Issue CSV refresh warning: {result.export_status['issue_csv_error']}")
+    if "conflict_csv_error" in result.export_status:
+        typer.echo(f"Conflict CSV refresh warning: {result.export_status['conflict_csv_error']}")
+    if "source_state_csv_error" in result.export_status:
+        typer.echo(f"Source State CSV refresh warning: {result.export_status['source_state_csv_error']}")
+    if "release_exports_error" in result.export_status:
+        typer.echo(f"Release export refresh warning: {result.export_status['release_exports_error']}")
 
 
 @app.command("report-bias")
@@ -799,40 +545,40 @@ def run_scenario_tests_cmd(ctx: typer.Context) -> None:
 @app.command("status")
 def status_cmd(ctx: typer.Context) -> None:
     """Show a concise snapshot of repository data and pipeline state."""
-    from pbdata.ops import build_status_report
-
     layout = _storage_layout(ctx)
-    status = build_status_report(layout)
-    typer.echo(f"Storage root           : {status['storage_root']}")
-    typer.echo(f"Raw RCSB records       : {status['raw_rcsb_count']}")
-    typer.echo(f"Processed records      : {status['processed_rcsb_count']}")
-    typer.echo(f"Extracted entries      : {status['extracted_entry_count']}")
-    typer.echo(f"Structure files        : {status['structure_file_count']}")
-    typer.echo(f"Graph exports present  : {status['graph_node_export_present'] and status['graph_edge_export_present']}")
-    typer.echo(f"Feature manifest       : {status['feature_manifest_present']}")
-    typer.echo(f"Training examples      : {status['training_example_count']}")
-    typer.echo(f"Baseline model         : {status['baseline_model_present']}")
-    typer.echo(f"Site feature runs      : {status['site_feature_runs']}")
-    typer.echo(f"Surrogate checkpoint   : {status['surrogate_checkpoint_present']}")
-    typer.echo(f"Latest release         : {status['release_snapshot_present']}")
+    render_status_report(build_status_state_report(layout))
 
 
 @app.command("doctor")
 def doctor_cmd(ctx: typer.Context) -> None:
     """Check dependency and configuration readiness for the current installation."""
-    from pbdata.ops import build_doctor_report
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj["config"]
+    render_doctor_report(layout.root, build_doctor_state_report(layout, cfg))
+
+
+@app.command("demo-readiness")
+def demo_readiness_cmd(ctx: typer.Context) -> None:
+    """Assess whether the current workspace is presentable for an internal demo."""    
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj["config"]
+    render_demo_readiness_report(layout.root, build_demo_readiness_state_report(layout, cfg))
+
+
+@app.command("export-demo-snapshot")
+def export_demo_snapshot_cmd(ctx: typer.Context) -> None:
+    """Write JSON and markdown artifacts for a canned internal demo walkthrough."""
+    from pbdata.demo import export_demo_snapshot
 
     layout = _storage_layout(ctx)
     cfg: AppConfig = ctx.obj["config"]
-    report = build_doctor_report(layout, cfg)
-    typer.echo(f"Storage root      : {layout.root}")
-    typer.echo(f"Overall status    : {report['overall_status']}")
-    typer.echo(f"Python version    : {report['python_version']}")
-    typer.echo(f"Data dir present  : {report['required_directories']['data']}")
-    typer.echo(f"Artifacts present : {report['required_directories']['artifacts']}")
-    typer.echo("Dependencies:")
-    for name, payload in report["dependency_checks"].items():
-        typer.echo(f"  - {name}: {payload['status']}{' (required)' if payload['required'] else ''}")
+    json_path, md_path, report = export_demo_snapshot(layout, cfg)
+    emit_labeled_values([
+        ("Storage root", layout.root),
+        ("Demo readiness", report["readiness"]),
+        ("JSON snapshot", json_path),
+        ("Markdown guide", md_path),
+    ])
 
 
 @app.command("predict-ligand-screening")
@@ -886,6 +632,56 @@ def evaluate_baseline_model_cmd(ctx: typer.Context) -> None:
     typer.echo(f"Workflow status: {manifest['status']}")
 
 
+@app.command("train-tabular-affinity-model")
+def train_tabular_affinity_model_cmd(ctx: typer.Context) -> None:
+    """Train a lightweight supervised tabular affinity model on training examples."""
+    from pbdata.models.tabular_affinity import train_tabular_affinity_model
+
+    layout = _storage_layout(ctx)
+    out_path, manifest = train_tabular_affinity_model(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Tabular affinity model artifact written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("evaluate-tabular-affinity-model")
+def evaluate_tabular_affinity_model_cmd(ctx: typer.Context) -> None:
+    """Evaluate the supervised tabular affinity model against the current split files."""
+    from pbdata.models.tabular_affinity import evaluate_tabular_affinity_model
+
+    layout = _storage_layout(ctx)
+    out_path, manifest = evaluate_tabular_affinity_model(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Tabular affinity model evaluation written to {out_path}")
+    typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("report-training-set-quality")
+def report_training_set_quality_cmd(ctx: typer.Context) -> None:
+    """Write a training-set quality report and summary for current training examples and splits."""
+    from pbdata.training_quality import export_training_set_quality_report
+
+    layout = _storage_layout(ctx)
+    json_path, md_path, report = export_training_set_quality_report(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Training quality JSON: {json_path}")
+    typer.echo(f"Training quality Markdown: {md_path}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
+@app.command("report-model-comparison")
+def report_model_comparison_cmd(ctx: typer.Context) -> None:
+    """Write a model-comparison report from the current baseline and tabular evaluation artifacts."""
+    from pbdata.model_comparison import export_model_comparison_report
+
+    layout = _storage_layout(ctx)
+    json_path, md_path, report = export_model_comparison_report(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Model comparison JSON: {json_path}")
+    typer.echo(f"Model comparison Markdown: {md_path}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
 @app.command("predict-peptide-binding")
 def predict_peptide_binding_cmd(
     ctx: typer.Context,
@@ -926,6 +722,7 @@ def score_pathway_risk_cmd(
 def _pair_split_items_from_layout(layout: StorageLayout) -> list:
     chains = _load_table_rows(layout.extracted_dir / "chains")
     assays = _load_table_rows(layout.extracted_dir / "assays")
+    entries = _load_table_rows(layout.extracted_dir / "entry")
     training_examples = _load_json_rows(layout.training_dir / "training_examples.json") if (layout.training_dir / "training_examples.json").exists() else []
     if not assays:
         return []
@@ -934,6 +731,7 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
 
     sequence_by_pdb_chain: dict[tuple[str, str], str] = {}
     uniprot_by_pdb_chain: dict[tuple[str, str], str] = {}
+    release_date_by_pdb: dict[str, str] = {}
     for chain in chains:
         pdb_id = str(chain.get("pdb_id") or "")
         chain_id = str(chain.get("chain_id") or "")
@@ -945,8 +743,14 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         uniprot_id = str(chain.get("uniprot_id") or "")
         if uniprot_id:
             uniprot_by_pdb_chain[(pdb_id, chain_id)] = uniprot_id
+    for entry in entries:
+        pdb_id = str(entry.get("pdb_id") or "")
+        release_date = str(entry.get("release_date") or "")[:10]
+        if pdb_id and release_date:
+            release_date_by_pdb[pdb_id] = release_date
 
     example_id_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+    training_example_by_id: dict[str, dict] = {}
     for row in training_examples:
         provenance = row.get("provenance") or {}
         labels = row.get("labels") or {}
@@ -955,6 +759,7 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         example_id = str(row.get("example_id") or "")
         if pair_key and example_id:
             example_id_by_key[(pair_key, affinity_type)].append(example_id)
+            training_example_by_id[example_id] = row
 
     items: list[PairSplitItem] = []
     for assay in assays:
@@ -1000,6 +805,24 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         ])
         target_ids = example_id_by_key.get((pair_key, affinity_type), []) or [f"{pair_key}|{affinity_type or 'assay_unknown'}"]
         for target_id in target_ids:
+            training_example = training_example_by_id.get(target_id) or {}
+            ligand = training_example.get("ligand") if isinstance(training_example.get("ligand"), dict) else {}
+            ligand_proxy = (
+                str(ligand.get("inchikey") or "").strip()
+                or str(ligand.get("smiles") or "").strip()
+                or str(ligand.get("ligand_id") or "").strip()
+                or str(parsed_pair.ligand_key or "").strip()
+                or ",".join(parsed_pair.partner_chain_ids)
+                or "-"
+            )
+            preferred_source = (
+                str((training_example.get("labels") or {}).get("preferred_source_database") or "").strip()
+                or str((training_example.get("experiment") or {}).get("preferred_source_database") or "").strip()
+                or str(assay.get("selected_preferred_source") or "").strip()
+                or str(assay.get("source_database") or "").strip()
+                or "source_unknown"
+            )
+            mutation_group = (parsed_pair.mutation_key or "wt_or_unspecified").strip().lower() or "wt_or_unspecified"
             items.append(PairSplitItem(
                 item_id=target_id,
                 pair_identity_key=pair_key,
@@ -1008,6 +831,16 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
                 receptor_identity=receptor_identity,
                 representation_key=representation_key,
                 hard_group_key=hard_group_key,
+                scaffold_key="|".join([parsed_pair.task_type, ligand_proxy]),
+                family_key="|".join([parsed_pair.task_type, receptor_identity]),
+                mutation_group_key="|".join([
+                    parsed_pair.task_type,
+                    receptor_identity,
+                    ligand_proxy,
+                    mutation_group,
+                ]),
+                source_group_key="|".join([parsed_pair.task_type, preferred_source]),
+                release_date=release_date_by_pdb.get(pdb_id),
             ))
     return items
 
@@ -1311,10 +1144,14 @@ def run_feature_pipeline_cmd(
         )
     except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
         _exit_with_dependency_error(exc)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Feature pipeline run id: {result['run_id']}")
-    typer.echo(f"Artifacts root: {result['artifacts_root']}")
-    typer.echo(f"Input manifest: {result['input_manifest']}")
+    _emit_feature_workflow_output(
+        layout,
+        [
+            ("Feature pipeline run id", result["run_id"]),
+            ("Artifacts root", result["artifacts_root"]),
+            ("Input manifest", result["input_manifest"]),
+        ],
+    )
     for stage, status in result["stage_statuses"].items():
         typer.echo(f"{stage}: {status}")
 
@@ -1331,26 +1168,23 @@ def export_analysis_queue_cmd(
     from pbdata.pipeline.feature_execution import export_analysis_queue
 
     layout = _storage_layout(ctx)
-    resolved_run_id = run_id
-    if not resolved_run_id:
-        manifests = sorted(
-            layout.artifact_manifests_dir.glob("*_input_manifest.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        if not manifests:
-            typer.echo("Error: --run-id is required until at least one site-centric feature run exists.")
-            raise typer.Exit(code=1)
-        resolved_run_id = manifests[0].name.replace("_input_manifest.json", "")
+    resolved_run_id = _resolve_latest_feature_pipeline_run_id(layout, run_id)
     try:
         result = export_analysis_queue(layout, run_id=resolved_run_id)
     except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
         _exit_with_dependency_error(exc)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Feature pipeline run id: {resolved_run_id}")
-    typer.echo(f"Archetypes: {result['archetypes']}")
-    typer.echo(f"Analysis queue: {result['queue']}")
-    typer.echo(f"Batch manifest: {result['batch_manifest']}")
+    _emit_feature_workflow_output(
+        layout,
+        [
+            ("Feature pipeline run id", resolved_run_id),
+            ("Archetypes", result["archetypes"]),
+            ("Representatives", result["representatives"]),
+            ("Cluster summary", result["cluster_summary"]),
+            ("Fragments", result["fragments"]),
+            ("Analysis queue", result["queue"]),
+            ("Batch manifest", result["batch_manifest"]),
+        ],
+    )
 
 
 @app.command("ingest-physics-results")
@@ -1366,10 +1200,14 @@ def ingest_physics_results_cmd(
 
     layout = _storage_layout(ctx)
     result = ingest_external_analysis_results(layout, batch_id=batch_id)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Physics targets: {result['physics_targets']}")
-    typer.echo(f"Failed fragments: {result['failed_fragments']}")
-    typer.echo(f"Manifest: {result['manifest']}")
+    _emit_feature_workflow_output(
+        layout,
+        [
+            ("Physics targets", result["physics_targets"]),
+            ("Failed fragments", result["failed_fragments"]),
+            ("Manifest", result["manifest"]),
+        ],
+    )
 
 
 @app.command("train-site-physics-surrogate")
@@ -1398,10 +1236,14 @@ def train_site_physics_surrogate_cmd(
         source_run_id=source_run_id,
         surrogate_run_id=surrogate_run_id,
     )
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Checkpoint: {result['checkpoint']}")
-    typer.echo(f"Manifest: {result['manifest']}")
-    typer.echo(f"Latest pointer: {result['latest']}")
+    _emit_feature_workflow_output(
+        layout,
+        [
+            ("Checkpoint", result["checkpoint"]),
+            ("Manifest", result["manifest"]),
+            ("Latest pointer", result["latest"]),
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1477,7 +1319,13 @@ def build_structural_graphs_cmd(
 
 
 @app.command("build-graph")
-def build_graph_cmd(ctx: typer.Context) -> None:
+def build_graph_cmd(
+    ctx: typer.Context,
+    strict_prereqs: Annotated[
+        bool,
+        typer.Option("--strict-prereqs", help="Exit with an error instead of writing a planned manifest when upstream inputs are missing."),
+    ] = False,
+) -> None:
     """Write the graph-layer architecture manifest.
 
     If extracted structure records are available, materialize a first
@@ -1526,9 +1374,16 @@ def build_graph_cmd(ctx: typer.Context) -> None:
             typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
         return
 
+    if strict_prereqs:
+        typer.echo("Run 'extract' first so graph materialization has extracted entry records.")
+        raise typer.Exit(code=1)
+
     manifest_path = build_graph_manifest(layout.graph_dir)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Graph architecture manifest written to {manifest_path}")
+    _emit_planned_manifest_notice(
+        artifact_label="Graph architecture",
+        manifest_path=manifest_path,
+        missing_steps=["Run 'extract' first so graph materialization has extracted entry records."],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1537,7 +1392,13 @@ def build_graph_cmd(ctx: typer.Context) -> None:
 
 
 @app.command("build-features")
-def build_features_cmd(ctx: typer.Context) -> None:
+def build_features_cmd(
+    ctx: typer.Context,
+    strict_prereqs: Annotated[
+        bool,
+        typer.Option("--strict-prereqs", help="Exit with an error instead of writing a planned manifest when upstream inputs are missing."),
+    ] = False,
+) -> None:
     """Materialize first-pass features when extracted+graph data are present."""
     layout = _storage_layout(ctx)
     from pbdata.master_export import refresh_master_exports
@@ -1548,7 +1409,9 @@ def build_features_cmd(ctx: typer.Context) -> None:
 
     extracted_dir = layout.extracted_dir
     graph_dir = layout.graph_dir
-    if (extracted_dir / "assays").exists() and (graph_dir / "graph_edges.json").exists():
+    has_assays = (extracted_dir / "assays").exists()
+    has_graph_edges = (graph_dir / "graph_edges.json").exists()
+    if has_assays and has_graph_edges:
         features_path, manifest_path = build_features_from_extracted_and_graph(
             extracted_dir,
             graph_dir,
@@ -1590,9 +1453,22 @@ def build_features_cmd(ctx: typer.Context) -> None:
             typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
         return
 
+    missing_steps: list[str] = []
+    if not has_assays:
+        missing_steps.append("Run 'extract' first so assay records exist.")
+    if not has_graph_edges:
+        missing_steps.append("Run 'build-graph' first so canonical graph edges exist.")
+    if strict_prereqs:
+        for step in missing_steps:
+            typer.echo(step)
+        raise typer.Exit(code=1)
+
     manifest_path = build_feature_manifest(layout.features_dir)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Feature architecture manifest written to {manifest_path}")
+    _emit_planned_manifest_notice(
+        artifact_label="Feature architecture",
+        manifest_path=manifest_path,
+        missing_steps=missing_steps,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1601,7 +1477,13 @@ def build_features_cmd(ctx: typer.Context) -> None:
 
 
 @app.command("build-training-examples")
-def build_training_examples_cmd(ctx: typer.Context) -> None:
+def build_training_examples_cmd(
+    ctx: typer.Context,
+    strict_prereqs: Annotated[
+        bool,
+        typer.Option("--strict-prereqs", help="Exit with an error instead of writing a planned manifest when upstream inputs are missing."),
+    ] = False,
+) -> None:
     """Assemble training examples from extracted, graph, and feature layers.
 
     If all upstream layers are present, joins them into spec-aligned
@@ -1654,15 +1536,24 @@ def build_training_examples_cmd(ctx: typer.Context) -> None:
             typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
         return
 
-    manifest_path = build_training_manifest(layout.training_dir)
-    typer.echo(f"Storage root: {layout.root}")
-    typer.echo(f"Training-example architecture manifest written to {manifest_path}")
+    missing_steps: list[str] = []
     if not has_assays:
-        typer.echo("  (missing: extracted assays — run 'extract' first)")
+        missing_steps.append("Run 'extract' first so extracted assay rows exist.")
     if not has_graph:
-        typer.echo("  (missing: graph data — run 'build-graph' first)")
+        missing_steps.append("Run 'build-graph' first so canonical graph nodes exist.")
     if not has_features:
-        typer.echo("  (missing: feature records — run 'build-features' first)")
+        missing_steps.append("Run 'build-features' first so feature records exist.")
+    if strict_prereqs:
+        for step in missing_steps:
+            typer.echo(step)
+        raise typer.Exit(code=1)
+
+    manifest_path = build_training_manifest(layout.training_dir)
+    _emit_planned_manifest_notice(
+        artifact_label="Training-example architecture",
+        manifest_path=manifest_path,
+        missing_steps=missing_steps,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1824,7 +1715,7 @@ def build_splits_cmd(
     train_frac:    Annotated[float, typer.Option(help="Train fraction.")] = 0.70,
     val_frac:      Annotated[float, typer.Option(help="Validation fraction.")] = 0.15,
     seed:          Annotated[int,   typer.Option(help="Hash seed for reproducibility.")] = 42,
-    split_mode:    Annotated[str,   typer.Option(help="auto | pair-aware | legacy-sequence | hash")] = "auto",
+    split_mode:    Annotated[str,   typer.Option(help="auto | pair-aware | legacy-sequence | hash | scaffold | family | mutation | source | time")] = "auto",
     hash_only:     Annotated[bool,  typer.Option("--hash-only", help="Use fast hash split (no clustering).")] = False,
     threshold:     Annotated[float, typer.Option(help="Jaccard threshold for sequence clustering.")] = 0.30,
 ) -> None:
@@ -1837,15 +1728,17 @@ def build_splits_cmd(
     Outputs train.txt, val.txt, test.txt, and metadata.json to data/splits/.
     """
     from pbdata.dataset.splits import (
+        build_grouped_pair_splits,
         build_pair_aware_splits,
         build_splits,
+        build_temporal_pair_splits,
         cluster_aware_split,
         save_splits,
     )
 
     layout = _storage_layout(ctx)
-    if split_mode not in {"auto", "pair-aware", "legacy-sequence", "hash"}:
-        raise typer.BadParameter("split-mode must be one of: auto, pair-aware, legacy-sequence, hash")
+    if split_mode not in {"auto", "pair-aware", "legacy-sequence", "hash", "scaffold", "family", "mutation", "source", "time"}:
+        raise typer.BadParameter("split-mode must be one of: auto, pair-aware, legacy-sequence, hash, scaffold, family, mutation, source, time")
     processed_dir = layout.processed_rcsb_dir
     files = sorted(processed_dir.glob("*.json")) if processed_dir.exists() else []
     pair_items = _pair_split_items_from_layout(layout)
@@ -1864,6 +1757,47 @@ def build_splits_cmd(
             log_fn=typer.echo,
         )
         strategy = "pair_aware_grouped"
+        save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
+        sizes = result.sizes()
+        typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
+        typer.echo(f"Storage root: {layout.root}")
+        typer.echo(f"Splits written to {layout.splits_dir}/")
+        return
+
+    if split_mode in {"scaffold", "family", "mutation", "source"}:
+        if not pair_items:
+            typer.echo("No pair-aware items available. Run 'extract' first, and build training examples for the strongest scaffold grouping.")
+            return
+        typer.echo(f"Building {split_mode}-grouped splits from {len(pair_items):,} pair-level items...")
+        result, extra_metadata = build_grouped_pair_splits(
+            pair_items,
+            grouping=split_mode,
+            train_frac=train_frac,
+            val_frac=val_frac,
+            seed=seed,
+            log_fn=typer.echo,
+        )
+        strategy = f"{split_mode}_grouped"
+        save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
+        sizes = result.sizes()
+        typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
+        typer.echo(f"Storage root: {layout.root}")
+        typer.echo(f"Splits written to {layout.splits_dir}/")
+        return
+
+    if split_mode == "time":
+        if not pair_items:
+            typer.echo("No pair-aware items available. Run 'extract' first so entry release dates are available for temporal splitting.")
+            return
+        typer.echo(f"Building time-ordered splits from {len(pair_items):,} pair-level items...")
+        result, extra_metadata = build_temporal_pair_splits(
+            pair_items,
+            train_frac=train_frac,
+            val_frac=val_frac,
+            seed=seed,
+            log_fn=typer.echo,
+        )
+        strategy = "time_ordered"
         save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
         sizes = result.sizes()
         typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
@@ -2011,7 +1945,7 @@ def extract_cmd(
         if _validate_extracted_bundle(out_dir, pdb_id) and _is_up_to_date(path, out_dir / "entry" / f"{pdb_id}.json"):
             return path.name, "cached"
         _delete_extracted_bundle(out_dir, pdb_id)
-        chembl_samples = _fetch_chembl_samples_for_raw(raw, chem_descriptors, cfg)
+        chembl_samples = _fetch_chembl_samples_for_raw(raw, chem_descriptors, cfg, layout=layout)
         bindingdb_samples = _fetch_bindingdb_samples_for_pdb(pdb_id, cfg, layout=layout)
         records = extract_rcsb_entry(
             raw,
@@ -2083,6 +2017,12 @@ def extract_cmd(
     if download_structures:
         typer.echo(f"Structures: {struct_dir}/")
     typer.echo(f"Stage state: {state_path}")
+    assay_row_count = _count_extracted_assay_rows(out_dir)
+    if assay_row_count == 0:
+        typer.echo(
+            "Warning: extracted assay table is empty. Enable external assay sources or "
+            "verify enrichment inputs if you expected binding measurements."
+        )
     export_status = refresh_master_exports(layout)
     if "master_csv" in export_status:
         typer.echo(f"Master CSV: {export_status['master_csv']}")

@@ -137,6 +137,66 @@ def test_graph_builder_emits_placeholder_pathway_node_without_external_sources()
     assert any(node["node_type"] == "Pathway" for node in nodes)
 
 
+def test_graph_builder_emits_structured_edge_provenance() -> None:
+    tmp_root = _tmp_dir("graph_edge_provenance")
+    extracted_dir = tmp_root / "extracted"
+    output_dir = tmp_root / "graph"
+    for name in ["entry", "chains", "bound_objects", "interfaces", "assays"]:
+        (extracted_dir / name).mkdir(parents=True, exist_ok=True)
+
+    (extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "assembly_id": "1",
+        "source_database": "RCSB",
+    }), encoding="utf-8")
+    (extracted_dir / "chains" / "1ABC.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "chain_id": "A",
+            "is_protein": True,
+            "uniprot_id": "P12345",
+        }
+    ]), encoding="utf-8")
+    (extracted_dir / "bound_objects" / "1ABC.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "component_id": "ATP",
+            "component_name": "ATP",
+        }
+    ]), encoding="utf-8")
+    (extracted_dir / "interfaces" / "1ABC.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "interface_type": "protein_ligand",
+            "entity_name_b": "ATP",
+            "binding_site_chain_ids": ["A"],
+            "binding_site_residue_ids": ["A:TYR15"],
+        }
+    ]), encoding="utf-8")
+    (extracted_dir / "assays" / "1ABC.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+            "source_database": "PDBbind",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 5.0,
+            "binding_affinity_unit": "nM",
+        }
+    ]), encoding="utf-8")
+
+    _, edges_path, _ = build_graph_from_extracted(extracted_dir, output_dir)
+    edges = json.loads(edges_path.read_text(encoding="utf-8"))
+
+    assert edges
+    for edge in edges:
+        provenance = edge["provenance"]
+        assert provenance["source"]
+        assert provenance["confidence"]
+        assert provenance["source_record_key"]
+        assert provenance["extraction_method"]
+        assert provenance["retrieved_at"]
+
+
 def test_remaining_scope_stubs_are_importable_and_explicit() -> None:
     connector = connector_stub("STRING", Path("data/raw/graph_sources/STRING"))
     mapping = map_protein_identifier("P12345", resolve_remote=False)

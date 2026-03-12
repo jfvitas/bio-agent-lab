@@ -58,6 +58,22 @@ _GRAPH_SOURCES = [
 ]
 
 
+def _edge_provenance(
+    *,
+    source: str,
+    confidence: str,
+    source_record_key: str,
+    extraction_method: str,
+) -> dict[str, str]:
+    return {
+        "source": source,
+        "confidence": confidence,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "source_record_key": source_record_key,
+        "extraction_method": extraction_method,
+    }
+
+
 def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not table_dir.exists():
@@ -406,11 +422,16 @@ def build_graph_from_extracted(
                         source_database="RCSB",
                         relation="structural_interface",
                         metadata={"pdb_id": pdb_id},
-                        provenance={
-                            "source": "RCSB",
-                            "confidence": "medium",
-                            "method": "structural_interface_graph_projection",
-                        },
+                        provenance=_edge_provenance(
+                            source="RCSB",
+                            confidence="medium",
+                            source_record_key=(
+                                f"{pdb_id}:"
+                                f"{','.join(str(chain) for chain in interface.get('partner_a_chain_ids') or [])}:"
+                                f"{','.join(str(chain) for chain in interface.get('partner_b_chain_ids') or [])}"
+                            ),
+                            extraction_method="structural_interface_graph_projection",
+                        ),
                     ))
         elif iface_type == "protein_ligand":
             ligand_name = str(interface.get("entity_name_b") or "")
@@ -444,11 +465,15 @@ def build_graph_from_extracted(
                         "pdb_id": pdb_id,
                         "binding_site_residue_ids": interface.get("binding_site_residue_ids"),
                     },
-                    provenance={
-                        "source": "BioLiP",
-                        "confidence": "medium",
-                        "method": "binding_site_annotation_graph_projection",
-                    },
+                    provenance=_edge_provenance(
+                        source="BioLiP",
+                        confidence="medium",
+                        source_record_key=(
+                            f"{pdb_id}:{ligand_name or ligand_node}:"
+                            f"{','.join(str(chain) for chain in interface.get('binding_site_chain_ids') or [])}"
+                        ),
+                        extraction_method="binding_site_annotation_graph_projection",
+                    ),
                 ))
 
     for assay in assays:
@@ -482,11 +507,12 @@ def build_graph_from_extracted(
                     "binding_affinity_value": assay.get("binding_affinity_value"),
                     "binding_affinity_unit": assay.get("binding_affinity_unit"),
                 },
-                provenance={
-                    "source": str(assay.get("source_database") or "unknown"),
-                    "confidence": "medium",
-                    "method": "assay_pair_graph_projection",
-                },
+                provenance=_edge_provenance(
+                    source=str(assay.get("source_database") or "unknown"),
+                    confidence="medium",
+                    source_record_key=pair_key or edge_id,
+                    extraction_method="assay_pair_graph_projection",
+                ),
             ))
 
     # --- Merge external sources ---
