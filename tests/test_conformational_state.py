@@ -3,7 +3,9 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from typer.testing import CliRunner
 
+from pbdata.cli import app
 from pbdata.dataset.conformations import build_conformation_states
 from pbdata.schemas.conformational_state import ConformationalStateRecord
 
@@ -64,3 +66,34 @@ def test_build_conformation_states_writes_new_shape() -> None:
     rows = json.loads(states_path.read_text(encoding="utf-8"))
     assert rows[0]["pdb_id"] == "1ABC"
     assert "ligand_class_in_state" in rows[0]
+
+
+def test_build_conformational_states_cli_writes_outputs() -> None:
+    tmp_root = _tmp_dir("conformation_cli")
+    extracted_dir = tmp_root / "data" / "extracted"
+    (extracted_dir / "entry").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "chains").mkdir(parents=True, exist_ok=True)
+    (extracted_dir / "entry" / "1ABC.json").write_text(
+        json.dumps({
+            "pdb_id": "1ABC",
+            "structure_file_cif_path": "data/structures/rcsb/1ABC.cif",
+            "task_hint": "protein_ligand",
+        }),
+        encoding="utf-8",
+    )
+    (extracted_dir / "chains" / "1ABC.json").write_text(
+        json.dumps([{"pdb_id": "1ABC", "uniprot_id": "P12345"}]),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "build-conformational-states"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Conformational states written to" in result.output
+    assert (tmp_root / "data" / "conformations" / "conformation_states.json").exists()
+    assert (tmp_root / "data" / "conformations" / "conformation_state_manifest.json").exists()

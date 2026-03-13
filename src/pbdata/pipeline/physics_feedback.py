@@ -46,6 +46,9 @@ _LATEST_FILE = "latest_surrogate_checkpoint.json"
 _SURROGATE_VERSION = "site_physics_surrogate_v1_1"
 _MLP_HIDDEN_DIM = 32
 _MLP_EPOCHS = 250
+_SITE_FEATURE_ID_COLUMNS = ["site_id", "motif_class"]
+_ARCHETYPE_ID_COLUMNS = ["archetype_id", "site_id", "motif_class"]
+_PHYSICS_TARGET_ID_COLUMNS = ["archetype_id", "motif_class"]
 
 
 def _utc_now() -> str:
@@ -272,7 +275,13 @@ def _site_feature_rows(layout: StorageLayout, source_run_id: str) -> pd.DataFram
                 "geometry.max_site_distance": float(edge_stats.get(site_id, {}).get("geometry.max_site_distance", 0.0)),
             })
             rows.append(feature_row)
+    if not rows:
+        return pd.DataFrame(columns=_SITE_FEATURE_ID_COLUMNS)
     return pd.DataFrame(rows)
+
+
+def _has_required_columns(frame: pd.DataFrame, required_columns: list[str]) -> bool:
+    return all(column in frame.columns for column in required_columns)
 
 
 def _build_training_matrix(
@@ -280,6 +289,15 @@ def _build_training_matrix(
     archetypes: pd.DataFrame,
     site_features: pd.DataFrame,
 ) -> tuple[list[list[float]], list[list[float]], list[str], list[str], list[str]]:
+    if (
+        physics_targets.empty
+        or archetypes.empty
+        or site_features.empty
+        or not _has_required_columns(physics_targets, _PHYSICS_TARGET_ID_COLUMNS)
+        or not _has_required_columns(archetypes, _ARCHETYPE_ID_COLUMNS)
+        or not _has_required_columns(site_features, _SITE_FEATURE_ID_COLUMNS)
+    ):
+        return [], [], [], [], TARGET_COLUMNS
     merged = physics_targets.merge(archetypes[["archetype_id", "site_id", "motif_class"]], on=["archetype_id", "motif_class"], how="inner")
     merged = merged.merge(site_features, on=["site_id", "motif_class"], how="inner")
     feature_columns = sorted(

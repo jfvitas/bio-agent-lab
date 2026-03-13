@@ -10,7 +10,11 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from pbdata.config import AppConfig, load_config
+from pbdata.model_comparison import build_model_comparison_report
+from pbdata.sources.registry import build_source_capability_report
 from pbdata.storage import StorageLayout
+from pbdata.training_quality import build_training_set_quality_report
 
 _CANONICAL_ENTRY_CSV = "canonical_entries.csv"
 _CANONICAL_PAIR_CSV = "canonical_pairs.csv"
@@ -29,6 +33,20 @@ _MODEL_READY_BLOCKERS = {
     "ambiguous_mutation_context",
     "source_value_conflict",
     "non_high_confidence_assay_fields",
+}
+
+_RELEASE_GRADE_SPLIT_STRATEGIES = {
+    "pair_aware_grouped",
+    "scaffold_grouped",
+    "family_grouped",
+    "mutation_grouped",
+    "source_grouped",
+    "time_ordered",
+}
+
+_EXPLORATORY_SPLIT_STRATEGIES = {
+    "hash",
+    "cluster_aware",
 }
 
 
@@ -88,6 +106,48 @@ def _counter_dict(values: list[str]) -> dict[str, int]:
 
 def _semicolon_values(raw: str) -> list[str]:
     return [value.strip() for value in str(raw or "").split(";") if value.strip()]
+
+
+def _split_readiness_summary(
+    split_metadata: dict[str, Any],
+    split_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    strategy = str(split_metadata.get("strategy") or "").strip() or "unknown"
+    sizes = split_metadata.get("sizes") or {}
+    val_count = int(sizes.get("val") or 0)
+    test_count = int(sizes.get("test") or 0)
+    held_out_count = val_count + test_count
+    diagnostics_counts = split_diagnostics.get("counts") or {}
+    overlap = split_diagnostics.get("overlap") or {}
+    split_status = str(split_diagnostics.get("status") or "missing")
+    strategy_family = (
+        "release_grade"
+        if strategy in _RELEASE_GRADE_SPLIT_STRATEGIES
+        else "exploratory"
+        if strategy in _EXPLORATORY_SPLIT_STRATEGIES
+        else "unknown"
+    )
+    recommended_usage = (
+        "Suitable for leakage-aware held-out benchmarking."
+        if strategy_family == "release_grade" and held_out_count > 0 and split_status == "ready"
+        else "Usable for exploratory iteration, but not yet strong enough for release-grade benchmark claims."
+        if strategy_family in {"release_grade", "exploratory"}
+        else "Split strategy is not yet classified for benchmark readiness."
+    )
+    return {
+        "strategy": strategy,
+        "strategy_family": strategy_family,
+        "held_out_count": held_out_count,
+        "held_out_ready": held_out_count > 0,
+        "diagnostic_status": split_status,
+        "hard_group_overlap_count": int(diagnostics_counts.get("hard_group_overlap_count") or 0),
+        "family_overlap_count": int(diagnostics_counts.get("family_overlap_count") or 0),
+        "source_overlap_count": int((overlap.get("source_group_key") or {}).get("overlap_count") or 0),
+        "domain_overlap_count": int(diagnostics_counts.get("domain_overlap_count") or 0),
+        "pathway_overlap_count": int(diagnostics_counts.get("pathway_overlap_count") or 0),
+        "fold_overlap_count": int(diagnostics_counts.get("fold_overlap_count") or 0),
+        "recommended_usage": recommended_usage,
+    }
 
 
 def export_scientific_coverage_summary(
@@ -342,6 +402,14 @@ def export_release_artifacts(
     split_metadata = {}
     if split_metadata_path.exists():
         split_metadata = json.loads(split_metadata_path.read_text(encoding="utf-8"))
+    split_diagnostics_path = layout.splits_dir / "split_diagnostics.json"
+    split_diagnostics = (
+        json.loads(split_diagnostics_path.read_text(encoding="utf-8"))
+        if split_diagnostics_path.exists()
+        else {}
+    )
+    split_diagnostics_counts = split_diagnostics.get("counts") or {}
+    split_readiness = _split_readiness_summary(split_metadata, split_diagnostics)
     split_rows: list[dict[str, str]] = []
     for split_name in ("train", "val", "test"):
         split_path = layout.splits_dir / f"{split_name}.txt"
@@ -357,10 +425,37 @@ def export_release_artifacts(
             "affinity_types": "; ".join(sorted({row.get("binding_affinity_type", "") for row in ready_for_split if row.get("binding_affinity_type")})),
             "source_databases": "; ".join(sorted({row.get("selected_preferred_source", "") for row in ready_for_split if row.get("selected_preferred_source")})),
             "strategy": _stringify(split_metadata.get("strategy") if split_name == "train" else ""),
+            "strategy_family": _stringify(split_readiness.get("strategy_family") if split_name == "train" else ""),
+            "held_out_ready": _stringify(split_readiness.get("held_out_ready") if split_name == "train" else ""),
+            "diagnostic_status": _stringify(split_diagnostics.get("status") if split_name == "train" else ""),
+            "hard_group_overlap_count": _stringify(split_diagnostics_counts.get("hard_group_overlap_count") if split_name == "train" else ""),
+            "family_overlap_count": _stringify(split_diagnostics_counts.get("family_overlap_count") if split_name == "train" else ""),
+            "source_overlap_count": _stringify(split_readiness.get("source_overlap_count") if split_name == "train" else ""),
+            "domain_overlap_count": _stringify(split_readiness.get("domain_overlap_count") if split_name == "train" else ""),
+            "pathway_overlap_count": _stringify(split_readiness.get("pathway_overlap_count") if split_name == "train" else ""),
+            "fold_overlap_count": _stringify(split_readiness.get("fold_overlap_count") if split_name == "train" else ""),
+            "recommended_usage": _stringify(split_readiness.get("recommended_usage") if split_name == "train" else ""),
         })
     split_summary_path = _write_csv(
         _repo_path(_SPLIT_SUMMARY_CSV, root),
-        ["split_name", "split_item_count", "model_ready_pair_count", "affinity_types", "source_databases", "strategy"],
+        [
+            "split_name",
+            "split_item_count",
+            "model_ready_pair_count",
+            "affinity_types",
+            "source_databases",
+            "strategy",
+            "strategy_family",
+            "held_out_ready",
+            "diagnostic_status",
+            "hard_group_overlap_count",
+            "family_overlap_count",
+            "source_overlap_count",
+            "domain_overlap_count",
+            "pathway_overlap_count",
+            "fold_overlap_count",
+            "recommended_usage",
+        ],
         split_rows,
     )
 
@@ -372,6 +467,8 @@ def export_release_artifacts(
         "model_ready_exclusion_count": len(exclusion_rows),
         "model_ready_exclusion_reasons": dict(exclusion_counts),
         "split_metadata": split_metadata,
+        "split_diagnostics": split_diagnostics,
+        "split_readiness": split_readiness,
         "artifacts": {
             "canonical_entries_csv": str(canonical_entries_path),
             "canonical_pairs_csv": str(canonical_pairs_path),
@@ -413,6 +510,8 @@ def build_release_readiness_report(
     canonical_pair_count = int(manifest.get("canonical_pair_count") or 0)
     model_ready_pair_count = int(manifest.get("model_ready_pair_count") or 0)
     split_metadata = manifest.get("split_metadata") or {}
+    split_diagnostics = manifest.get("split_diagnostics") or {}
+    split_readiness = manifest.get("split_readiness") or _split_readiness_summary(split_metadata, split_diagnostics)
     exclusion_reasons = manifest.get("model_ready_exclusion_reasons") or {}
 
     if canonical_entry_count <= 0:
@@ -423,15 +522,76 @@ def build_release_readiness_report(
         blockers.append("no_model_ready_pairs")
     if not split_metadata:
         blockers.append("no_split_metadata")
+    elif not bool(split_readiness.get("held_out_ready")):
+        blockers.append("no_held_out_split")
+
+    cfg_path = layout.root / "configs" / "sources.yaml"
+    try:
+        config = load_config(cfg_path) if cfg_path.exists() else AppConfig()
+    except Exception:
+        config = AppConfig()
+    source_capabilities = build_source_capability_report(layout, config)
+    training_quality = build_training_set_quality_report(layout)
+    model_comparison = build_model_comparison_report(layout)
+    identity_summary_path = layout.identity_dir / "identity_crosswalk_summary.json"
+    identity_summary = (
+        json.loads(identity_summary_path.read_text(encoding="utf-8"))
+        if identity_summary_path.exists()
+        else {}
+    )
+
+    source_status = str(source_capabilities.get("status") or "")
+    if source_status == "needs_configuration":
+        blockers.append("source_configuration_incomplete")
+
+    training_status = str(training_quality.get("status") or "")
+    if training_status in {"empty", "weak_supervision"}:
+        blockers.append("training_corpus_not_ready")
 
     if exclusion_reasons:
         warnings.append("model_ready_exclusions_present")
-    if not (layout.training_dir / "training_examples.json").exists():
-        warnings.append("no_training_examples_materialized")
+    if str(split_diagnostics.get("status") or "") == "leakage_risk":
+        blockers.append("split_leakage_risk_detected")
+    elif str(split_diagnostics.get("status") or "") in {"dominance_risk", "attention_needed"}:
+        warnings.append("split_diagnostics_attention_needed")
+    if str(split_readiness.get("strategy_family") or "") == "exploratory":
+        warnings.append("exploratory_split_strategy")
+    split_counts = split_diagnostics.get("counts") or {}
+    if any(
+        int(split_counts.get(key) or 0) > 0
+        for key in ("domain_overlap_count", "pathway_overlap_count", "fold_overlap_count")
+    ):
+        warnings.append("metadata_group_overlap_detected")
+    if int(split_readiness.get("source_overlap_count") or 0) > 0:
+        warnings.append("source_group_overlap_detected")
+    if training_status == "undersized":
+        warnings.append("training_corpus_not_release_grade")
+    training_counts = training_quality.get("counts") or {}
+    metadata_annotation_scope = max(
+        canonical_pair_count,
+        model_ready_pair_count,
+        int(training_counts.get("unique_pair_count") or 0),
+        int(training_counts.get("example_count") or 0),
+    )
+    if metadata_annotation_scope > 0 and int(training_counts.get("unique_metadata_family_count") or 0) == 0:
+        warnings.append("metadata_family_annotations_missing")
+    if model_comparison.get("status") != "comparison_ready":
+        warnings.append("model_comparison_not_ready")
+    if not identity_summary:
+        warnings.append("identity_crosswalk_missing")
+    else:
+        counts = identity_summary.get("counts") or {}
+        pair_count = int(counts.get("pair_identity_count") or 0)
+        pair_partial_or_unresolved_count = int(counts.get("pair_partial_or_unresolved_count") or 0)
+        pair_partial_fraction = (
+            float(pair_partial_or_unresolved_count) / pair_count
+            if pair_count
+            else 0.0
+        )
+        if pair_count and pair_partial_fraction > 0.10:
+            warnings.append("identity_crosswalk_contains_many_fallbacks")
     if not (layout.models_dir / "ligand_memory_model.json").exists():
         warnings.append("no_baseline_model_artifact")
-    warnings.append("gui_framework_currently_tkinter")
-    warnings.append("prediction_and_risk_layers_include_baseline_or_placeholder_components")
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -445,6 +605,26 @@ def build_release_readiness_report(
             "canonical_pair_count": canonical_pair_count,
             "model_ready_pair_count": model_ready_pair_count,
             "model_ready_exclusion_count": int(manifest.get("model_ready_exclusion_count") or 0),
+            "held_out_count": int(split_readiness.get("held_out_count") or 0),
+        },
+        "split_readiness": split_readiness,
+        "quality_gates": {
+            "source_capabilities": {
+                "status": source_status,
+                "counts": source_capabilities.get("counts") or {},
+            },
+            "training_quality": {
+                "status": training_status,
+                "counts": training_quality.get("counts") or {},
+            },
+            "model_comparison": {
+                "status": model_comparison.get("status"),
+                "available_models": model_comparison.get("available_models") or {},
+            },
+            "identity_crosswalk": {
+                "status": identity_summary.get("status") or "missing",
+                "counts": identity_summary.get("counts") or {},
+            },
         },
         "supported_release_surface": {
             "gui_framework": "tkinter",

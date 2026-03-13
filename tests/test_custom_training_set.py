@@ -53,6 +53,15 @@ def _write_selection_fixtures(tmp_root: Path) -> Path:
         "4JKL,protein_protein|4JKL|A|B|A23V,SKEMPI,ddG,1,kcal/mol,1.000,\"SKEMPI:ddG=1\",1.000,3,false,,high,SKEMPI,preferred,A,Q88888,,,protein_protein,1,protein_protein,\"{}\",test,v1\n",
         encoding="utf-8",
     )
+    layout.workspace_metadata_dir.mkdir(parents=True, exist_ok=True)
+    (layout.workspace_metadata_dir / "protein_metadata.csv").write_text(
+        "pdb_id,pair_identity_key,interpro_ids,reactome_pathway_ids,structural_fold\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,IPR0001,R-HSA-1,1.10.510.10\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|wt,IPR0002,R-HSA-2,1.10.510.10\n"
+        "3GHI,protein_protein|3GHI|A|B|wt,IPR0003,R-HSA-3,b.1.1.1\n"
+        "4JKL,protein_protein|4JKL|A|B|A23V,IPR0004,R-HSA-4,b.1.1.2\n",
+        encoding="utf-8",
+    )
     return storage_root
 
 
@@ -83,8 +92,12 @@ def test_build_custom_training_set_enforces_cluster_diversity() -> None:
     assert Path(artifacts["custom_training_manifest_json"]).exists()
     assert summary["selected_count"] == 2
     assert summary["selected_receptor_clusters"] == 2
+    assert summary["selected_metadata_families"] == 2
     assert scorecard["diversity"]["selected_receptor_clusters"] == 2
     assert any(row["benchmark_mode"] == "receptor_cluster" for row in benchmark_rows)
+    assert any(row["benchmark_mode"] == "metadata_family" for row in benchmark_rows)
+    assert any(row["benchmark_mode"] == "pathway_group" for row in benchmark_rows)
+    assert any(row["benchmark_mode"] == "fold_group" for row in benchmark_rows)
 
 
 def test_build_custom_training_set_mutation_mode_prefers_mutants() -> None:

@@ -227,3 +227,113 @@ def test_fetch_chemcomp_descriptors_parses_current_schema() -> None:
     assert descriptors["ATP"]["SMILES_CANONICAL"] == "C1=NC"
     assert descriptors["ATP"]["SMILES"] == "C1=NC"
     assert descriptors["ATP"]["formula_weight"] == "507.181"
+
+
+def test_search_entries_applies_representative_result_limit() -> None:
+    criteria = SearchCriteria(max_results=3, representative_sampling=True)
+
+    class _Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    search_payload = {
+        "total_count": 6,
+        "result_set": [
+            {"identifier": "1AAA"},
+            {"identifier": "1AAB"},
+            {"identifier": "1AAC"},
+            {"identifier": "2BBB"},
+            {"identifier": "3CCC"},
+            {"identifier": "4DDD"},
+        ],
+    }
+    representative_entries = [
+        {
+            "rcsb_id": "1AAA",
+            "exptl": [{"method": "X-RAY DIFFRACTION"}],
+            "rcsb_entry_info": {"resolution_combined": [1.8], "polymer_entity_count_protein": 1, "nonpolymer_entity_count": 1},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 9606}]}],
+            "nonpolymer_entities": [{"nonpolymer_comp": {"chem_comp": {"id": "ATP"}}}],
+        },
+        {
+            "rcsb_id": "1AAB",
+            "exptl": [{"method": "X-RAY DIFFRACTION"}],
+            "rcsb_entry_info": {"resolution_combined": [1.9], "polymer_entity_count_protein": 1, "nonpolymer_entity_count": 1},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 9606}]}],
+            "nonpolymer_entities": [{"nonpolymer_comp": {"chem_comp": {"id": "ATP"}}}],
+        },
+        {
+            "rcsb_id": "1AAC",
+            "exptl": [{"method": "X-RAY DIFFRACTION"}],
+            "rcsb_entry_info": {"resolution_combined": [2.0], "polymer_entity_count_protein": 1, "nonpolymer_entity_count": 1},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 9606}]}],
+            "nonpolymer_entities": [{"nonpolymer_comp": {"chem_comp": {"id": "ATP"}}}],
+        },
+        {
+            "rcsb_id": "2BBB",
+            "exptl": [{"method": "ELECTRON MICROSCOPY"}],
+            "rcsb_entry_info": {"resolution_combined": [3.5], "polymer_entity_count_protein": 2, "nonpolymer_entity_count": 0},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 10090}]}],
+            "nonpolymer_entities": [],
+        },
+        {
+            "rcsb_id": "3CCC",
+            "exptl": [{"method": "SOLUTION NMR"}],
+            "rcsb_entry_info": {"resolution_combined": [], "polymer_entity_count_protein": 2, "nonpolymer_entity_count": 0},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 7227}]}],
+            "nonpolymer_entities": [],
+        },
+        {
+            "rcsb_id": "4DDD",
+            "exptl": [{"method": "X-RAY DIFFRACTION"}],
+            "rcsb_entry_info": {"resolution_combined": [2.6], "polymer_entity_count_protein": 1, "nonpolymer_entity_count": 1},
+            "polymer_entities": [{"rcsb_entity_source_organism": [{"ncbi_taxonomy_id": 4932}]}],
+            "nonpolymer_entities": [{"nonpolymer_comp": {"chem_comp": {"id": "HEM"}}}],
+        },
+    ]
+
+    original_post = rcsb_search.requests.post
+    original_fetch_entries_batch = rcsb_search.fetch_entries_batch
+    try:
+        rcsb_search.requests.post = lambda *args, **kwargs: _Response(search_payload)
+        rcsb_search.fetch_entries_batch = lambda ids: [entry for entry in representative_entries if entry["rcsb_id"] in ids]
+        ids = rcsb_search.search_entries(criteria)
+    finally:
+        rcsb_search.requests.post = original_post
+        rcsb_search.fetch_entries_batch = original_fetch_entries_batch
+
+    assert ids == ["1AAA", "2BBB", "3CCC"]
+
+
+def test_search_entries_hard_limit_preserves_order() -> None:
+    criteria = SearchCriteria(max_results=2, representative_sampling=False)
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "total_count": 4,
+                "result_set": [
+                    {"identifier": "1AAA"},
+                    {"identifier": "1AAB"},
+                    {"identifier": "2BBB"},
+                    {"identifier": "3CCC"},
+                ],
+            }
+
+    original_post = rcsb_search.requests.post
+    try:
+        rcsb_search.requests.post = lambda *args, **kwargs: _Response()
+        ids = rcsb_search.search_entries(criteria)
+    finally:
+        rcsb_search.requests.post = original_post
+
+    assert ids == ["1AAA", "1AAB"]

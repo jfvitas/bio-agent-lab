@@ -6,7 +6,8 @@ and feature-layer outputs into spec-aligned TrainingExampleRecord objects.
 Assembly rules:
 - One training example per unique (pair_identity_key, binding_affinity_type)
 - Missing fields are set to None (not imputed)
-- Labels use binding_affinity_log10_standardized when available
+- Labels use binding_affinity_log10_standardized when available, then
+  conservatively fall back to reported_measurement_mean_log10_standardized
 - Provenance tracks which tables contributed to each example
 """
 
@@ -29,30 +30,9 @@ from pbdata.schemas.training_example import (
     StructureFields,
     TrainingExampleRecord,
 )
+from pbdata.table_io import load_json_rows, load_table_json
 
 logger = logging.getLogger(__name__)
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
-
-def _load_json_file(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    return [raw] if isinstance(raw, dict) else []
 
 
 def assemble_training_examples(
@@ -66,14 +46,14 @@ def assemble_training_examples(
     Returns (examples_path, manifest_path).
     """
     # Load all upstream data
-    entries = _load_table_json(extracted_dir / "entry")
-    chains = _load_table_json(extracted_dir / "chains")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    assays = _load_table_json(extracted_dir / "assays")
-    features = _load_json_file(features_dir / "feature_records.json")
-    graph_nodes = _load_json_file(graph_dir / "graph_nodes.json")
-    graph_edges = _load_json_file(graph_dir / "graph_edges.json")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable training input")
+    chains = load_table_json(extracted_dir / "chains", logger=logger, warning_prefix="Skipping unreadable training input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable training input")
+    interfaces = load_table_json(extracted_dir / "interfaces", logger=logger, warning_prefix="Skipping unreadable training input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable training input")
+    features = load_json_rows(features_dir / "feature_records.json", logger=logger, warning_prefix="Skipping unreadable training input")
+    graph_nodes = load_json_rows(graph_dir / "graph_nodes.json", logger=logger, warning_prefix="Skipping unreadable training input")
+    graph_edges = load_json_rows(graph_dir / "graph_edges.json", logger=logger, warning_prefix="Skipping unreadable training input")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -321,6 +301,11 @@ def assemble_training_examples(
         # --- Labels ---
         labels: dict[str, Any] = {}
         log10_val = assay.get("binding_affinity_log10_standardized")
+        log10_source = "binding_affinity_log10_standardized"
+        if log10_val in (None, ""):
+            log10_val = assay.get("reported_measurement_mean_log10_standardized")
+            if log10_val not in (None, ""):
+                log10_source = "reported_measurement_mean_log10_standardized"
         if log10_val is not None:
             labels["binding_affinity_log10"] = log10_val
         raw_val = assay.get("binding_affinity_value")
@@ -399,6 +384,7 @@ def assemble_training_examples(
                 "labels": {
                     "source_tables": ["assays"],
                     "affinity_type": affinity_type or None,
+                    "binding_affinity_log10_source": log10_source if log10_val is not None else None,
                 },
             },
         ))
@@ -413,12 +399,52 @@ def assemble_training_examples(
         encoding="utf-8",
     )
 
+    source_status = {
+        "entry": _table_status(entries, extracted_dir / "entry"),
+        "chains": _table_status(chains, extracted_dir / "chains"),
+        "bound_objects": _table_status(bound_objects, extracted_dir / "bound_objects"),
+        "interfaces": _table_status(interfaces, extracted_dir / "interfaces"),
+        "assays": _table_status(assays, extracted_dir / "assays"),
+        "features": _file_status(features, features_dir / "feature_records.json"),
+        "graph_nodes": _file_status(graph_nodes, graph_dir / "graph_nodes.json"),
+        "graph_edges": _file_status(graph_edges, graph_dir / "graph_edges.json"),
+    }
+    sources_present = sorted(name for name, status in source_status.items() if status == "present")
+    sources_missing = sorted(name for name, status in source_status.items() if status == "missing")
+    sources_empty = sorted(name for name, status in source_status.items() if status == "empty")
+    completeness_warnings: list[str] = []
+    if source_status["assays"] != "present":
+        completeness_warnings.append("assays_missing_or_empty")
+    if examples and source_status["features"] != "present":
+        completeness_warnings.append("feature_records_missing_or_empty")
+    if examples and (
+        source_status["graph_nodes"] != "present"
+        or source_status["graph_edges"] != "present"
+    ):
+        completeness_warnings.append("graph_inputs_missing_or_empty")
+    if examples and len(examples) < len(assays):
+        completeness_warnings.append("deduped_or_filtered_examples_smaller_than_assay_rows")
+    if not examples and assays:
+        completeness_warnings.append("assay_rows_present_but_no_examples_assembled")
+
     manifest = {
         "generated_at": generated_at,
         "status": "assembled",
         "layer": "training_example",
         "example_count": len(examples),
         "sources_used": sorted(sources_used),
+        "sources_present": sources_present,
+        "sources_missing": sources_missing,
+        "sources_empty": sources_empty,
+        "source_status": source_status,
+        "data_completeness": {
+            "assay_row_count": len(assays),
+            "feature_row_count": len(features),
+            "graph_node_count": len(graph_nodes),
+            "graph_edge_count": len(graph_edges),
+            "warning_count": len(completeness_warnings),
+            "warnings": completeness_warnings,
+        },
         "required_sections": [
             "structure", "protein", "ligand",
             "interaction", "experiment", "graph_features",
@@ -464,6 +490,18 @@ def _safe_bool(value: Any) -> bool | None:
     if text in {"false", "0", "no"}:
         return False
     return None
+
+
+def _table_status(rows: list[dict[str, Any]], table_dir: Path) -> str:
+    if not table_dir.exists():
+        return "missing"
+    return "present" if rows else "empty"
+
+
+def _file_status(rows: list[dict[str, Any]], path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    return "present" if rows else "empty"
 
 
 # ---------------------------------------------------------------------------

@@ -44,8 +44,15 @@ def logging_config_path() -> Path:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Remove transient per-test artifacts created under tests/_tmp."""
-    for child in _LOCAL_TMP.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child, ignore_errors=True)
-        else:
-            child.unlink(missing_ok=True)
+    try:
+        children = list(_LOCAL_TMP.iterdir())
+    except OSError:
+        return
+    for child in children:
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except OSError:
+            continue

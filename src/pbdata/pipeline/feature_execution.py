@@ -38,7 +38,10 @@ from pbdata.pipeline.feature_post_pipeline import (
     export_representative_fragment_inputs,
     write_analysis_queue_yaml,
 )
-from pbdata.pipeline.feature_pipeline_stages import build_feature_pipeline_stages
+from pbdata.pipeline.feature_pipeline_stages import (
+    FEATURE_PIPELINE_STAGE_NAMES,
+    build_feature_pipeline_stages,
+)
 from pbdata.pipeline.feature_pipeline_runtime import (
     append_structured_error as _append_structured_error,
     default_run_id as _default_run_id,
@@ -556,7 +559,10 @@ def run_feature_pipeline(
             raise ValueError("stage_only run mode requires --stage-name")
         stages = [stage for stage in stages if stage[0] == config.stage_only]
         if not stages:
-            raise ValueError(f"Unknown stage_only target: {config.stage_only}")
+            raise ValueError(
+                f"Unknown stage_only target: {config.stage_only}. "
+                f"Valid stage names: {', '.join(FEATURE_PIPELINE_STAGE_NAMES)}"
+            )
         for dependency in stages[0][1]:
             dep_status = _load_stage_status(layout, config.run_id, dependency)
             if dep_status is None or str(dep_status.get("status") or "") != "passed":

@@ -7,10 +7,12 @@ import json
 from typer.testing import CliRunner
 
 from pbdata.cli import app
+from pbdata.cli import _pair_split_items_from_layout
 from pbdata.dataset.splits import (
     PairSplitItem,
     build_grouped_pair_splits,
     build_pair_aware_splits,
+    build_split_diagnostics,
     build_splits,
     build_temporal_pair_splits,
     cluster_aware_split,
@@ -379,6 +381,81 @@ def test_temporal_pair_splits_order_by_release_date() -> None:
     assert metadata["mode"] == "time_ordered"
 
 
+def test_split_diagnostics_include_metadata_overlap_channels() -> None:
+    items = [
+        PairSplitItem(
+            item_id="ex1",
+            pair_identity_key="protein_ligand|1ABC|A|ATP|wt",
+            affinity_type="Kd",
+            receptor_sequence="M" * 220,
+            receptor_identity="P12345",
+            representation_key="protein_ligand|Kd|wildtype|has_sequence",
+            hard_group_key="protein_ligand|P12345|ATP",
+            family_key="protein_ligand|IPR0001",
+            domain_group_key="protein_ligand|IPR0001",
+            pathway_group_key="protein_ligand|R-HSA-1",
+            fold_group_key="protein_ligand|monomer",
+        ),
+        PairSplitItem(
+            item_id="ex2",
+            pair_identity_key="protein_ligand|2DEF|A|GTP|wt",
+            affinity_type="Kd",
+            receptor_sequence="Q" * 220,
+            receptor_identity="Q99999",
+            representation_key="protein_ligand|Kd|wildtype|has_sequence",
+            hard_group_key="protein_ligand|Q99999|GTP",
+            family_key="protein_ligand|IPR0002",
+            domain_group_key="protein_ligand|IPR0002",
+            pathway_group_key="protein_ligand|R-HSA-1",
+            fold_group_key="protein_ligand|monomer",
+        ),
+    ]
+
+    result = type("SplitResultStub", (), {"train": ["ex1"], "val": ["ex2"], "test": []})()
+    diagnostics = build_split_diagnostics(items, result, strategy="pair_aware_grouped")
+
+    assert diagnostics["counts"]["pathway_overlap_count"] == 1
+    assert diagnostics["counts"]["domain_overlap_count"] == 0
+    assert diagnostics["status"] == "dominance_risk"
+
+
+def test_pair_split_items_prefer_metadata_family_keys() -> None:
+    tmp_root = _tmp_dir("pair_split_metadata_keys")
+    from pbdata.storage import build_storage_layout
+
+    layout = build_storage_layout(tmp_root)
+    extracted = tmp_root / "data" / "extracted"
+    training = tmp_root / "data" / "training_examples"
+    metadata = layout.workspace_metadata_dir
+    for name in ["assays", "chains", "entry"]:
+        (extracted / name).mkdir(parents=True, exist_ok=True)
+    training.mkdir(parents=True, exist_ok=True)
+    metadata.mkdir(parents=True, exist_ok=True)
+
+    (extracted / "chains" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "chain_id": "A", "polymer_sequence": "M" * 220, "uniprot_id": "P12345"},
+    ]), encoding="utf-8")
+    (extracted / "entry" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "release_date": "2020-01-01", "oligomeric_state": "monomer"},
+    ]), encoding="utf-8")
+    (extracted / "assays" / "pairs.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt", "binding_affinity_type": "Kd"},
+    ]), encoding="utf-8")
+    (metadata / "protein_metadata.csv").write_text(
+        "pdb_id,pair_identity_key,interpro_ids,pfam_ids,reactome_pathway_ids,structural_fold\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,IPR0001,PF0001,R-HSA-1,monomer\n",
+        encoding="utf-8",
+    )
+
+    items = _pair_split_items_from_layout(layout)
+
+    assert len(items) == 1
+    assert items[0].family_key == "protein_ligand|IPR0001"
+    assert items[0].domain_group_key == "protein_ligand|IPR0001"
+    assert items[0].pathway_group_key == "protein_ligand|R-HSA-1"
+    assert items[0].fold_group_key == "protein_ligand|monomer"
+
+
 def test_build_splits_auto_uses_pair_aware_training_examples() -> None:
     tmp_root = _tmp_dir("pair_aware_cli")
     extracted = tmp_root / "data" / "extracted"
@@ -409,6 +486,9 @@ def test_build_splits_auto_uses_pair_aware_training_examples() -> None:
     assert result.exit_code == 0
     metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["strategy"] == "pair_aware_grouped"
+    diagnostics = json.loads((tmp_root / "data" / "splits" / "split_diagnostics.json").read_text(encoding="utf-8"))
+    assert diagnostics["strategy"] == "pair_aware_grouped"
+    assert diagnostics["counts"]["hard_group_overlap_count"] == 0
     train_ids = set((tmp_root / "data" / "splits" / "train.txt").read_text(encoding="utf-8").split())
     val_ids = set((tmp_root / "data" / "splits" / "val.txt").read_text(encoding="utf-8").split())
     test_ids = set((tmp_root / "data" / "splits" / "test.txt").read_text(encoding="utf-8").split())
@@ -462,8 +542,11 @@ def test_build_splits_scaffold_mode_uses_training_example_ligand_proxy() -> None
     )
     assert result.exit_code == 0
     metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
+    diagnostics = json.loads((tmp_root / "data" / "splits" / "split_diagnostics.json").read_text(encoding="utf-8"))
     assert metadata["strategy"] == "scaffold_grouped"
     assert metadata["mode"] == "scaffold_grouped"
+    assert diagnostics["strategy"] == "scaffold_grouped"
+    assert diagnostics["status"] in {"ready", "attention_needed", "dominance_risk"}
     placements = [
         set((tmp_root / "data" / "splits" / f"{name}.txt").read_text(encoding="utf-8").split())
         for name in ("train", "val", "test")
@@ -514,7 +597,9 @@ def test_build_splits_source_and_time_modes() -> None:
     )
     assert source_result.exit_code == 0
     source_metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
+    source_diagnostics = json.loads((tmp_root / "data" / "splits" / "split_diagnostics.json").read_text(encoding="utf-8"))
     assert source_metadata["strategy"] == "source_grouped"
+    assert source_diagnostics["strategy"] == "source_grouped"
 
     time_result = runner.invoke(
         app,
@@ -523,4 +608,6 @@ def test_build_splits_source_and_time_modes() -> None:
     )
     assert time_result.exit_code == 0
     time_metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
+    time_diagnostics = json.loads((tmp_root / "data" / "splits" / "split_diagnostics.json").read_text(encoding="utf-8"))
     assert time_metadata["strategy"] == "time_ordered"
+    assert time_diagnostics["strategy"] == "time_ordered"

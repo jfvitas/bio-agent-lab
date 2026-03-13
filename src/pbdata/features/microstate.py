@@ -18,6 +18,7 @@ from typing import Any
 import gemmi
 
 from pbdata.pairing import parse_pair_identity_key
+from pbdata.table_io import load_table_json
 
 logger = logging.getLogger(__name__)
 
@@ -25,20 +26,6 @@ _IONIZABLE_RESIDUES = {"ASP", "GLU", "HIS", "LYS", "ARG", "CYS", "TYR"}
 _POSITIVE_DEFAULT = {"LYS": 1.0, "ARG": 1.0}
 _NEGATIVE_DEFAULT = {"ASP": -1.0, "GLU": -1.0}
 _METAL_ELEMENTS = {"ZN", "FE", "MG", "MN", "CA", "CU", "CO", "NI"}
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
 
 def _distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
@@ -216,8 +203,8 @@ def build_microstate_records(
     output_dir: Path,
 ) -> tuple[Path, Path]:
     """Build pair-level microstate records from extracted data and local structures."""
-    entries = _load_table_json(extracted_dir / "entry")
-    assays = _load_table_json(extracted_dir / "assays")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable microstate input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable microstate input")
     entry_by_pdb = {str(entry.get("pdb_id") or ""): entry for entry in entries if entry.get("pdb_id")}
     output_dir.mkdir(parents=True, exist_ok=True)
 

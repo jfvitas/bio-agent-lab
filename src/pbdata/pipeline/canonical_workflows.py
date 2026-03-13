@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from pbdata.catalog import summarize_bulk_file, update_download_manifest
 from pbdata.criteria import load_criteria
+from pbdata.file_health import atomic_write_text
 from pbdata.master_export import refresh_master_exports
 from pbdata.quality.audit import audit_record
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
@@ -94,6 +95,7 @@ class NormalizeResult:
     cached: int
     failed: int
     chem_descriptor_count: int
+    unreadable_inputs: int
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class AuditResult:
     failed: int
     mean_quality_score: float
     top_flags: dict[str, int]
+    unreadable_inputs: int
 
 
 @dataclass(frozen=True)
@@ -236,16 +239,22 @@ def run_normalize_rcsb(
 
     comp_ids: list[str] = []
     raw_data: list[tuple[Path, dict[str, Any]]] = []
+    unreadable_inputs = 0
     for file_path in files:
         try:
-            raw = json.loads(file_path.read_text())
+            raw = json.loads(file_path.read_text(encoding="utf-8"))
             raw_data.append((file_path, raw))
             for ent in raw.get("nonpolymer_entities") or []:
                 cid = (((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {}).get("id", ""))
                 if cid:
                     comp_ids.append(cid)
-        except Exception as exc:
-            logger.warning("Failed to read %s: %s", file_path.name, exc)
+        except Exception:
+            unreadable_inputs += 1
+    if unreadable_inputs and progress_fn:
+        progress_fn(
+            f"Skipped {unreadable_inputs:,} unreadable raw record(s) while scanning input JSON. "
+            "Use `pbdata clean --raw --delete` to remove corrupt cached files."
+        )
 
     chem_descriptors: dict[str, dict[str, str]] = {}
     if comp_ids:
@@ -273,7 +282,7 @@ def run_normalize_rcsb(
             return path.name, "cached"
         out_path.unlink(missing_ok=True)
         record = adapter.normalize_record(raw, chem_descriptors=chem_descriptors)
-        out_path.write_text(record.model_dump_json(indent=2))
+        atomic_write_text(out_path, record.model_dump_json(indent=2))
         return path.name, "ok"
 
     if worker_count == 1:
@@ -327,6 +336,7 @@ def run_normalize_rcsb(
         cached=cached,
         failed=failed,
         chem_descriptor_count=len(chem_descriptors),
+        unreadable_inputs=unreadable_inputs,
     )
 
 
@@ -349,13 +359,14 @@ def run_audit_processed_records(
     scores: list[float] = []
     ok = failed = 0
     worker_count = _coerce_workers(workers)
+    failed_names: list[str] = []
 
     def _audit_one(path: Path) -> CanonicalBindingSample:
         raw = json.loads(path.read_text())
         record = CanonicalBindingSample.model_validate(raw)
         audited = audit_record(record)
         processed_dir.mkdir(parents=True, exist_ok=True)
-        (processed_dir / path.name).write_text(audited.model_dump_json(indent=2))
+        atomic_write_text(processed_dir / path.name, audited.model_dump_json(indent=2))
         return audited
 
     if worker_count == 1:
@@ -366,8 +377,9 @@ def run_audit_processed_records(
                 scores.append(audited.quality_score)
                 ok += 1
             except Exception as exc:
-                logger.warning("Failed to audit %s: %s", file_path.name, exc)
                 failed += 1
+                if len(failed_names) < 5:
+                    failed_names.append(file_path.name)
     else:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {executor.submit(_audit_one, file_path): file_path.name for file_path in files}
@@ -379,8 +391,15 @@ def run_audit_processed_records(
                     scores.append(audited.quality_score)
                     ok += 1
                 except Exception as exc:
-                    logger.warning("Failed to audit %s: %s", name, exc)
                     failed += 1
+                    if len(failed_names) < 5:
+                        failed_names.append(name)
+    if failed and progress_fn:
+        preview = ", ".join(failed_names)
+        suffix = f" Examples: {preview}." if preview else ""
+        progress_fn(
+            f"Skipped {failed:,} unreadable or invalid processed record(s) during audit.{suffix}"
+        )
 
     summary = {
         "total": ok + failed,
@@ -395,7 +414,7 @@ def run_audit_processed_records(
         "flag_counts": dict(flag_counter.most_common()),
     }
     summary_path = layout.audit_dir / "audit_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
+    atomic_write_text(summary_path, json.dumps(summary, indent=2))
     state_path = write_stage_state(
         layout,
         stage="audit",
@@ -419,6 +438,7 @@ def run_audit_processed_records(
         failed=failed,
         mean_quality_score=float(summary["quality_score"]["mean"]),
         top_flags=dict(flag_counter.most_common(5)),
+        unreadable_inputs=failed,
     )
 
 
@@ -462,8 +482,11 @@ def run_processed_report(
                 if val is not None and val != [] and val != "":
                     field_present[field] += 1
         except Exception as exc:
-            logger.warning("Skipping %s: %s", file_path.name, exc)
             failed += 1
+    if failed and progress_fn:
+        progress_fn(
+            f"Skipped {failed:,} unreadable or invalid processed record(s) while building the report."
+        )
 
     total = len(files) - failed
 
@@ -496,7 +519,7 @@ def run_processed_report(
 
     layout.reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = layout.reports_dir / "summary.json"
-    report_path.write_text(json.dumps(rep, indent=2))
+    atomic_write_text(report_path, json.dumps(rep, indent=2))
     export_status = refresh_master_exports(layout)
 
     return ProcessedReportResult(

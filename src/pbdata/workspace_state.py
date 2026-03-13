@@ -2,19 +2,49 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from pbdata.config import AppConfig
+from pbdata.file_health import JsonFileHealthSummary, load_or_scan_json_directory, write_health_summary_report
+from pbdata.schemas.canonical_sample import CanonicalBindingSample
+from pbdata.stage_state import list_stage_activity
 from pbdata.storage import StorageLayout
+
+_DIRECTORY_COUNT_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int], int]] = {}
+
+
+def _directory_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_mtime_ns, getattr(stat, "st_ctime_ns", 0), stat.st_size)
 
 
 def _count_glob(path: Path, pattern: str) -> int:
-    if not path.exists():
+    signature = _directory_signature(path)
+    if signature is None:
         return 0
-    return sum(1 for _ in path.glob(pattern))
+    cache_key = (str(path), pattern)
+    cached = _DIRECTORY_COUNT_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return cached[1]
+
+    count = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_file() and fnmatch.fnmatch(entry.name, pattern):
+                    count += 1
+    except OSError:
+        count = 0
+    _DIRECTORY_COUNT_CACHE[cache_key] = (signature, count)
+    return count
 
 
 @dataclass(frozen=True)
@@ -22,6 +52,17 @@ class WorkspaceStatusReport:
     storage_root: str
     raw_rcsb_count: int
     processed_rcsb_count: int
+    processed_rcsb_valid_count: int
+    processed_rcsb_problem_count: int
+    processed_rcsb_empty_count: int
+    processed_rcsb_corrupt_count: int
+    processed_rcsb_invalid_count: int
+    processed_health_cache_used: bool
+    processed_health_cache_stale: bool
+    processed_health_generated_at: str | None
+    processed_health_report_json: str | None
+    processed_health_report_md: str | None
+    processed_health_sample_problem_files: list[str]
     extracted_entry_count: int
     structure_file_count: int
     graph_node_export_present: bool
@@ -33,11 +74,23 @@ class WorkspaceStatusReport:
     baseline_model_present: bool
     site_feature_runs: int
     surrogate_checkpoint_present: bool
+    active_stage_lock_count: int
+    running_stage_state_count: int
+    failed_stage_state_count: int
+    latest_stage_name: str | None
+    latest_stage_status: str | None
     core_pipeline_ready: bool
     advanced_outputs_ready: bool
+    processed_health: JsonFileHealthSummary
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["processed_health"] = self.processed_health.to_dict()
+        return payload
+
+
+def _validate_processed_record(raw: dict[str, object]) -> None:
+    CanonicalBindingSample.model_validate(raw)
 
 
 @dataclass(frozen=True)
@@ -91,7 +144,11 @@ class DemoReadinessReport:
         return payload
 
 
-def build_status_report(layout: StorageLayout) -> WorkspaceStatusReport:
+def build_status_report(
+    layout: StorageLayout,
+    *,
+    prefer_cached_health: bool = False,
+) -> WorkspaceStatusReport:
     training_examples_path = layout.training_dir / "training_examples.json"
     model_path = layout.models_dir / "ligand_memory_model.json"
     latest_release = layout.releases_dir / "latest_release.json"
@@ -110,11 +167,53 @@ def build_status_report(layout: StorageLayout) -> WorkspaceStatusReport:
     release_snapshot_present = latest_release.exists()
     baseline_model_present = model_path.exists()
     site_feature_runs = _count_glob(layout.artifact_manifests_dir, "*_input_manifest.json")
+    layout.reports_dir.mkdir(parents=True, exist_ok=True)
+    processed_health_report_json = layout.reports_dir / "processed_json_health.json"
+    processed_health_report_md = layout.reports_dir / "processed_json_health.md"
+    processed_health = load_or_scan_json_directory(
+        layout.processed_rcsb_dir,
+        validator=_validate_processed_record,
+        cache_path=processed_health_report_json,
+        prefer_cached=prefer_cached_health,
+    )
+    write_health_summary_report(
+        processed_health,
+        json_path=processed_health_report_json,
+        md_path=processed_health_report_md,
+        title="Processed JSON Health",
+        scan_target=layout.processed_rcsb_dir,
+    )
+    stage_activity = list_stage_activity(layout)
+    latest_stage = max(
+        stage_activity,
+        key=lambda payload: str(payload.get("generated_at") or ""),
+        default={},
+    )
+    active_stage_lock_count = sum(1 for payload in stage_activity if payload.get("lock_active"))
+    running_stage_state_count = sum(
+        1
+        for payload in stage_activity
+        if str(payload.get("status") or "") == "running" and bool(payload.get("lock_active"))
+    )
+    failed_stage_state_count = sum(
+        1 for payload in stage_activity if str(payload.get("status") or "") == "failed"
+    )
 
     return WorkspaceStatusReport(
         storage_root=str(layout.root),
         raw_rcsb_count=_count_glob(layout.raw_rcsb_dir, "*.json"),
-        processed_rcsb_count=_count_glob(layout.processed_rcsb_dir, "*.json"),
+        processed_rcsb_count=processed_health.total_count,
+        processed_rcsb_valid_count=processed_health.valid_count,
+        processed_rcsb_problem_count=processed_health.problem_count,
+        processed_rcsb_empty_count=processed_health.empty_count,
+        processed_rcsb_corrupt_count=processed_health.corrupt_count,
+        processed_rcsb_invalid_count=processed_health.invalid_count,
+        processed_health_cache_used=processed_health.cache_used,
+        processed_health_cache_stale=processed_health.cache_stale,
+        processed_health_generated_at=processed_health.generated_at,
+        processed_health_report_json=str(processed_health_report_json) if processed_health_report_json.exists() else None,
+        processed_health_report_md=str(processed_health_report_md) if processed_health_report_md.exists() else None,
+        processed_health_sample_problem_files=list(processed_health.sample_problem_files),
         extracted_entry_count=_count_glob(layout.extracted_dir / "entry", "*.json"),
         structure_file_count=_count_glob(layout.structures_rcsb_dir, "*.cif") + _count_glob(layout.structures_rcsb_dir, "*.pdb"),
         graph_node_export_present=graph_nodes,
@@ -126,6 +225,11 @@ def build_status_report(layout: StorageLayout) -> WorkspaceStatusReport:
         baseline_model_present=baseline_model_present,
         site_feature_runs=site_feature_runs,
         surrogate_checkpoint_present=(layout.surrogate_training_artifacts_dir / "latest_surrogate_checkpoint.json").exists(),
+        active_stage_lock_count=active_stage_lock_count,
+        running_stage_state_count=running_stage_state_count,
+        failed_stage_state_count=failed_stage_state_count,
+        latest_stage_name=str(latest_stage.get("stage") or "") or None,
+        latest_stage_status=str(latest_stage.get("status") or "") or None,
         core_pipeline_ready=bool(
             _count_glob(layout.raw_rcsb_dir, "*.json")
             or _count_glob(layout.processed_rcsb_dir, "*.json")
@@ -139,10 +243,16 @@ def build_status_report(layout: StorageLayout) -> WorkspaceStatusReport:
             or release_snapshot_present
             or site_feature_runs
         ),
+        processed_health=processed_health,
     )
 
 
-def build_doctor_report(layout: StorageLayout, config: AppConfig) -> DoctorReport:
+def build_doctor_report(
+    layout: StorageLayout,
+    config: AppConfig,
+    *,
+    status_snapshot: WorkspaceStatusReport | None = None,
+) -> DoctorReport:
     dependency_checks: dict[str, DependencyCheck] = {}
     for package_name, required, note in [
         ("gemmi", True, "Required for structure parsing."),
@@ -190,14 +300,20 @@ def build_doctor_report(layout: StorageLayout, config: AppConfig) -> DoctorRepor
         },
         dependency_checks=dependency_checks,
         source_status=source_status,
-        status_snapshot=build_status_report(layout),
+        status_snapshot=status_snapshot or build_status_report(layout),
         overall_status=overall_status,
     )
 
 
-def build_demo_readiness_report(layout: StorageLayout, config: AppConfig) -> DemoReadinessReport:
-    status = build_status_report(layout)
-    doctor = build_doctor_report(layout, config)
+def build_demo_readiness_report(
+    layout: StorageLayout,
+    config: AppConfig,
+    *,
+    status_snapshot: WorkspaceStatusReport | None = None,
+    doctor_report: DoctorReport | None = None,
+) -> DemoReadinessReport:
+    status = status_snapshot or build_status_report(layout)
+    doctor = doctor_report or build_doctor_report(layout, config, status_snapshot=status)
 
     blockers: list[str] = []
     if doctor.overall_status != "ready":

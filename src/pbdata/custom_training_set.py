@@ -64,6 +64,9 @@ class SelectionCandidate:
     mutation_family: str
     task_type: str
     pair_family_key: str
+    metadata_family_key: str
+    pathway_group_key: str
+    fold_group_key: str
     receptor_identity: str
     receptor_sequence: str | None
     receptor_cluster_key: str
@@ -216,7 +219,13 @@ def _build_candidates(
     root = repo_root or Path.cwd()
     model_ready_rows = _read_csv(_repo_path("model_ready_pairs.csv", root))
     entry_rows = _read_csv(_repo_path("master_pdb_repository.csv", root))
+    metadata_rows = _read_csv(layout.workspace_metadata_dir / "protein_metadata.csv")
     entry_by_pdb = {str(row.get("pdb_id") or ""): row for row in entry_rows if row.get("pdb_id")}
+    metadata_by_pair = {
+        str(row.get("pair_identity_key") or ""): row
+        for row in metadata_rows
+        if row.get("pair_identity_key")
+    }
     deduped_rows, dedupe_exclusions = _dedupe_model_ready_rows(model_ready_rows)
     candidates: list[SelectionCandidate] = []
     for index, row in enumerate(deduped_rows):
@@ -231,6 +240,13 @@ def _build_candidates(
         partner_key = ",".join(parsed.partner_chain_ids) if parsed is not None and parsed.partner_chain_ids else ""
         pair_family = _pair_family_key(task_type, receptor_identity, ligand_key, partner_key)
         entry = entry_by_pdb.get(pdb_id, {})
+        metadata = metadata_by_pair.get(pair_key, {})
+        metadata_family_key = (
+            str(metadata.get("interpro_ids") or metadata.get("pfam_ids") or "").strip()
+            or "metadata_family_unknown"
+        )
+        pathway_group_key = str(metadata.get("reactome_pathway_ids") or "").strip() or "pathway_unknown"
+        fold_group_key = str(metadata.get("structural_fold") or metadata.get("cath_ids") or metadata.get("scop_ids") or "").strip() or "fold_unknown"
         receptor_sequence = _receptor_sequence_token(row)
         confidence_penalty = _confidence_penalty(row.get("assay_field_confidence_json")) + _confidence_penalty(entry.get("field_confidence_json"))
         quality_score = _safe_float(entry.get("quality_score"), 0.0)
@@ -266,6 +282,9 @@ def _build_candidates(
             mutation_family=mutation_family,
             task_type=task_type,
             pair_family_key=pair_family,
+            metadata_family_key=metadata_family_key,
+            pathway_group_key=pathway_group_key,
+            fold_group_key=fold_group_key,
             receptor_identity=receptor_identity,
             receptor_sequence=receptor_sequence,
             receptor_cluster_key="",
@@ -305,6 +324,9 @@ def _candidate_tokens(candidate: SelectionCandidate) -> set[str]:
         f"mutation:{candidate.mutation_family}",
         f"quality:{_normalize_quality_band(candidate.quality_score)}",
         f"split:{candidate.release_split or 'unsplit'}",
+        f"metadata_family:{candidate.metadata_family_key}",
+        f"pathway:{candidate.pathway_group_key}",
+        f"fold:{candidate.fold_group_key}",
     }
     for ligand_type in _semicolon_values(candidate.ligand_types):
         tokens.add(f"ligand:{ligand_type}")
@@ -327,6 +349,9 @@ def _benchmark_rows(selected: list[SelectionCandidate]) -> list[dict[str, str]]:
         "release_split": lambda candidate: candidate.release_split or "unsplit",
         "receptor_cluster": lambda candidate: candidate.receptor_cluster_key,
         "pair_family": lambda candidate: candidate.pair_family_key,
+        "metadata_family": lambda candidate: candidate.metadata_family_key,
+        "pathway_group": lambda candidate: candidate.pathway_group_key,
+        "fold_group": lambda candidate: candidate.fold_group_key,
         "mutation_family": lambda candidate: candidate.mutation_family,
         "task_type": lambda candidate: candidate.task_type,
         "taxonomy": lambda candidate: candidate.taxonomy_ids or "taxonomy_unknown",
@@ -401,6 +426,9 @@ def _build_scorecard(
         "diversity": {
             "selected_receptor_clusters": len({candidate.receptor_cluster_key for candidate in selected}),
             "selected_pair_families": len({candidate.pair_family_key for candidate in selected}),
+            "selected_metadata_families": len({candidate.metadata_family_key for candidate in selected}),
+            "selected_pathway_groups": len({candidate.pathway_group_key for candidate in selected}),
+            "selected_fold_groups": len({candidate.fold_group_key for candidate in selected}),
             "selected_receptor_identities": len({candidate.receptor_identity for candidate in selected}),
             "release_splits": dict(release_split_counts),
             "task_types": dict(selected_task_counts),
@@ -556,6 +584,9 @@ def build_custom_training_set(
         "release_split",
         "receptor_cluster_key",
         "pair_family_key",
+        "metadata_family_key",
+        "pathway_group_key",
+        "fold_group_key",
         "mutation_family",
         "base_score",
         "quality_score",
@@ -583,6 +614,9 @@ def build_custom_training_set(
             "release_split": candidate.release_split,
             "receptor_cluster_key": candidate.receptor_cluster_key,
             "pair_family_key": candidate.pair_family_key,
+            "metadata_family_key": candidate.metadata_family_key,
+            "pathway_group_key": candidate.pathway_group_key,
+            "fold_group_key": candidate.fold_group_key,
             "mutation_family": candidate.mutation_family,
             "base_score": f"{candidate.base_score:.4f}",
             "quality_score": f"{candidate.quality_score:.4f}",
@@ -618,6 +652,9 @@ def build_custom_training_set(
         "selected_interface_types": dict(scorecard["diversity"]["interface_types"]),  # type: ignore[index]
         "selected_receptor_clusters": int(scorecard["diversity"]["selected_receptor_clusters"]),  # type: ignore[index]
         "selected_pair_families": int(scorecard["diversity"]["selected_pair_families"]),  # type: ignore[index]
+        "selected_metadata_families": int(scorecard["diversity"]["selected_metadata_families"]),  # type: ignore[index]
+        "selected_pathway_groups": int(scorecard["diversity"]["selected_pathway_groups"]),  # type: ignore[index]
+        "selected_fold_groups": int(scorecard["diversity"]["selected_fold_groups"]),  # type: ignore[index]
         "mean_quality_score": float(scorecard["quality"]["mean_quality_score"]),  # type: ignore[index]
     }
     summary_path = _repo_path(_CUSTOM_TRAINING_SUMMARY_JSON, root)

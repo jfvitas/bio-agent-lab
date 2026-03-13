@@ -10,17 +10,25 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from pbdata.storage import StorageLayout
+from pbdata.table_io import load_json_rows, load_table_json
 
 _MASTER_CSV_NAME = "master_pdb_repository.csv"
 _PAIR_MASTER_CSV_NAME = "master_pdb_pairs.csv"
 _ISSUE_CSV_NAME = "master_pdb_issues.csv"
 _CONFLICT_CSV_NAME = "master_pdb_conflicts.csv"
 _SOURCE_STATE_CSV_NAME = "master_source_state.csv"
+_CRITICAL_ASSAY_CONFIDENCE_FIELDS = frozenset({
+    "binding_affinity_log10_standardized",
+    "binding_affinity_type",
+})
+
+logger = logging.getLogger(__name__)
 
 
 def master_csv_path(repo_root: Path | None = None) -> Path:
@@ -47,27 +55,16 @@ def source_state_csv_path(repo_root: Path | None = None) -> Path:
     root = repo_root or Path.cwd()
     return root / _SOURCE_STATE_CSV_NAME
 
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
-
-def _load_json_rows(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    return [raw] if isinstance(raw, dict) else []
+def _parse_json_object(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _load_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -111,13 +108,13 @@ def export_master_repository_csv(
 ) -> Path:
     """Export one row per PDB entry to a root-level CSV."""
     extracted_dir = layout.extracted_dir
-    entries = _load_table_json(extracted_dir / "entry")
-    chains = _load_table_json(extracted_dir / "chains")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    assays = _load_table_json(extracted_dir / "assays")
-    features = _load_json_rows(layout.features_dir / "feature_records.json")
-    training_examples = _load_json_rows(layout.training_dir / "training_examples.json")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable export input")
+    chains = load_table_json(extracted_dir / "chains", logger=logger, warning_prefix="Skipping unreadable export input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable export input")
+    interfaces = load_table_json(extracted_dir / "interfaces", logger=logger, warning_prefix="Skipping unreadable export input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable export input")
+    features = load_json_rows(layout.features_dir / "feature_records.json", logger=logger, warning_prefix="Skipping unreadable export input")
+    training_examples = load_json_rows(layout.training_dir / "training_examples.json", logger=logger, warning_prefix="Skipping unreadable export input")
 
     chains_by_pdb: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in chains:
@@ -349,13 +346,13 @@ def export_master_pair_repository_csv(
 ) -> Path:
     """Export one row per pair/assay context to a root-level CSV."""
     extracted_dir = layout.extracted_dir
-    entries = _load_table_json(extracted_dir / "entry")
-    chains = _load_table_json(extracted_dir / "chains")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    assays = _load_table_json(extracted_dir / "assays")
-    features = _load_json_rows(layout.features_dir / "feature_records.json")
-    training_examples = _load_json_rows(layout.training_dir / "training_examples.json")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable export input")
+    chains = load_table_json(extracted_dir / "chains", logger=logger, warning_prefix="Skipping unreadable export input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable export input")
+    interfaces = load_table_json(extracted_dir / "interfaces", logger=logger, warning_prefix="Skipping unreadable export input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable export input")
+    features = load_json_rows(layout.features_dir / "feature_records.json", logger=logger, warning_prefix="Skipping unreadable export input")
+    training_examples = load_json_rows(layout.training_dir / "training_examples.json", logger=logger, warning_prefix="Skipping unreadable export input")
 
     entry_by_pdb = {
         str(row.get("pdb_id") or ""): row for row in entries if row.get("pdb_id")
@@ -598,9 +595,9 @@ def export_issue_repository_csv(
 ) -> Path:
     """Export filtered issue rows for rapid manual review."""
     extracted_dir = layout.extracted_dir
-    entries = _load_table_json(extracted_dir / "entry")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    assays = _load_table_json(extracted_dir / "assays")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable export input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable export input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable export input")
     pair_rows = _load_csv_rows(pair_master_csv_path(repo_root))
 
     assay_count_by_pdb: dict[str, int] = defaultdict(int)
@@ -676,7 +673,20 @@ def export_issue_repository_csv(
                 "issue_type": "no_matched_interface",
                 "details": "No interface rows matched this pair context.",
             })
-        if "mutation_unknown" in pair_key:
+        field_conf = _parse_json_object(row.get("assay_field_confidence_json"))
+        field_prov = _parse_json_object(row.get("assay_field_provenance_json"))
+        pair_key_prov = field_prov.get("pair_identity_key") or {}
+        override_used = bool(pair_key_prov.get("override_used"))
+        is_explicit_non_mutant = str(row.get("binding_affinity_is_mutant_measurement") or "").strip().lower() == "false"
+
+        # Assumption:
+        # - `mutation_unknown` is a hard ambiguity when the source row could still
+        #   plausibly describe a mutant context.
+        # - When the source explicitly says the measurement is not mutant and the
+        #   token only comes from a conservative pair-grouping override, keep the
+        #   caution in field confidence but do not promote it to a biological
+        #   blocker.
+        if "mutation_unknown" in pair_key and not (override_used and is_explicit_non_mutant):
             issue_rows.append({
                 "scope": "pair",
                 "pdb_id": pdb_id,
@@ -692,24 +702,33 @@ def export_issue_repository_csv(
                 "issue_type": "source_value_conflict",
                 "details": str(row.get("source_conflict_summary") or "Conflicting source values detected."),
             })
-        field_conf = {}
-        raw_conf = row.get("assay_field_confidence_json") or ""
-        if raw_conf:
-            try:
-                field_conf = json.loads(raw_conf)
-            except json.JSONDecodeError:
-                field_conf = {}
         non_high_fields = sorted(
             field for field, value in field_conf.items()
             if str(value or "").lower() not in {"", "high"}
         )
-        if non_high_fields:
+        critical_non_high_fields = [
+            field for field in non_high_fields
+            if field in _CRITICAL_ASSAY_CONFIDENCE_FIELDS
+        ]
+        advisory_non_high_fields = [
+            field for field in non_high_fields
+            if field not in _CRITICAL_ASSAY_CONFIDENCE_FIELDS
+        ]
+        if critical_non_high_fields:
             issue_rows.append({
                 "scope": "pair",
                 "pdb_id": pdb_id,
                 "pair_identity_key": pair_key,
                 "issue_type": "non_high_confidence_assay_fields",
-                "details": "; ".join(non_high_fields),
+                "details": "; ".join(critical_non_high_fields),
+            })
+        if advisory_non_high_fields:
+            issue_rows.append({
+                "scope": "pair",
+                "pdb_id": pdb_id,
+                "pair_identity_key": pair_key,
+                "issue_type": "advisory_non_high_confidence_assay_fields",
+                "details": "; ".join(advisory_non_high_fields),
             })
 
     columns = ["scope", "pdb_id", "pair_identity_key", "issue_type", "details"]

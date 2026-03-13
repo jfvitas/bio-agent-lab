@@ -10,6 +10,8 @@ API used:
   SMILES, and assay metadata for a given PDB ID.
 
 Assay values are normalised to nM (nanomolar) where possible.
+The derived `assay_value_log10` field therefore uses `log10(nM)` rather than
+the sign-flipped pKd/pKi convention often used in medicinal chemistry.
 
 Rate-limiting: BindingDB asks users to limit to ~3 requests/second.
 This adapter enforces a 0.35s inter-request delay.
@@ -44,6 +46,7 @@ _TO_NM: dict[str, float] = {
 }
 
 _ASSAY_TYPES = {"ki", "kd", "ic50", "ec50"}
+_LOG10_CONVENTION = "log10_nM"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +167,7 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
             "source_database": "BindingDB",
             "ingested_at": datetime.now(timezone.utc).isoformat(),
             "adapter_version": _ADAPTER_VERSION,
+            "assay_value_log10_convention": _LOG10_CONVENTION,
             "target_name": target_name,
             "ligand_name": ligand_name,
             "reference_text": reference_text,
@@ -172,6 +176,7 @@ def _parse_monomer(mono: dict[str, Any], pdb_id: str) -> list[CanonicalBindingSa
             "raw_affinity_text": str(assay_raw) if assay_raw else None,
             "standard_relation": relation,
             "assay_method": assay_method,
+            "standardized_affinity_unit": "nM" if std is not None else None,
         }
 
         results.append(CanonicalBindingSample(
@@ -231,6 +236,9 @@ class BindingDBAdapter(BaseAdapter):
         for attempt in range(1, _RETRY_ATTEMPTS + 1):
             try:
                 resp = requests.get(url, params=params, timeout=_TIMEOUT)
+                if resp.status_code == 404:
+                    time.sleep(_DELAY)
+                    return {"pdb_id": record_id.upper(), "monomers": []}
                 resp.raise_for_status()
                 time.sleep(_DELAY)
                 return resp.json()

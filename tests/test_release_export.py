@@ -79,3 +79,37 @@ def test_export_release_artifacts_builds_model_ready_and_manifest() -> None:
     assert coverage["counts"]["entry_count"] == 1
     assert coverage["coverage"]["assay_sources"]["PDBbind"] == 1
     assert coverage["flags"]["metal_present_entries"] == 1
+
+
+def test_export_release_artifacts_keeps_advisory_override_rows_model_ready() -> None:
+    tmp_root = _tmp_dir("release_export_advisory_override")
+    layout = build_storage_layout(tmp_root / "storage")
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,structure_file_cif_path\n"
+        "1ABC,Example,/tmp/1ABC.cif\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,source_conflict_summary,source_agreement_band,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,receptor_uniprot_ids,ligand_key,ligand_component_ids,ligand_inchikeys,ligand_types,matching_interface_count,matching_interface_types,assay_field_confidence_json\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|mutation_unknown:CHEMBL1,ChEMBL,Ki,5,nM,0.699,\"ChEMBL:Ki=5 nM\",0.699,1,false,,unknown,ChEMBL,\"single_source:ChEMBL\",A,P12345,ATP,ATP,ATP-KEY,small_molecule,1,protein_ligand,\"{\"\"pair_identity_key\"\":\"\"medium\"\",\"\"binding_affinity_value\"\":\"\"medium\"\"}\"\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_issues.csv").write_text(
+        "scope,pdb_id,pair_identity_key,issue_type,details\n"
+        "pair,1ABC,protein_ligand|1ABC|A|ATP|mutation_unknown:CHEMBL1,advisory_non_high_confidence_assay_fields,pair_identity_key; binding_affinity_value\n",
+        encoding="utf-8",
+    )
+    (layout.splits_dir / "metadata.json").write_text(json.dumps({"strategy": "pair_aware_grouped"}), encoding="utf-8")
+
+    paths = export_release_artifacts(layout, repo_root=tmp_root)
+
+    with Path(paths["model_ready_pairs_csv"]).open(newline="", encoding="utf-8") as handle:
+        model_ready_rows = list(csv.DictReader(handle))
+    with Path(paths["model_ready_exclusions_csv"]).open(newline="", encoding="utf-8") as handle:
+        exclusion_rows = list(csv.DictReader(handle))
+
+    assert len(model_ready_rows) == 1
+    assert model_ready_rows[0]["pair_identity_key"] == "protein_ligand|1ABC|A|ATP|mutation_unknown:CHEMBL1"
+    assert exclusion_rows == []

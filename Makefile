@@ -1,4 +1,4 @@
-.PHONY: validate test format tree
+.PHONY: validate test test-sharded format tree
 
 PYTHON := .venv/Scripts/python.exe
 
@@ -7,6 +7,9 @@ validate:
 
 test:
 	$(PYTHON) -m pytest -q
+
+test-sharded:
+	$(PYTHON) scripts/run_test_shards.py
 
 format:
 	$(PYTHON) -m ruff check . --fix

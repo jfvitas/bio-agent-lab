@@ -134,6 +134,38 @@ def test_train_site_physics_surrogate_and_load_latest() -> None:
     assert any(str(column).startswith("geometry.") for column in model["feature_columns"])
 
 
+def test_train_site_physics_surrogate_reports_missing_join_inputs_cleanly() -> None:
+    tmp_root = _tmp_dir("physics_surrogate_missing_join_inputs")
+    layout = build_storage_layout(tmp_root)
+    _prepare_site_pipeline(layout)
+    archetypes = pd.DataFrame([{
+        "run_id": "physics_run",
+        "site_id": "1ABC|A|ASP|10|OD1|asp_carboxylate_oxygen",
+        "motif_class": "asp_carboxylate_oxygen",
+        "archetype_id": "asp_carboxylate_oxygen:abc123",
+        "descriptor_hash": "abc123",
+    }])
+    write_dataframe(archetypes, layout.archetypes_artifacts_dir / "physics_run" / "archetypes.parquet")
+    _write_parsed_results(layout, "batch1")
+    ingest_external_analysis_results(layout, batch_id="batch1")
+
+    original_site_feature_rows = train_site_physics_surrogate.__globals__["_site_feature_rows"]
+    train_site_physics_surrogate.__globals__["_site_feature_rows"] = lambda layout, source_run_id: pd.DataFrame()
+    try:
+        try:
+            train_site_physics_surrogate(
+                layout,
+                batch_id="batch1",
+                source_run_id="physics_run",
+                surrogate_run_id="sur_missing",
+            )
+            assert False, "Expected ValueError for missing site feature join inputs."
+        except ValueError as exc:
+            assert "No training rows available after joining physics targets with archetype site features." in str(exc)
+    finally:
+        train_site_physics_surrogate.__globals__["_site_feature_rows"] = original_site_feature_rows
+
+
 def test_cli_ingest_and_train_site_physics_surrogate() -> None:
     tmp_root = _tmp_dir("physics_cli")
     layout = build_storage_layout(tmp_root)

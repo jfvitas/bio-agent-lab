@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,11 +8,25 @@ from typing import Any
 
 from pbdata.storage import StorageLayout
 
+_MIN_EXAMPLES_FOR_USABLE_CORPUS = 25
+_MIN_UNIQUE_TARGETS_FOR_USABLE_CORPUS = 5
+_MIN_UNIQUE_LIGANDS_FOR_USABLE_CORPUS = 5
+_MIN_EXAMPLES_FOR_STRONG_CORPUS = 100
+_MIN_UNIQUE_TARGETS_FOR_STRONG_CORPUS = 10
+_MIN_UNIQUE_LIGANDS_FOR_STRONG_CORPUS = 10
+
 
 def _read_json(path: Path) -> Any:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
 
 def _read_split_ids(path: Path) -> set[str]:
@@ -27,6 +42,9 @@ def _safe_dict(value: object) -> dict[str, Any]:
 def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
     raw = _read_json(layout.training_dir / "training_examples.json")
     examples = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+    split_diagnostics = _read_json(layout.splits_dir / "split_diagnostics.json")
+    split_diagnostics = split_diagnostics if isinstance(split_diagnostics, dict) else {}
+    metadata_rows = _read_csv_rows(layout.workspace_metadata_dir / "protein_metadata.csv")
     train_ids = _read_split_ids(layout.splits_dir / "train.txt")
     val_ids = _read_split_ids(layout.splits_dir / "val.txt")
     test_ids = _read_split_ids(layout.splits_dir / "test.txt")
@@ -37,15 +55,38 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
     has_graph_count = 0
     has_smiles_count = 0
     has_target_count = 0
+    mutation_count = 0
+    degraded_count = 0
     unique_targets: set[str] = set()
     unique_ligands: set[str] = set()
+    unique_pairs: set[str] = set()
+    unique_interpro_families: set[str] = set()
+    unique_pathways: set[str] = set()
     affinity_type_counts: dict[str, int] = {}
     source_database_counts: dict[str, int] = {}
     source_agreement_counts: dict[str, int] = {}
+    missing_field_counts = {
+        "labels": 0,
+        "binding_affinity_log10": 0,
+        "affinity_type": 0,
+        "target_id": 0,
+        "ligand_smiles": 0,
+        "graph_data": 0,
+    }
+    supervision_blockers = {
+        "missing_labels": 0,
+        "missing_affinity_log10": 0,
+        "missing_affinity_type": 0,
+    }
     split_counts = {"train": 0, "val": 0, "test": 0, "unsplit": 0}
     train_targets: set[str] = set()
     train_ligands: set[str] = set()
     train_pairs: set[str] = set()
+    metadata_by_pair: dict[str, dict[str, str]] = {}
+    for row in metadata_rows:
+        pair_key = str(row.get("pair_identity_key") or "").strip()
+        if pair_key and pair_key not in metadata_by_pair:
+            metadata_by_pair[pair_key] = row
 
     normalized_rows: list[dict[str, str | bool]] = []
     for row in examples:
@@ -68,6 +109,24 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         has_graph = bool(provenance.get("has_graph_data"))
         has_smiles = bool(ligand_smiles)
         has_target = bool(target_id)
+        is_mutation = bool(labels.get("is_mutant"))
+        degraded_mode = bool(provenance.get("degraded_mode"))
+
+        if not labels:
+            missing_field_counts["labels"] += 1
+            supervision_blockers["missing_labels"] += 1
+        if labels.get("binding_affinity_log10") in (None, ""):
+            missing_field_counts["binding_affinity_log10"] += 1
+            supervision_blockers["missing_affinity_log10"] += 1
+        if not affinity_type or affinity_type == "unknown":
+            missing_field_counts["affinity_type"] += 1
+            supervision_blockers["missing_affinity_type"] += 1
+        if not has_target:
+            missing_field_counts["target_id"] += 1
+        if not has_smiles:
+            missing_field_counts["ligand_smiles"] += 1
+        if not has_graph:
+            missing_field_counts["graph_data"] += 1
 
         if is_supervised:
             supervised_count += 1
@@ -83,6 +142,21 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
             unique_targets.add(target_id)
         if ligand_smiles:
             unique_ligands.add(ligand_smiles)
+        if pair_key:
+            unique_pairs.add(pair_key)
+            metadata_row = metadata_by_pair.get(pair_key) or {}
+            for family_id in str(metadata_row.get("interpro_ids") or metadata_row.get("pfam_ids") or "").replace(";", ",").split(","):
+                family_id = family_id.strip()
+                if family_id:
+                    unique_interpro_families.add(family_id)
+            for pathway_id in str(metadata_row.get("reactome_pathway_ids") or "").replace(";", ",").split(","):
+                pathway_id = pathway_id.strip()
+                if pathway_id:
+                    unique_pathways.add(pathway_id)
+        if is_mutation:
+            mutation_count += 1
+        if degraded_mode:
+            degraded_count += 1
         affinity_type_counts[affinity_type] = affinity_type_counts.get(affinity_type, 0) + 1
         source_database_counts[source_database] = source_database_counts.get(source_database, 0) + 1
         source_agreement_counts[source_agreement] = source_agreement_counts.get(source_agreement, 0) + 1
@@ -139,32 +213,80 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
     supervised_fraction = (supervised_count / example_count) if example_count else 0.0
     graph_fraction = (has_graph_count / example_count) if example_count else 0.0
     conflict_fraction = (source_conflict_count / example_count) if example_count else 0.0
+    mutation_fraction = (mutation_count / example_count) if example_count else 0.0
+    degraded_fraction = (degraded_count / example_count) if example_count else 0.0
+    target_coverage_fraction = (has_target_count / example_count) if example_count else 0.0
+    smiles_coverage_fraction = (has_smiles_count / example_count) if example_count else 0.0
+    split_status = str(split_diagnostics.get("status") or "")
+    split_counts_meta = split_diagnostics.get("counts") or {}
     readiness = "empty"
-    if example_count and supervised_fraction >= 0.8 and conflict_fraction <= 0.1:
+    if example_count == 0:
+        readiness = "empty"
+    elif supervised_count == 0:
+        readiness = "weak_supervision"
+    elif (
+        example_count < _MIN_EXAMPLES_FOR_USABLE_CORPUS
+        or len(unique_targets) < _MIN_UNIQUE_TARGETS_FOR_USABLE_CORPUS
+        or len(unique_ligands) < _MIN_UNIQUE_LIGANDS_FOR_USABLE_CORPUS
+    ):
+        readiness = "undersized"
+    elif split_status == "leakage_risk":
+        readiness = "split_leakage_risk"
+    elif split_status in {"dominance_risk", "attention_needed"}:
+        readiness = "usable_with_gaps"
+    elif (
+        example_count
+        >= _MIN_EXAMPLES_FOR_STRONG_CORPUS
+        and len(unique_targets) >= _MIN_UNIQUE_TARGETS_FOR_STRONG_CORPUS
+        and len(unique_ligands) >= _MIN_UNIQUE_LIGANDS_FOR_STRONG_CORPUS
+        and supervised_fraction >= 0.8
+        and conflict_fraction <= 0.1
+        and degraded_fraction <= 0.1
+        and target_coverage_fraction >= 0.95
+        and smiles_coverage_fraction >= 0.95
+    ):
         readiness = "strong"
     elif example_count and supervised_count:
         readiness = "usable_with_gaps"
-    elif example_count:
-        readiness = "weak_supervision"
 
     summary = (
         f"{example_count:,} examples, {supervised_count:,} supervised, "
-        f"{len(unique_targets):,} targets, {len(unique_ligands):,} ligands"
+        f"{len(unique_targets):,} targets, {len(unique_ligands):,} ligands, "
+        f"{len(unique_pairs):,} unique pairs"
     )
     quality = (
         f"{supervised_fraction:.1%} supervised; {graph_fraction:.1%} with graph linkage; "
-        f"{conflict_fraction:.1%} conflicted"
+        f"{conflict_fraction:.1%} conflicted; {degraded_fraction:.1%} degraded; "
+        f"split={split_status or 'unknown'}"
     )
     if example_count == 0:
         next_action = "Build training examples, then splits, before training models."
     elif supervised_count == 0:
-        next_action = "Inspect assay extraction and label coverage before training any supervised model."
+        next_action = "Inspect assay extraction and improve standardized affinity coverage before training any supervised model."
+    elif example_count < _MIN_EXAMPLES_FOR_USABLE_CORPUS:
+        next_action = (
+            "Expand assay enrichment before training models; the current corpus is too small "
+            "to benchmark credibly."
+        )
+    elif len(unique_targets) < _MIN_UNIQUE_TARGETS_FOR_USABLE_CORPUS or len(unique_ligands) < _MIN_UNIQUE_LIGANDS_FOR_USABLE_CORPUS:
+        next_action = (
+            "Broaden target and ligand coverage before trusting model comparisons; the current "
+            "corpus is too narrow."
+        )
+    elif split_status == "leakage_risk":
+        next_action = "Regenerate splits with stronger grouping before trusting held-out metrics or model comparisons."
+    elif split_status in {"dominance_risk", "attention_needed"}:
+        next_action = "Inspect split diagnostics and reduce family/domain/pathway dominance before claiming robust generalization."
+    elif supervision_blockers["missing_affinity_log10"] > 0:
+        next_action = "Improve standardized affinity coverage so more examples become usable supervised rows."
     elif split_counts["train"] == 0:
         next_action = "Build splits so the training set can be benchmarked and models can be trained."
     elif split_counts["val"] == 0 and split_counts["test"] == 0:
         next_action = "Create held-out validation/test splits before trusting training metrics."
     elif source_conflict_count > 0:
         next_action = "Review conflicted examples and source-agreement bands before relying on model outputs."
+    elif degraded_count > 0:
+        next_action = "Reduce degraded-mode examples or track them separately before treating the corpus as stable."
     else:
         next_action = "Train and compare baseline versus tabular models on the current splits."
 
@@ -179,21 +301,40 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
             "supervised_count": supervised_count,
             "unique_target_count": len(unique_targets),
             "unique_ligand_count": len(unique_ligands),
+            "unique_pair_count": len(unique_pairs),
+            "unique_metadata_family_count": len(unique_interpro_families),
+            "unique_pathway_count": len(unique_pathways),
             "source_conflict_count": source_conflict_count,
             "graph_linked_count": has_graph_count,
             "smiles_present_count": has_smiles_count,
             "target_present_count": has_target_count,
+            "mutation_count": mutation_count,
+            "degraded_count": degraded_count,
         },
         "fractions": {
             "supervised_fraction": round(supervised_fraction, 6),
             "graph_linked_fraction": round(graph_fraction, 6),
             "source_conflict_fraction": round(conflict_fraction, 6),
+            "mutation_fraction": round(mutation_fraction, 6),
+            "degraded_fraction": round(degraded_fraction, 6),
+            "target_coverage_fraction": round(target_coverage_fraction, 6),
+            "smiles_coverage_fraction": round(smiles_coverage_fraction, 6),
         },
         "split_counts": split_counts,
         "overlap_with_train": overlap,
+        "missing_field_counts": missing_field_counts,
+        "supervision_blockers": supervision_blockers,
         "affinity_type_counts": affinity_type_counts,
         "source_database_counts": source_database_counts,
         "source_agreement_band_counts": source_agreement_counts,
+        "split_diagnostics": {
+            "status": split_status or "missing",
+            "hard_group_overlap_count": int(split_counts_meta.get("hard_group_overlap_count") or 0),
+            "family_overlap_count": int(split_counts_meta.get("family_overlap_count") or 0),
+            "domain_overlap_count": int(split_counts_meta.get("domain_overlap_count") or 0),
+            "pathway_overlap_count": int(split_counts_meta.get("pathway_overlap_count") or 0),
+            "fold_overlap_count": int(split_counts_meta.get("fold_overlap_count") or 0),
+        },
     }
 
 
@@ -217,6 +358,14 @@ def export_training_set_quality_report(layout: StorageLayout) -> tuple[Path, Pat
         lines.append(f"- {split_name}: {count}")
     lines.extend([
         "",
+        "## Missingness and supervision blockers",
+    ])
+    for key, count in (report.get("missing_field_counts") or {}).items():
+        lines.append(f"- missing {key}: {count}")
+    for key, count in (report.get("supervision_blockers") or {}).items():
+        lines.append(f"- blocker {key}: {count}")
+    lines.extend([
+        "",
         "## Overlap with train",
     ])
     overlap = report.get("overlap_with_train") or {}
@@ -228,5 +377,12 @@ def export_training_set_quality_report(layout: StorageLayout) -> tuple[Path, Pat
             f"exact pair overlap={payload.get('exact_pair_seen_in_train', 0)}, "
             f"novel={payload.get('novel_examples', 0)}"
         )
+    lines.extend([
+        "",
+        "## Split diagnostics",
+    ])
+    split_info = report.get("split_diagnostics") or {}
+    for key, value in split_info.items():
+        lines.append(f"- {key}: {value}")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, md_path, report

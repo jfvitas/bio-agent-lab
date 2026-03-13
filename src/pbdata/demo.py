@@ -1,4 +1,4 @@
-"""Internal demo snapshot exports for operator-facing walkthroughs."""
+"""Demo snapshot exports for walkthrough-ready workspace summaries."""
 
 from __future__ import annotations
 
@@ -15,33 +15,46 @@ def _demo_markdown(report: dict[str, object]) -> str:
     warnings = report.get("warnings") or []
     steps = report.get("recommended_demo_flow") or []
     assumptions = report.get("assumptions") or []
+    readiness = str(report.get("readiness", "unknown") or "unknown")
+    customer_message = {
+        "ready_for_internal_demo": "Suitable for a customer-facing baseline demo if the presenter stays close to the visible artifacts.",
+        "technically_reviewable_not_polished": "Suitable for a technical preview, but unfinished areas should be framed explicitly as work in progress.",
+        "not_demo_ready": "Not yet suitable for a clean customer demo without additional setup or caveat-heavy narration.",
+    }.get(readiness, "Current demo state should be reviewed before sharing externally.")
 
     lines = [
-        "# Internal Demo Snapshot",
+        "# Demo Snapshot",
         "",
-        f"- Readiness: `{report.get('readiness', 'unknown')}`",
-        f"- Summary: {report.get('summary', '')}",
-        f"- Core pipeline ready: `{report.get('core_pipeline_ready', False)}`",
-        f"- Advanced outputs ready: `{report.get('advanced_outputs_ready', False)}`",
+        f"- Workspace readiness: `{readiness}`",
+        f"- Demo summary: {report.get('summary', '')}",
+        f"- Presenter note: {customer_message}",
+        f"- Core pipeline ready: `{'yes' if report.get('core_pipeline_ready', False) else 'no'}`",
+        f"- Advanced outputs ready: `{'yes' if report.get('advanced_outputs_ready', False) else 'no'}`",
         "",
-        "## Blockers",
+        "## What Needs Attention Before The Demo",
     ]
     if blockers:
         lines.extend(f"- `{item}`" for item in blockers if item)
     else:
-        lines.append("- none")
+        lines.append("- No hard blockers detected.")
 
-    lines.extend(["", "## Warnings"])
+    lines.extend(["", "## Watchouts To Explain Clearly"])
     if warnings:
         lines.extend(f"- `{item}`" for item in warnings if item)
     else:
-        lines.append("- none")
+        lines.append("- No active warnings.")
 
-    lines.extend(["", "## Recommended Demo Flow"])
-    lines.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+    lines.extend(["", "## Recommended Walkthrough"])
+    if steps:
+        lines.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+    else:
+        lines.append("1. Open the workspace overview and confirm the current dataset state.")
 
-    lines.extend(["", "## Assumptions"])
-    lines.extend(f"- {item}" for item in assumptions if item)
+    lines.extend(["", "## Ground Rules"])
+    if assumptions:
+        lines.extend(f"- {item}" for item in assumptions if item)
+    else:
+        lines.append("- No additional assumptions were recorded.")
     lines.append("")
     return "\n".join(lines)
 

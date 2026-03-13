@@ -8,10 +8,13 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 from pbdata.catalog import summarize_bulk_file, update_download_manifest
 from pbdata.config import AppConfig
 from pbdata.pairing import chain_group_key
 from pbdata.source_state import write_source_state
+from pbdata.sources.rcsb_classify import _EXCLUDED_COMPS
 from pbdata.storage import StorageLayout, reuse_existing_file, validate_bindingdb_raw_json
 
 logger = logging.getLogger(__name__)
@@ -98,10 +101,24 @@ def _raw_ligand_inchikeys(raw: dict, chem_descriptors: dict[str, dict[str, str]]
         comp_id = (((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {}).get("id", ""))
         if not comp_id:
             continue
+        comp_id = str(comp_id).upper()
+        if comp_id in _EXCLUDED_COMPS:
+            continue
         desc = chem_descriptors.get(str(comp_id), {})
         inchikey = desc.get("InChIKey")
         if inchikey:
             seen[str(inchikey)] = None
+    return list(seen)
+
+
+def _raw_enrichable_comp_ids(raw: dict) -> list[str]:
+    seen: dict[str, None] = {}
+    for ent in raw.get("nonpolymer_entities") or []:
+        comp_id = (((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {}).get("id", ""))
+        normalized = str(comp_id or "").strip().upper()
+        if not normalized or normalized in _EXCLUDED_COMPS:
+            continue
+        seen[normalized] = None
     return list(seen)
 
 
@@ -207,8 +224,21 @@ def fetch_bindingdb_samples_for_pdb(
     config: AppConfig,
     *,
     layout: StorageLayout,
+    raw: dict | None = None,
 ) -> list:
     if not config.sources.bindingdb.enabled or not pdb_id:
+        return []
+    enrichable_comp_ids = _raw_enrichable_comp_ids(raw or {})
+    if raw is not None and not enrichable_comp_ids:
+        write_source_state(
+            layout,
+            source_name="BindingDB",
+            status="missing_identifiers",
+            mode="live_api",
+            record_id=pdb_id.upper(),
+            notes="No enrichable nonpolymer ligands were available for BindingDB lookup.",
+            extra={"enrichable_comp_id_count": 0},
+        )
         return []
 
     from pbdata.sources.bindingdb import BindingDBAdapter
@@ -238,6 +268,30 @@ def fetch_bindingdb_samples_for_pdb(
         adapter = BindingDBAdapter()
         try:
             raw = adapter.fetch_metadata(pdb_id)
+        except requests.HTTPError as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code == 404:
+                write_source_state(
+                    layout,
+                    source_name="BindingDB",
+                    status="no_matches",
+                    mode="live_api",
+                    record_id=pdb_id.upper(),
+                    notes="BindingDB returned HTTP 404 for this PDB ID; treating as no enrichment match.",
+                    extra={"configured_local_dir": local_dir or None},
+                )
+                return []
+            logger.warning("BindingDB lookup failed for %s: %s", pdb_id, exc)
+            write_source_state(
+                layout,
+                source_name="BindingDB",
+                status="error",
+                mode="live_api",
+                record_id=pdb_id.upper(),
+                notes=str(exc),
+                extra={"configured_local_dir": local_dir or None},
+            )
+            return []
         except Exception as exc:
             logger.warning("BindingDB lookup failed for %s: %s", pdb_id, exc)
             write_source_state(

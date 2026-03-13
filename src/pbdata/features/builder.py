@@ -22,33 +22,11 @@ _MAX_EAGER_STRUCTURE_FEATURE_ENTRIES = 200
 
 from pbdata.pairing import bound_object_matches_ligand_key, parse_pair_identity_key
 from pbdata.schemas.features import FeatureRecord
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
-
-def _load_json_file(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    return [raw] if isinstance(raw, dict) else []
-
+from pbdata.table_io import load_json_rows, load_table_json
 
 def _load_optional_pair_records(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
     lookup: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in _load_json_file(path):
+    for row in load_json_rows(path, logger=logger, warning_prefix="Skipping unreadable feature input"):
         pair_key = str(row.get("pair_identity_key") or "")
         affinity_type = str(row.get("binding_affinity_type") or "")
         if pair_key:
@@ -310,6 +288,19 @@ def _compute_structure_file_features(
     return features
 
 
+def _index_rows_by_pdb(
+    rows: list[dict[str, Any]],
+    *,
+    key: str = "pdb_id",
+) -> dict[str, list[dict[str, Any]]]:
+    indexed: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        pdb_id = str(row.get(key) or "")
+        if pdb_id:
+            indexed[pdb_id].append(row)
+    return indexed
+
+
 def _aggregate_graph_features_for_pair(
     *,
     parsed_pair,
@@ -343,13 +334,13 @@ def build_features_from_extracted_and_graph(
     physics_dir: Path | None = None,
 ) -> tuple[Path, Path]:
     """Materialize features from extracted tables and graph outputs."""
-    entries = _load_table_json(extracted_dir / "entry")
-    chains = _load_table_json(extracted_dir / "chains")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    assays = _load_table_json(extracted_dir / "assays")
-    graph_nodes = _load_json_file(graph_dir / "graph_nodes.json")
-    graph_edges = _load_json_file(graph_dir / "graph_edges.json")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable feature input")
+    chains = load_table_json(extracted_dir / "chains", logger=logger, warning_prefix="Skipping unreadable feature input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable feature input")
+    interfaces = load_table_json(extracted_dir / "interfaces", logger=logger, warning_prefix="Skipping unreadable feature input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable feature input")
+    graph_nodes = load_json_rows(graph_dir / "graph_nodes.json", logger=logger, warning_prefix="Skipping unreadable feature input")
+    graph_edges = load_json_rows(graph_dir / "graph_edges.json", logger=logger, warning_prefix="Skipping unreadable feature input")
     microstate_by_pair = _load_optional_pair_records((microstate_dir or output_dir / "microstates") / "microstate_records.json")
     physics_by_pair = _load_optional_pair_records((physics_dir or output_dir / "physics") / "physics_feature_records.json")
 
@@ -363,6 +354,7 @@ def build_features_from_extracted_and_graph(
 
     ligand_counts: Counter[str] = Counter()
     ligand_mw_by_pdb: dict[str, float] = {}
+    bound_objects_by_pdb = _index_rows_by_pdb(bound_objects)
     for bound_object in bound_objects:
         pdb_id = str(bound_object.get("pdb_id") or "")
         ligand_counts[pdb_id] += 1
@@ -373,6 +365,7 @@ def build_features_from_extracted_and_graph(
                 pass
 
     interface_residue_counts: dict[str, int] = defaultdict(int)
+    interfaces_by_pdb = _index_rows_by_pdb(interfaces)
     for interface in interfaces:
         pdb_id = str(interface.get("pdb_id") or "")
         residues = interface.get("binding_site_residue_ids") or []
@@ -460,9 +453,7 @@ def build_features_from_extracted_and_graph(
 
         pair_interface_residue_count = 0
         pair_interface_types: set[str] = set()
-        for interface in interfaces:
-            if str(interface.get("pdb_id") or "") != pdb_id:
-                continue
+        for interface in interfaces_by_pdb.get(pdb_id, []):
             interface_chain_ids = set(interface.get("binding_site_chain_ids") or [])
             if receptor_chain_ids and not interface_chain_ids.intersection(receptor_chain_ids):
                 continue
@@ -483,9 +474,7 @@ def build_features_from_extracted_and_graph(
         ligand_is_covalent = None
         ligand_inchikey = None
         if parsed_pair is not None and parsed_pair.ligand_key:
-            for bound_object in bound_objects:
-                if str(bound_object.get("pdb_id") or "") != pdb_id:
-                    continue
+            for bound_object in bound_objects_by_pdb.get(pdb_id, []):
                 if not bound_object_matches_ligand_key(bound_object, parsed_pair.ligand_key):
                     continue
                 try:

@@ -65,6 +65,9 @@ class PairSplitItem:
     hard_group_key: str
     scaffold_key: str = ""
     family_key: str = ""
+    domain_group_key: str = ""
+    pathway_group_key: str = ""
+    fold_group_key: str = ""
     mutation_group_key: str = ""
     source_group_key: str = ""
     release_date: str | None = None
@@ -588,6 +591,294 @@ def build_temporal_pair_splits(
         ],
     }
     return result, metadata
+
+
+# ---------------------------------------------------------------------------
+# Split diagnostics
+# ---------------------------------------------------------------------------
+
+def _split_item_map(items: list[PairSplitItem]) -> dict[str, PairSplitItem]:
+    mapped: dict[str, PairSplitItem] = {}
+    for item in items:
+        if item.item_id not in mapped:
+            mapped[item.item_id] = item
+    return mapped
+
+
+def _counter_summary(values: list[str]) -> dict[str, object]:
+    counts = Counter(value for value in values if value)
+    total = sum(counts.values())
+    top_key, top_count = counts.most_common(1)[0] if counts else ("", 0)
+    return {
+        "unique_count": len(counts),
+        "largest_group_key": top_key,
+        "largest_group_count": top_count,
+        "largest_group_fraction": round((top_count / total), 6) if total else 0.0,
+    }
+
+
+def build_split_diagnostics(
+    items: list[PairSplitItem],
+    result: SplitResult,
+    *,
+    strategy: str,
+    extra_metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build an audit-friendly diagnostics payload for pair-aware split outputs."""
+    if not items:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "no_pair_items",
+            "strategy": strategy,
+            "summary": "No pair-aware split items were available for diagnostics.",
+            "next_action": "Run extract and build training examples before expecting split diagnostics.",
+            "counts": {
+                "item_count": 0,
+                "train_count": 0,
+                "val_count": 0,
+                "test_count": 0,
+            },
+            "split_breakdown": {},
+            "overlap": {},
+            "dominance": {},
+            "metadata": extra_metadata or {},
+        }
+
+    item_by_id = _split_item_map(items)
+    group_fields = {
+        "pair_identity_key": lambda item: item.pair_identity_key,
+        "hard_group_key": lambda item: item.hard_group_key,
+        "family_key": lambda item: item.family_key,
+        "domain_group_key": lambda item: item.domain_group_key,
+        "pathway_group_key": lambda item: item.pathway_group_key,
+        "fold_group_key": lambda item: item.fold_group_key,
+        "scaffold_key": lambda item: item.scaffold_key,
+        "mutation_group_key": lambda item: item.mutation_group_key,
+        "source_group_key": lambda item: item.source_group_key,
+        "representation_key": lambda item: item.representation_key,
+        "receptor_identity": lambda item: item.receptor_identity,
+    }
+
+    split_to_ids = {
+        "train": list(result.train),
+        "val": list(result.val),
+        "test": list(result.test),
+    }
+    split_breakdown: dict[str, dict[str, object]] = {}
+    dominance: dict[str, dict[str, object]] = {}
+    groups_to_splits: dict[str, dict[str, set[str]]] = {
+        field: defaultdict(set)
+        for field in group_fields
+    }
+
+    for split_name, item_ids in split_to_ids.items():
+        split_items = [item_by_id[item_id] for item_id in item_ids if item_id in item_by_id]
+        split_breakdown[split_name] = {
+            "item_count": len(split_items),
+            "supervision_item_count": len(split_items),
+        }
+        dominance[split_name] = {}
+        for field_name, getter in group_fields.items():
+            values = [str(getter(item) or "") for item in split_items]
+            split_breakdown[split_name][field_name] = _counter_summary(values)
+            if field_name in {
+                "representation_key",
+                "family_key",
+                "domain_group_key",
+                "pathway_group_key",
+                "fold_group_key",
+                "scaffold_key",
+                "source_group_key",
+            }:
+                dominance[split_name][field_name] = split_breakdown[split_name][field_name]
+            for value in values:
+                if value:
+                    groups_to_splits[field_name][value].add(split_name)
+
+    overlap: dict[str, dict[str, object]] = {}
+    for field_name, mapping in groups_to_splits.items():
+        overlapping = {
+            key: sorted(split_names)
+            for key, split_names in mapping.items()
+            if len(split_names) > 1
+        }
+        overlap[field_name] = {
+            "overlap_count": len(overlapping),
+            "sample_keys": sorted(overlapping)[:5],
+        }
+
+    largest_representation_fraction = max(
+        (
+            float(
+                ((dominance.get(split_name) or {}).get("representation_key") or {}).get(
+                    "largest_group_fraction",
+                    0.0,
+                )
+            )
+            for split_name in split_to_ids
+        ),
+        default=0.0,
+    )
+    largest_family_fraction = max(
+        (
+            float(
+                ((dominance.get(split_name) or {}).get("family_key") or {}).get(
+                    "largest_group_fraction",
+                    0.0,
+                )
+            )
+            for split_name in split_to_ids
+        ),
+        default=0.0,
+    )
+    hard_group_overlap = int((overlap.get("hard_group_key") or {}).get("overlap_count") or 0)
+    family_overlap = int((overlap.get("family_key") or {}).get("overlap_count") or 0)
+    domain_overlap = int((overlap.get("domain_group_key") or {}).get("overlap_count") or 0)
+    pathway_overlap = int((overlap.get("pathway_group_key") or {}).get("overlap_count") or 0)
+    fold_overlap = int((overlap.get("fold_group_key") or {}).get("overlap_count") or 0)
+    scaffold_overlap = int((overlap.get("scaffold_key") or {}).get("overlap_count") or 0)
+    largest_domain_fraction = max(
+        (
+            float(
+                ((dominance.get(split_name) or {}).get("domain_group_key") or {}).get(
+                    "largest_group_fraction",
+                    0.0,
+                )
+            )
+            for split_name in split_to_ids
+        ),
+        default=0.0,
+    )
+    largest_pathway_fraction = max(
+        (
+            float(
+                ((dominance.get(split_name) or {}).get("pathway_group_key") or {}).get(
+                    "largest_group_fraction",
+                    0.0,
+                )
+            )
+            for split_name in split_to_ids
+        ),
+        default=0.0,
+    )
+
+    status = "ready"
+    if not result.val and not result.test:
+        status = "no_held_out_split"
+    elif hard_group_overlap > 0:
+        status = "leakage_risk"
+    elif (
+        largest_family_fraction > 0.6
+        or largest_domain_fraction > 0.6
+        or largest_pathway_fraction > 0.6
+        or largest_representation_fraction > 0.6
+    ):
+        status = "dominance_risk"
+    elif family_overlap > 0 or domain_overlap > 0 or pathway_overlap > 0 or fold_overlap > 0 or scaffold_overlap > 0:
+        status = "attention_needed"
+
+    summary = (
+        f"{strategy} split with {len(items):,} items; hard-group overlap={hard_group_overlap}, "
+        f"family overlap={family_overlap}, domain overlap={domain_overlap}, "
+        f"pathway overlap={pathway_overlap}, fold overlap={fold_overlap}, scaffold overlap={scaffold_overlap}, "
+        f"largest family share={largest_family_fraction:.1%}."
+    )
+    if status == "leakage_risk":
+        next_action = "Regenerate splits with a stricter grouping strategy before trusting held-out metrics."
+    elif status == "dominance_risk":
+        next_action = "Reduce dominant family or representation concentration before presenting benchmark results."
+    elif status == "attention_needed":
+        next_action = "Review family and scaffold overlap before treating the split as leakage-resistant."
+    elif status == "no_held_out_split":
+        next_action = "Create validation or test partitions before using the split for benchmark claims."
+    else:
+        next_action = "Inspect the diagnostics artifact alongside training-quality and release reports."
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "strategy": strategy,
+        "summary": summary,
+        "next_action": next_action,
+        "counts": {
+            "item_count": len(items),
+            "train_count": len(result.train),
+            "val_count": len(result.val),
+            "test_count": len(result.test),
+            "hard_group_overlap_count": hard_group_overlap,
+            "family_overlap_count": family_overlap,
+            "domain_overlap_count": domain_overlap,
+            "pathway_overlap_count": pathway_overlap,
+            "fold_overlap_count": fold_overlap,
+            "scaffold_overlap_count": scaffold_overlap,
+        },
+        "split_breakdown": split_breakdown,
+        "overlap": overlap,
+        "dominance": dominance,
+        "metadata": extra_metadata or {},
+    }
+
+
+def export_split_diagnostics(
+    items: list[PairSplitItem],
+    result: SplitResult,
+    output_dir: Path,
+    *,
+    strategy: str,
+    extra_metadata: dict[str, object] | None = None,
+) -> tuple[Path, Path, dict[str, object]]:
+    """Write machine-readable and markdown split diagnostics artifacts."""
+    diagnostics = build_split_diagnostics(
+        items,
+        result,
+        strategy=strategy,
+        extra_metadata=extra_metadata,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "split_diagnostics.json"
+    md_path = output_dir / "split_diagnostics.md"
+    json_path.write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
+
+    lines = [
+        "# Split Diagnostics",
+        "",
+        f"- Status: {diagnostics['status']}",
+        f"- Strategy: {diagnostics['strategy']}",
+        f"- Summary: {diagnostics['summary']}",
+        f"- Next action: {diagnostics['next_action']}",
+        "",
+        "## Counts",
+    ]
+    for key, value in (diagnostics.get("counts") or {}).items():
+        lines.append(f"- {key}: {value}")
+    lines.extend([
+        "",
+        "## Dominance",
+    ])
+    for split_name, payload in (diagnostics.get("dominance") or {}).items():
+        family = (payload or {}).get("family_key") or {}
+        domain = (payload or {}).get("domain_group_key") or {}
+        pathway = (payload or {}).get("pathway_group_key") or {}
+        scaffold = (payload or {}).get("scaffold_key") or {}
+        representation = (payload or {}).get("representation_key") or {}
+        lines.append(
+            f"- {split_name}: family={family.get('largest_group_fraction', 0.0):.1%}, "
+            f"domain={domain.get('largest_group_fraction', 0.0):.1%}, "
+            f"pathway={pathway.get('largest_group_fraction', 0.0):.1%}, "
+            f"scaffold={scaffold.get('largest_group_fraction', 0.0):.1%}, "
+            f"representation={representation.get('largest_group_fraction', 0.0):.1%}"
+        )
+    lines.extend([
+        "",
+        "## Overlap",
+    ])
+    for field_name, payload in (diagnostics.get("overlap") or {}).items():
+        lines.append(
+            f"- {field_name}: {payload.get('overlap_count', 0)} overlapping key(s); "
+            f"samples={', '.join(payload.get('sample_keys') or []) or 'none'}"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path, diagnostics
 
 
 # ---------------------------------------------------------------------------

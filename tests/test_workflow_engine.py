@@ -22,6 +22,11 @@ def test_initialize_workspace_and_harvest_metadata() -> None:
     assert Path(workspace_artifacts["workflow_manifest"]).exists()
     assert Path(harvest_artifacts["metadata_csv"]).exists()
     assert Path(harvest_artifacts["manifest"]).exists()
+    assert Path(harvest_artifacts["source_annotation_summary_json"]).exists()
+    assert Path(harvest_artifacts["source_annotation_summary_md"]).exists()
+    manifest = json.loads(Path(harvest_artifacts["manifest"]).read_text(encoding="utf-8"))
+    assert "annotation_caches" in manifest
+    assert "uniprot" in manifest["annotation_caches"]
 
 
 def test_build_structural_graphs_and_engineer_dataset() -> None:

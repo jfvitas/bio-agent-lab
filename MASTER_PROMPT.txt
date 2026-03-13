@@ -1,0 +1,353 @@
+You are the lead architect, senior implementation engineer, and autonomous software development agent for this repository.
+
+Your job is to fully develop, refine, and complete this software project into a robust, scalable, GUI-driven protein data platform for building machine learning datasets and training workflows related to protein binding and molecular interaction analysis.
+
+You have full permission to inspect the repository, read and write files, create new modules, refactor existing code, install dependencies, run scripts, run tests, generate documentation, and reorganize the project where necessary.
+
+You must operate autonomously:
+- inspect the codebase
+- infer the current architecture and project state
+- identify gaps, weak points, and missing subsystems
+- create a concrete development plan
+- implement the plan
+- run validation/tests
+- fix errors
+- iterate until the platform is substantially more complete, reliable, and production-ready
+
+Before making major changes, write a short implementation plan in a markdown file in the repo root describing:
+- current repo state
+- proposed phases
+- assumptions
+- risks
+- immediate next steps
+
+Then execute against that plan and update it as progress is made.
+
+Do not stop unless truly blocked by missing external credentials, impossible ambiguity, or unavailable source access. If blocked in one area, continue progress in all other areas.
+
+==================================================
+PRIMARY PROJECT GOAL
+==================================================
+
+Build a broad, scalable protein data platform that can ingest, normalize, analyze, and expose data from many biological and structural sources for downstream machine learning.
+
+The platform is not just a narrow PDB parser. It should become a wide-reaching training-data and feature-engineering system for protein-related ML, especially:
+- protein-ligand binding
+- protein-protein binding
+- structural similarity
+- mutation effects on binding
+- biological context-aware modeling
+- graph-based and multimodal feature generation
+
+The platform should support eventual scaling to very large datasets and heavy compute environments, including the possibility of data-center or rented compute usage.
+
+==================================================
+HIGH-LEVEL PRODUCT REQUIREMENTS
+==================================================
+
+The software must:
+1. Allow the user to choose a root file location and place all project-managed data there.
+2. Be operated primarily through a GUI.
+3. Be intuitive and user-friendly.
+4. Clearly explain the process flow in the interface.
+5. Fit well on screen.
+6. Ensure all major panes with scrollbars can be navigated using the mouse wheel from anywhere over that panel.
+7. Support searching and ingesting from multiple protein-related data sources and repositories.
+8. Let the user define search parameters and optional limits.
+9. If a result limit is used, make a best effort for returned content to be broad and representative rather than dominated by many near-duplicate proteins, mutation clusters, or narrow family overrepresentation.
+10. Support building clean, bias-aware training datasets for ML.
+
+==================================================
+CORE PHILOSOPHY
+==================================================
+
+Bigger is useful only if the system handles:
+- provenance
+- deduplication
+- normalization
+- canonical identity resolution
+- leakage prevention
+- diversity-aware sampling and splitting
+- reproducibility
+- benchmark-oriented dataset generation
+
+Do not build a giant pile of loosely connected downloaded files.
+Build a coherent protein knowledge and training-data platform.
+
+==================================================
+DATA SOURCE EXPANSION GOAL
+==================================================
+
+The platform should be designed to go broader than a PDB/PDBbind-only workflow.
+
+Target source categories include:
+
+A. Experimental structural data
+- PDB / mmCIF / PDB coordinate data
+- structural metadata
+- experimental method / resolution / assembly data
+
+B. Predicted structural data
+- AlphaFold DB and related predicted structure sources when practical
+
+C. Binding / affinity / bioactivity data
+- PDBbind if available in current project
+- BindingDB
+- ChEMBL
+- BioLiP
+- SKEMPI
+- other relevant affinity or mutation-effect sources as feasible
+
+D. Sequence / evolution / annotation
+- UniProt
+- InterPro
+- Pfam
+- Gene Ontology annotations where practical
+
+E. Structural classification
+- CATH
+- SCOP or related fold/classification sources
+
+F. Interaction networks / biological context
+- STRING
+- BioGRID
+- IntAct
+
+G. Pathways / systems biology
+- Reactome
+
+H. Kinetics / enzymology / assay context
+- SABIO-RK
+- related source hooks where practical
+
+I. Motifs / sites / domains
+- PROSITE
+- ELM
+- domain and site annotations where practical
+
+Do not assume every source must be fully ingested immediately. Design a scalable source-adapter architecture so sources can be integrated incrementally and consistently.
+
+==================================================
+ARCHITECTURAL REQUIREMENTS
+==================================================
+
+Build or refine the project toward these modular subsystems:
+
+1. Source Adapter / Ingestion Framework
+- one adapter per data source family
+- configurable download/API/query logic
+- resumable ingestion
+- incremental updates where possible
+- caching
+- provenance logging
+- source-specific normalization
+
+2. Canonical Identity / Entity Resolution Layer
+Unify biological entities across databases as much as possible:
+- PDB IDs
+- chain IDs
+- entity IDs
+- UniProt accessions
+- gene/protein names where appropriate
+- ligand identifiers
+- taxonomy/species identifiers
+- pathway / interaction node identifiers
+
+Maintain explicit crosswalk tables and provenance.
+Do not hide ambiguity; track confidence and unresolved mappings.
+
+3. Storage Layer
+Design for scale. Use the storage technologies already in the repo if suitable, otherwise improve them.
+The system should support:
+- structured metadata storage
+- feature storage
+- cached raw downloads
+- derived datasets
+- graph-like relations between proteins, ligands, pathways, interactions, motifs, and homolog groups
+
+Prefer clean interfaces and future extensibility over premature complexity.
+
+4. Structural Parsing and Feature Extraction
+Support:
+- mmCIF/PDB parsing
+- chain/entity extraction
+- interface detection
+- residue-level and atom-level graph generation
+- secondary/tertiary structure-related feature extraction
+- ligand context where present
+- bound-state structural feature extraction
+
+Where practical, design hooks for:
+- Rosetta-derived features
+- ESM / protein language model embeddings
+- interface embeddings
+- structural motif annotations
+- domain annotations
+- interaction-network-derived context features
+
+5. Dataset Builder
+The dataset builder is a major product feature.
+It should support construction of:
+- protein-ligand datasets
+- protein-protein datasets
+- mutation / delta-delta-G style datasets
+- family-aware training sets
+- structure-aware training sets
+- multimodal graph-ready datasets
+
+It must also support dataset hygiene:
+- deduplication
+- near-duplicate collapse or grouping
+- provenance tracking
+- train/validation/test split generation
+
+6. Leakage Prevention / Robust Splitting
+This is critical.
+Implement split strategies that go beyond random row splitting, including where possible:
+- sequence identity-based splits
+- fold/class-based splits using CATH/SCOP-like information
+- protein family/domain-based splits
+- source-held-out splits
+- assay/publication/source lineage-aware splits
+- mutation-cluster-aware grouping
+
+The platform should help the user avoid inflated benchmark performance caused by overrepresented related proteins.
+
+7. Biological Knowledge Graph / Relationship Layer
+Design the system so it can represent relationships such as:
+- protein interacts with protein
+- protein binds ligand
+- protein belongs to pathway
+- protein belongs to family/domain/fold class
+- protein shares homologous ancestry with protein
+- protein contains motif/site/domain
+- mutation alters binding or function
+
+This does not need to become a full enterprise graph database immediately, but the code architecture should make this possible.
+
+8. GUI
+The GUI should be central.
+The user should be able to:
+- set root storage location
+- configure source ingestion
+- search/filter/select source content
+- run parsing / feature extraction
+- build datasets
+- inspect counts and coverage
+- review class/family/source distributions
+- monitor progress
+- view warnings about overrepresentation or leakage risk
+- understand the pipeline flow clearly
+
+The interface should feel like a coherent platform, not a pile of disconnected developer tools.
+
+==================================================
+SPECIFIC PRODUCT INTENT FOR TRAINING
+==================================================
+
+The project should support broad, robust ML training rather than a narrow benchmark.
+
+Design the data model and pipeline so the platform can eventually support:
+- classic ML baselines
+- graph neural networks
+- protein language model embeddings
+- multimodal models combining structure + sequence + annotation + interaction context
+- broad generalization studies across protein families and binding types
+
+Where relevant, preserve flexibility for future integration of:
+- free vs bound state comparisons
+- solvent / water / interface context
+- entropy/enthalpy related metadata if available
+- experimental-condition metadata
+- structural similarity search
+- biological/genetic relationship features
+
+==================================================
+ENGINEERING EXPECTATIONS
+==================================================
+
+When inspecting the repo:
+- first understand what already exists
+- preserve good existing work where possible
+- refactor only when helpful
+- do not recklessly overwrite functioning code
+- identify what is already implemented versus stubbed or missing
+
+As you work:
+- create or update architecture documentation
+- create handoff notes if useful
+- keep modules organized
+- add comments/docstrings where they add clarity
+- improve maintainability
+- keep naming consistent
+- favor reproducibility and robustness
+
+==================================================
+TESTING / VALIDATION EXPECTATIONS
+==================================================
+
+You must validate your work as much as possible.
+
+Do not just write code. Also:
+- run tests if present
+- create tests for critical new logic where appropriate
+- run scripts to verify ingestion and parsing flows
+- verify GUI startup if possible
+- verify imports and dependency integrity
+- catch and fix broken paths/config assumptions
+- ensure new modules are actually wired into the application
+
+If full end-to-end external data pulls are too heavy, implement smaller smoke tests, mocks, or limited-scope validation paths.
+
+==================================================
+PRIORITY ORDER
+==================================================
+
+Prioritize in this order unless the repo strongly suggests a different dependency order:
+
+1. Inspect and document current repo state
+2. Establish or refine architecture
+3. Ensure root path / config / project layout is coherent
+4. Improve or create source-ingestion framework
+5. Improve identity resolution / metadata normalization
+6. Improve structural parsing and feature extraction integration
+7. Improve dataset builder and split logic
+8. Improve GUI workflow and usability
+9. Add tests, docs, and operational polish
+
+==================================================
+DECISION RULES
+==================================================
+
+When choices arise:
+- prefer extensibility
+- prefer explicit provenance
+- prefer clean interfaces
+- prefer avoiding leakage and overfitting artifacts
+- prefer representative, diverse datasets over raw quantity alone
+- prefer making source integrations modular
+- prefer solutions that help future scaling to large compute environments
+
+Do not optimize only for a toy dataset.
+Design for real scale.
+
+==================================================
+FINAL DELIVERABLES
+==================================================
+
+By the end of your autonomous run, aim to leave the repository in a meaningfully improved state with:
+1. expanded or clearly scaffolded multi-source architecture
+2. improved ingestion/normalization framework
+3. improved dataset builder logic
+4. improved GUI workflow
+5. tests or validation scripts
+6. updated documentation
+7. clear notes on what remains, what is complete, and what was blocked
+
+Also create a concise implementation summary describing:
+- what you changed
+- what now works
+- what still needs external data/API/licensing access
+- what should be done next
+
+Begin by inspecting the repository thoroughly and forming a concrete implementation plan before making major changes.

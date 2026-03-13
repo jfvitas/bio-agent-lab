@@ -57,6 +57,8 @@ def test_parse_monomer_captures_context_fields() -> None:
     assert row.provenance["standard_relation"] == ">"
     assert row.provenance["pubmed_id"] == "123456"
     assert row.provenance["doi"] == "10.1000/example"
+    assert row.provenance["assay_value_log10_convention"] == "log10_nM"
+    assert row.provenance["standardized_affinity_unit"] == "nM"
 
 
 def test_fetch_bindingdb_samples_prefers_local_cache_dir() -> None:
@@ -109,3 +111,15 @@ def test_bindingdb_adapter_retries_transient_failure() -> None:
         payload = BindingDBAdapter().fetch_metadata("1ABC")
 
     assert payload["pdb_id"] == "1ABC"
+
+
+def test_bindingdb_adapter_returns_empty_payload_for_404() -> None:
+    response = Mock(status_code=404)
+
+    with patch("pbdata.sources.bindingdb.requests.get", return_value=response), patch(
+        "pbdata.sources.bindingdb.time.sleep",
+        return_value=None,
+    ):
+        payload = BindingDBAdapter().fetch_metadata("1ABC")
+
+    assert payload == {"pdb_id": "1ABC", "monomers": []}

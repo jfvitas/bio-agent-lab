@@ -20,12 +20,23 @@ class SourceConfig(BaseModel):
 class SourcesConfig(BaseModel):
     """Configuration block for all source adapters."""
 
-    rcsb: SourceConfig = SourceConfig()
-    bindingdb: SourceConfig = SourceConfig()
-    chembl: SourceConfig = SourceConfig()
+    # Default assumption:
+    # - RCSB, BindingDB, and ChEMBL are the useful out-of-the-box live sources.
+    # - PDBbind, BioLiP, and SKEMPI still require explicit user intent because
+    #   they depend on local files or a specific dataset workflow.
+    rcsb: SourceConfig = SourceConfig(enabled=True)
+    bindingdb: SourceConfig = SourceConfig(enabled=True)
+    chembl: SourceConfig = SourceConfig(enabled=True)
     pdbbind: SourceConfig = SourceConfig()
     biolip: SourceConfig = SourceConfig()
     skempi: SourceConfig = SourceConfig()
+    alphafold_db: SourceConfig = SourceConfig()
+    uniprot: SourceConfig = SourceConfig()
+    reactome: SourceConfig = SourceConfig()
+    interpro: SourceConfig = SourceConfig()
+    pfam: SourceConfig = SourceConfig()
+    cath: SourceConfig = SourceConfig()
+    scop: SourceConfig = SourceConfig()
 
 
 class AppConfig(BaseModel):

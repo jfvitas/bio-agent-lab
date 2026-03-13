@@ -70,6 +70,12 @@ def test_load_config_empty_yaml() -> None:
     cfg = load_config(empty)
     assert isinstance(cfg, AppConfig)
     assert cfg.storage_root is None
+    assert cfg.sources.rcsb.enabled is True
+    assert cfg.sources.bindingdb.enabled is True
+    assert cfg.sources.chembl.enabled is True
+    assert cfg.sources.pdbbind.enabled is False
+    assert cfg.sources.biolip.enabled is False
+    assert cfg.sources.skempi.enabled is False
 
 
 # ---------------------------------------------------------------------------

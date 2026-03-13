@@ -19,6 +19,7 @@ from typing import Any, Literal
 import gemmi
 
 from pbdata.pairing import parse_pair_identity_key
+from pbdata.table_io import load_json_rows, load_table_json
 
 
 TierName = Literal[
@@ -86,29 +87,6 @@ def plan_local_qm_refinement(structure_id: str) -> MolecularMechanicsFeaturePlan
             "realistic for dataset-scale feature generation."
         ),
     )
-
-
-def _load_json_rows(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    return []
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
 
 def _matching_interface_residue_ids(
     interfaces_by_pdb: dict[str, list[dict[str, Any]]],
@@ -315,9 +293,9 @@ def build_microstate_refinement_plan(
     output_dir: Path,
 ) -> tuple[Path, Path]:
     """Build explicit protonation-policy records for local refinement."""
-    entries = _load_table_json(extracted_dir / "entry")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    microstate_rows = _load_json_rows(microstate_dir / "microstate_records.json")
+    entries = load_table_json(extracted_dir / "entry")
+    interfaces = load_table_json(extracted_dir / "interfaces")
+    microstate_rows = load_json_rows(microstate_dir / "microstate_records.json")
     entry_by_pdb = {str(entry.get("pdb_id") or ""): entry for entry in entries if entry.get("pdb_id")}
     interfaces_by_pdb: dict[str, list[dict[str, Any]]] = {}
     for interface in interfaces:
@@ -426,7 +404,7 @@ def build_mm_job_manifests(
     output_dir: Path,
 ) -> tuple[Path, Path]:
     """Build backend-ready local MM job manifests from refinement plans."""
-    refinement_rows = _load_json_rows(refinement_dir / "microstate_refinement_records.json")
+    refinement_rows = load_json_rows(refinement_dir / "microstate_refinement_records.json")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
@@ -537,7 +515,7 @@ def run_mm_job_bundles(
     - Even when OpenMM is available, execution remains conservative until a
       full force-field/runtime pipeline is implemented.
     """
-    job_rows = _load_json_rows(mm_jobs_dir / "mm_job_records.json")
+    job_rows = load_json_rows(mm_jobs_dir / "mm_job_records.json")
     backend = _detect_openmm_backend()
     results: list[dict[str, Any]] = []
 

@@ -87,6 +87,33 @@ def test_export_master_repository_csv_flattens_extracted_tables() -> None:
     assert "RCSB" in row["field_provenance_json"]
 
 
+def test_export_master_repository_csv_skips_unreadable_rows() -> None:
+    tmp_root = _tmp_dir("master_export_unreadable")
+    layout = build_storage_layout(tmp_root / "storage")
+    (layout.extracted_dir / "entry").mkdir(parents=True)
+    (layout.extracted_dir / "chains").mkdir(parents=True)
+    (layout.extracted_dir / "bound_objects").mkdir(parents=True)
+    (layout.extracted_dir / "interfaces").mkdir(parents=True)
+    (layout.extracted_dir / "assays").mkdir(parents=True)
+    layout.features_dir.mkdir(parents=True)
+    layout.training_dir.mkdir(parents=True)
+
+    (layout.extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "title": "Example entry",
+    }), encoding="utf-8")
+    (layout.extracted_dir / "entry" / "broken.json").write_text("{invalid", encoding="utf-8")
+    (layout.features_dir / "feature_records.json").write_text("{invalid", encoding="utf-8")
+
+    out_path = export_master_repository_csv(layout, repo_root=tmp_root)
+
+    with out_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["pdb_id"] == "1ABC"
+
+
 def test_export_master_pair_repository_csv_flattens_pair_rows() -> None:
     tmp_root = _tmp_dir("pair_export")
     layout = build_storage_layout(tmp_root / "storage")
@@ -196,7 +223,7 @@ def test_export_issue_repository_csv_reports_review_gaps() -> None:
     # Pair CSV is also part of issue generation.
     (tmp_root / "master_pdb_pairs.csv").write_text(
         "pdb_id,pair_identity_key,matching_interface_count,source_conflict_flag,source_conflict_summary,assay_field_confidence_json\n"
-        "1ABC,protein_ligand|1ABC|A|ATP|mutation_unknown:1,0,true,high_conflict_spread=1.200,\"{\"\"binding_affinity_value\"\":\"\"medium\"\"}\"\n",
+        "1ABC,protein_ligand|1ABC|A|ATP|mutation_unknown:1,0,true,high_conflict_spread=1.200,\"{\"\"binding_affinity_log10_standardized\"\":\"\"medium\"\"}\"\n",
         encoding="utf-8",
     )
 
@@ -213,6 +240,35 @@ def test_export_issue_repository_csv_reports_review_gaps() -> None:
     assert "ambiguous_mutation_context" in issue_types
     assert "non_high_confidence_assay_fields" in issue_types
     assert "source_value_conflict" in issue_types
+
+
+def test_export_issue_repository_csv_keeps_non_mutant_override_cases_advisory() -> None:
+    tmp_root = _tmp_dir("issue_export_non_mutant_override")
+    layout = build_storage_layout(tmp_root / "storage")
+    (layout.extracted_dir / "entry").mkdir(parents=True)
+    (layout.extracted_dir / "bound_objects").mkdir(parents=True)
+    (layout.extracted_dir / "assays").mkdir(parents=True)
+
+    (layout.extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "structure_file_cif_path": "/tmp/1ABC.cif",
+        "field_confidence": {},
+    }), encoding="utf-8")
+
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,matching_interface_count,source_conflict_flag,source_conflict_summary,binding_affinity_is_mutant_measurement,assay_field_provenance_json,assay_field_confidence_json\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|mutation_unknown:CHEMBL1,1,false,,false,\"{\"\"pair_identity_key\"\":{\"\"override_used\"\":true}}\",\"{\"\"pair_identity_key\"\":\"\"medium\"\",\"\"binding_affinity_value\"\":\"\"medium\"\"}\"\n",
+        encoding="utf-8",
+    )
+
+    out_path = export_issue_repository_csv(layout, repo_root=tmp_root)
+    with out_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    issue_types = {row["issue_type"] for row in rows}
+    assert "ambiguous_mutation_context" not in issue_types
+    assert "non_high_confidence_assay_fields" not in issue_types
+    assert "advisory_non_high_confidence_assay_fields" in issue_types
 
 
 def test_export_conflict_repository_csv_filters_to_conflicted_pairs() -> None:

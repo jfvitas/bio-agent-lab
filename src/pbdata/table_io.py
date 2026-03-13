@@ -1,8 +1,9 @@
-"""Small dataframe I/O wrapper with a parquet-first, JSON-lines fallback."""
+"""Shared dataframe and JSON row I/O helpers."""
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -35,3 +36,38 @@ def read_dataframe(path: Path) -> pd.DataFrame:
                     continue
                 rows.append(json.loads(line))
         return pd.DataFrame(rows)
+
+
+def load_json_rows(
+    path: Path,
+    *,
+    logger: logging.Logger | None = None,
+    warning_prefix: str = "Skipping unreadable JSON input",
+) -> list[dict[str, Any]]:
+    """Return JSON object/list content as a normalized list of dict rows."""
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("%s %s: %s", warning_prefix, path.name, exc)
+        return []
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return [raw] if isinstance(raw, dict) else []
+
+
+def load_table_json(
+    table_dir: Path,
+    *,
+    logger: logging.Logger | None = None,
+    warning_prefix: str = "Skipping unreadable JSON input",
+) -> list[dict[str, Any]]:
+    """Read all `*.json` files in a table directory into one list of dict rows."""
+    rows: list[dict[str, Any]] = []
+    if not table_dir.exists():
+        return rows
+    for path in sorted(table_dir.glob("*.json")):
+        rows.extend(load_json_rows(path, logger=logger, warning_prefix=warning_prefix))
+    return rows

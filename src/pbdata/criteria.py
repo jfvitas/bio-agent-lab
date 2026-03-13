@@ -65,6 +65,8 @@ class SearchCriteria(BaseModel):
     require_multimer: bool = False
     require_protein: bool = True
     require_ligand: bool = False
+    max_results: int | None = None
+    representative_sampling: bool = True
     require_branched_entities: bool = False
     min_protein_entities: int | None = None
     min_nonpolymer_entities: int | None = None
@@ -93,6 +95,8 @@ class SearchCriteria(BaseModel):
         self.direct_pdb_ids = normalized_ids
         if self.taxonomy_id is not None and self.taxonomy_id <= 0:
             raise ValueError("taxonomy_id must be > 0")
+        if self.max_results is not None and self.max_results <= 0:
+            raise ValueError("max_results must be > 0")
         if self.min_protein_entities is not None and self.min_protein_entities < 0:
             raise ValueError("min_protein_entities must be >= 0")
         if self.min_nonpolymer_entities is not None and self.min_nonpolymer_entities < 0:

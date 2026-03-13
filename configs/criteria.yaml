@@ -12,6 +12,8 @@ membrane_only: true
 require_multimer: false
 require_protein: true
 require_ligand: false
+max_results: 500
+representative_sampling: true
 require_branched_entities: false
 min_protein_entities: null
 min_nonpolymer_entities: null

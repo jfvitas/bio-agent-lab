@@ -55,6 +55,37 @@ def _semicolon_values(raw: str | None) -> list[str]:
     return [item.strip() for item in str(raw or "").replace(",", ";").split(";") if item.strip()]
 
 
+def _binding_call_from_kd(kd_nM: float | None) -> tuple[str, bool | None]:
+    if kd_nM is None:
+        return "unknown", None
+    if kd_nM <= 1_000:
+        return "strong_binder_predicted", True
+    if kd_nM <= 10_000:
+        return "binder_predicted", True
+    if kd_nM <= 100_000:
+        return "weak_binder_predicted", False
+    return "unlikely_binder", False
+
+
+def _sequence_features_from_fasta(raw_fasta: str) -> dict[str, float]:
+    lines = [line.strip() for line in str(raw_fasta).replace("\r", "").splitlines() if line.strip()]
+    sequence = "".join(line for line in lines if not line.startswith(">")).upper()
+    if not sequence:
+        sequence = "".join(ch for ch in str(raw_fasta).upper() if ch.isalpha())
+    if not sequence:
+        return {}
+    length = len(sequence)
+    charged = sum(1 for aa in sequence if aa in {"D", "E", "K", "R", "H"})
+    aromatic = sum(1 for aa in sequence if aa in {"F", "W", "Y", "H"})
+    polar = sum(1 for aa in sequence if aa in {"N", "Q", "S", "T", "Y", "C", "H", "D", "E", "K", "R"})
+    return {
+        "sequence_length": float(length),
+        "charged_fraction": round(charged / max(length, 1), 4),
+        "aromatic_fraction": round(aromatic / max(length, 1), 4),
+        "polar_fraction": round(polar / max(length, 1), 4),
+    }
+
+
 def _load_bound_object_rows(layout: StorageLayout, pdb_id: str) -> list[dict[str, Any]]:
     path = layout.extracted_dir / "bound_objects" / f"{pdb_id}.json"
     rows = _read_json(path)
@@ -140,8 +171,46 @@ def _aggregate_targets(ranked_rows: list[dict[str, Any]]) -> list[dict[str, Any]
     ranked_targets = sorted(by_target.values(), key=lambda item: item["raw_score"], reverse=True)
     for index, item in enumerate(ranked_targets, start=1):
         item["rank"] = index
+        binding_call, likely_binder = _binding_call_from_kd(_safe_float(item.get("predicted_kd_nM")))
+        item["binding_call"] = binding_call
+        item["likely_binder"] = likely_binder
         item.pop("raw_score", None)
     return ranked_targets
+
+
+def _sequence_only_peptide_targets(layout: StorageLayout, raw_fasta: str) -> list[dict[str, Any]]:
+    sequence_features = _sequence_features_from_fasta(raw_fasta)
+    pair_rows = _pair_rows_for_prediction(layout)
+    by_target: dict[str, dict[str, Any]] = {}
+    for row in pair_rows:
+        source_database = str(row.get("selected_preferred_source") or row.get("source_database") or "")
+        interface_count = int(float(str(row.get("matching_interface_count") or "0")))
+        source_bonus = 0.2 if source_database in {"BioLiP", "SKEMPI"} else 0.0
+        for target_id in _semicolon_values(row.get("receptor_uniprot_ids")):
+            bucket = by_target.setdefault(
+                target_id,
+                {
+                    "target_id": target_id,
+                    "support_count": 0,
+                    "max_matching_interface_count": 0,
+                    "source_databases": set(),
+                    "score": 0.0,
+                },
+            )
+            bucket["support_count"] += 1
+            bucket["max_matching_interface_count"] = max(bucket["max_matching_interface_count"], interface_count)
+            bucket["source_databases"].add(source_database)
+            bucket["score"] += 1.0 + (0.1 * interface_count) + source_bonus
+    ranked = sorted(by_target.values(), key=lambda item: item["score"], reverse=True)
+    for index, item in enumerate(ranked, start=1):
+        item["rank"] = index
+        item["query_sequence_length"] = int(sequence_features.get("sequence_length") or 0)
+        item["query_charged_fraction"] = sequence_features.get("charged_fraction")
+        item["query_aromatic_fraction"] = sequence_features.get("aromatic_fraction")
+        item["source_databases"] = sorted(db for db in item["source_databases"] if db)
+        item["sequence_only_mode"] = True
+        item.pop("score", None)
+    return ranked
 
 
 def _pair_rows_for_prediction(layout: StorageLayout) -> list[dict[str, str]]:
@@ -300,6 +369,9 @@ def run_ligand_screening_workflow(
     coverage_ready = (layout.root / "scientific_coverage_summary.json").exists()
     top_target = ranked_targets[0] if ranked_targets else None
     using_trained_model = selected_model in {"ligand_memory_baseline", "tabular_affinity"} and bool(ranked_targets)
+    binding_call, likely_binder = _binding_call_from_kd(
+        _safe_float(top_target.get("predicted_kd_nM")) if top_target else None
+    )
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -323,6 +395,8 @@ def run_ligand_screening_workflow(
             if top_target and top_target.get("ligand_similarity") is not None
             else (top_target.get("confidence_score") if top_target else None)
         ),
+        "binding_call": binding_call,
+        "likely_binder": likely_binder,
         "confidence_score": top_target["confidence_score"] if top_target else None,
         "prediction_method": {
             "tabular_affinity": "trained_tabular_affinity_model",
@@ -369,86 +443,121 @@ def run_ligand_screening_workflow(
 def run_peptide_binding_workflow(
     layout: StorageLayout,
     *,
-    structure_file: str,
+    structure_file: str | None = None,
+    fasta: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write a structured manifest for baseline peptide-binding prediction."""
-    if not structure_file:
-        raise ValueError("structure_file is required")
-    suffix = Path(structure_file).suffix.lower()
-    PredictionInputRecord(
-        input_type="mmcif" if suffix in {".cif", ".mmcif"} else "pdb",
-        input_value=structure_file,
-    )
-    input_type = "mmCIF" if suffix in {".cif", ".mmcif"} else "PDB"
-    interface_summary = _interface_summary_for_structure(layout, structure_file)
-    query_numeric_features = _query_numeric_features_from_structure(
-        structure_file,
-        interface_summary=interface_summary,
-    )
-    pdb_id = Path(structure_file).stem.upper()
-    pair_rows = [
-        row for row in _pair_rows_for_prediction(layout)
-        if str(row.get("pdb_id") or "").upper() == pdb_id
-    ]
+    if bool(structure_file) == bool(fasta):
+        raise ValueError("Provide exactly one peptide input: --structure-file or --fasta")
+    if structure_file:
+        suffix = Path(structure_file).suffix.lower()
+        PredictionInputRecord(
+            input_type="mmcif" if suffix in {".cif", ".mmcif"} else "pdb",
+            input_value=structure_file,
+        )
+        input_type = "mmCIF" if suffix in {".cif", ".mmcif"} else "PDB"
+        interface_summary = _interface_summary_for_structure(layout, structure_file)
+        query_numeric_features = _query_numeric_features_from_structure(
+            structure_file,
+            interface_summary=interface_summary,
+        )
+        pdb_id = Path(structure_file).stem.upper()
+        pair_rows = [
+            row for row in _pair_rows_for_prediction(layout)
+            if str(row.get("pdb_id") or "").upper() == pdb_id
+        ]
+    else:
+        assert fasta is not None
+        PredictionInputRecord(input_type="fasta", input_value=fasta)
+        input_type = "FASTA"
+        interface_summary = {
+            "status": "sequence_only_query_no_structure_context",
+            "feature_context_available": False,
+            "graph_context_available": (layout.graph_dir / "graph_nodes.json").exists() and (layout.graph_dir / "graph_edges.json").exists(),
+            "observed_interface_count": 0,
+            "observed_interface_types": [],
+            "predicted_interface_residues": [],
+        }
+        query_numeric_features = _sequence_features_from_fasta(fasta)
+        pair_rows = _pair_rows_for_prediction(layout)
     predicted_targets: list[dict[str, Any]] = []
     seen_targets: set[str] = set()
     model = load_ligand_memory_model(layout)
     target_profiles = model.get("target_profiles") if isinstance(model, dict) and isinstance(model.get("target_profiles"), dict) else {}
-    for row in pair_rows:
-        for target_id in _semicolon_values(row.get("receptor_uniprot_ids")):
-            if target_id in seen_targets:
-                continue
-            seen_targets.add(target_id)
-            context_alignment = score_query_context_against_target_profile(
-                query_numeric_features,
-                target_profiles.get(target_id) if isinstance(target_profiles, dict) else None,
-            )
-            predicted_targets.append({
-                "target_id": target_id,
-                "supporting_pair_identity_key": str(row.get("pair_identity_key") or ""),
-                "source_database": str(row.get("selected_preferred_source") or row.get("source_database") or ""),
-                "matching_interface_count": int(float(str(row.get("matching_interface_count") or "0"))),
-                "query_context_alignment": context_alignment,
-            })
-    predicted_targets.sort(
-        key=lambda item: (
-            float(item.get("query_context_alignment") or 0.0),
-            int(item.get("matching_interface_count") or 0),
-        ),
-        reverse=True,
-    )
-    for index, item in enumerate(predicted_targets, start=1):
-        item["rank"] = index
+    if structure_file:
+        for row in pair_rows:
+            for target_id in _semicolon_values(row.get("receptor_uniprot_ids")):
+                if target_id in seen_targets:
+                    continue
+                seen_targets.add(target_id)
+                context_alignment = score_query_context_against_target_profile(
+                    query_numeric_features,
+                    target_profiles.get(target_id) if isinstance(target_profiles, dict) else None,
+                )
+                predicted_targets.append({
+                    "target_id": target_id,
+                    "supporting_pair_identity_key": str(row.get("pair_identity_key") or ""),
+                    "source_database": str(row.get("selected_preferred_source") or row.get("source_database") or ""),
+                    "matching_interface_count": int(float(str(row.get("matching_interface_count") or "0"))),
+                    "query_context_alignment": context_alignment,
+                    "sequence_only_mode": False,
+                })
+        predicted_targets.sort(
+            key=lambda item: (
+                float(item.get("query_context_alignment") or 0.0),
+                int(item.get("matching_interface_count") or 0),
+            ),
+            reverse=True,
+        )
+        for index, item in enumerate(predicted_targets, start=1):
+            item["rank"] = index
+    else:
+        predicted_targets = _sequence_only_peptide_targets(layout, fasta or "")[:25]
     observed_count = int(interface_summary.get("observed_interface_count") or 0)
     top_alignment = float(predicted_targets[0].get("query_context_alignment") or 0.0) if predicted_targets else 0.0
     binding_probability = (
         min(1.0, 0.22 + (0.12 * observed_count) + (0.30 * top_alignment))
-        if predicted_targets else 0.0
+        if predicted_targets and structure_file else (
+            min(0.7, 0.15 + (0.08 * float(predicted_targets[0].get("support_count") or 0)))
+            if predicted_targets else 0.0
+        )
     )
 
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "status": "baseline_heuristic_predictions_generated" if predicted_targets else "no_candidate_predictions_available",
+        "status": (
+            "baseline_heuristic_predictions_generated"
+            if predicted_targets and structure_file
+            else "baseline_sequence_only_predictions_generated"
+            if predicted_targets
+            else "no_candidate_predictions_available"
+        ),
         "workflow": "peptide_binding",
         "normalized_input_type": input_type,
-        "normalized_input": {"structure_file": structure_file},
+        "normalized_input": {"structure_file": structure_file} if structure_file else {"fasta": fasta},
         "predicted_targets": predicted_targets[:25],
         "binding_probability": round(binding_probability, 4) if predicted_targets else None,
         "interface_summary": interface_summary,
         "query_numeric_feature_count": len(query_numeric_features),
         "query_structure_context": {
-            "microstate_feature_available": bool(query_numeric_features),
+            "microstate_feature_available": bool(structure_file and query_numeric_features),
             "query_numeric_features": query_numeric_features,
         },
         "prediction_method": (
             "baseline_interface_context_lookup_with_microstate_alignment"
-            if query_numeric_features
+            if structure_file and query_numeric_features
             else "baseline_interface_context_lookup"
+            if structure_file
+            else "baseline_sequence_support_lookup"
         ),
         "notes": (
             "Predictions use extracted interface annotations and existing pair records "
             "for the same structure, plus query-side microstate/physics-style features "
             "when those can be derived from the provided structure."
+            if structure_file else
+            "Sequence-only peptide predictions are a low-confidence fallback that rank targets "
+            "using existing peptide-binding evidence counts and source support. Provide a "
+            "structure file for interface-aware predictions."
         ),
     }
     out_dir = layout.prediction_dir / "peptide_binding"

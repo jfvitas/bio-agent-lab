@@ -2,6 +2,8 @@
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 from unittest.mock import patch
@@ -369,6 +371,10 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     gui._site_pipeline_degraded_mode_var = _Var(True)
     gui._site_pipeline_run_id_var = _Var("site-run-001")
     gui._site_physics_batch_id_var = _Var("batch-001")
+    gui._harvest_uniprot_var = _Var(True)
+    gui._harvest_alphafold_var = _Var(True)
+    gui._harvest_reactome_var = _Var(False)
+    gui._harvest_max_proteins_var = _Var("25")
     gui._structural_graph_level_var = _Var("residue")
     gui._structural_graph_scope_var = _Var("whole_protein")
     gui._structural_graph_exports_var = _Var("pyg,networkx")
@@ -423,6 +429,12 @@ def test_gui_stage_command_includes_storage_root_and_workers() -> None:
     queue_cmd = gui._build_stage_cmd("export-analysis-queue")
     assert "--run-id" in queue_cmd
     assert "site-run-001" in queue_cmd
+    harvest_cmd = gui._build_stage_cmd("harvest-metadata")
+    assert "--with-uniprot" in harvest_cmd
+    assert "--with-alphafold" in harvest_cmd
+    assert "--with-reactome" not in harvest_cmd
+    assert "--max-proteins" in harvest_cmd
+    assert "25" in harvest_cmd
     structural_graph_cmd = gui._build_stage_cmd("build-structural-graphs")
     assert "--graph-level" in structural_graph_cmd
     assert "residue" in structural_graph_cmd
@@ -533,6 +545,18 @@ def test_gui_criteria_from_ui_includes_branched_and_assembly_filters() -> None:
     assert criteria.max_branched_entities == 3
     assert criteria.min_assembly_count == 1
     assert criteria.max_assembly_count == 4
+
+
+def test_existing_extracted_pdb_ids_reads_entry_dir() -> None:
+    from pbdata.cli import _existing_extracted_pdb_ids
+
+    tmp = _tmp_dir("existing_extracted_ids")
+    entry_dir = tmp / "entry"
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    (entry_dir / "1abc.json").write_text("{}", encoding="utf-8")
+    (entry_dir / "2DEF.json").write_text("{}", encoding="utf-8")
+
+    assert _existing_extracted_pdb_ids(tmp) == {"1ABC", "2DEF"}
 
 
 def test_gui_refresh_review_exports_logs_conflict_csv() -> None:
@@ -661,17 +685,74 @@ def test_training_set_workflow_runs_expected_stages() -> None:
     root = Mock()
     root.after = Mock(side_effect=lambda _delay, fn, *args: fn(*args))
     gui._root = root
-    gui._running = Mock()
     gui._run_stage = Mock(side_effect=["done", "done", "done"])
     gui._refresh_overview = Mock()
     gui._log_line = Mock()
+    gui._display_stage_name = Mock(side_effect=lambda stage: stage.replace("-", " "))
+    gui._complete_background_run = Mock()
 
     gui._run_training_set_workflow_thread()
 
     assert gui._run_stage.call_args_list[0].args[0] == "build-splits"
     assert gui._run_stage.call_args_list[1].args[0] == "build-custom-training-set"
     assert gui._run_stage.call_args_list[2].args[0] == "build-release"
-    gui._running.release.assert_called_once()
+    gui._complete_background_run.assert_called_once_with("done", "Training set workflow completed.")
+
+
+def test_spawn_stage_blocks_when_another_workflow_is_running() -> None:
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._running = threading.Lock()
+    gui._running.acquire()
+    gui._log_line = Mock()
+
+    with patch("pbdata.gui.threading.Thread") as thread_cls:
+        gui._spawn_stage("extract")
+
+    thread_cls.assert_not_called()
+    gui._log_line.assert_called_once()
+    assert "already running" in gui._log_line.call_args.args[0]
+    gui._running.release()
+
+
+def test_run_tracking_updates_progress_and_summary() -> None:
+    class _Var:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+    root = Mock()
+    root.after = Mock()
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._root = root
+    gui._run_state_var = _Var("Idle")
+    gui._run_current_stage_var = _Var("No active stage")
+    gui._run_progress_var = _Var("0 / 0 stages complete")
+    gui._run_next_stage_var = _Var("Nothing queued")
+    gui._run_last_message_var = _Var("Choose a stage or workflow to begin.")
+    gui._run_elapsed_var = _Var("0s")
+    gui._run_plan = []
+    gui._run_completed_count = 0
+    gui._run_started_at = None
+    gui._run_in_progress = False
+    gui._run_active_label = ""
+    gui._run_current_stage_key = None
+
+    gui._start_run_tracking("Full pipeline", ["ingest", "extract"])
+    gui._mark_stage_started("ingest")
+    gui._mark_stage_finished("ingest", "done")
+    gui._mark_stage_started("extract")
+    gui._finish_run_tracking("done", "Full pipeline completed.")
+
+    assert gui._run_state_var.get() == "Full pipeline complete"
+    assert gui._run_progress_var.get() == "Stage 2 of 2"
+    assert gui._run_current_stage_var.get() == "Extract Multi-Table"
+    assert gui._run_next_stage_var.get() == "Choose the next stage or refresh the overview."
+    assert gui._run_last_message_var.get() == "Full pipeline completed."
 
 
 def test_build_filtered_review_rows_applies_conflict_and_flag_filters() -> None:
@@ -890,6 +971,49 @@ def test_cli_extract_warns_when_no_assays_are_materialized() -> None:
     assert "extracted assay table is empty" in result.output
 
 
+def test_cli_extract_emits_plan_and_heartbeat_progress() -> None:
+    tmp_root = _tmp_dir("extract_heartbeat_logging")
+    raw_dir = tmp_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "1ABC.json").write_text('{"rcsb_id":"1ABC","nonpolymer_entities":[]}', encoding="utf-8")
+    (raw_dir / "2DEF.json").write_text('{"rcsb_id":"2DEF","nonpolymer_entities":[]}', encoding="utf-8")
+
+    def _fake_extract_rcsb_entry(raw, **_kwargs):
+        time.sleep(0.05)
+        pdb_id = raw["rcsb_id"]
+        return {
+            "entry": EntryRecord(source_database="RCSB", source_record_id=pdb_id, pdb_id=pdb_id),
+            "chains": [],
+            "bound_objects": [],
+            "interfaces": [],
+            "assays": [],
+            "provenance": [],
+        }
+
+    runner = CliRunner()
+    original_cwd = Path.cwd()
+    os.chdir(tmp_root)
+    try:
+        with patch("pbdata.cli._load_external_assay_samples", return_value={}), patch(
+            "pbdata.pipeline.extract.extract_rcsb_entry", side_effect=_fake_extract_rcsb_entry
+        ), patch("pbdata.pipeline.extract.write_records_json", return_value=None), patch(
+            "pbdata.cli._EXTRACT_HEARTBEAT_SECONDS", 0.01
+        ):
+            result = runner.invoke(
+                app,
+                ["extract", "--no-download-structures", "--workers", "2"],
+                catch_exceptions=False,
+            )
+    finally:
+        os.chdir(original_cwd)
+
+    assert result.exit_code == 0
+    assert "Extraction plan:" in result.output
+    assert "Enrichment sources:" in result.output
+    assert "heartbeat:" in result.output
+    assert "active sample:" in result.output
+
+
 def test_gui_close_terminates_active_processes() -> None:
     proc = Mock()
     proc.poll.side_effect = [None, 0, 0]
@@ -904,6 +1028,43 @@ def test_gui_close_terminates_active_processes() -> None:
 
     proc.terminate.assert_called_once()
     root.destroy.assert_called_once()
+
+
+def test_apply_demo_mode_hides_detail_sections() -> None:
+    class _Var:
+        def __init__(self, value: bool) -> None:
+            self._value = value
+
+        def get(self) -> bool:
+            return self._value
+
+    class _Widget:
+        def __init__(self) -> None:
+            self.visible = True
+
+        def grid(self) -> None:
+            self.visible = True
+
+        def grid_remove(self) -> None:
+            self.visible = False
+
+    gui = PbdataGUI.__new__(PbdataGUI)
+    gui._demo_mode_var = _Var(True)
+    gui._overview_sections = {
+        "completion": _Widget(),
+        "prediction_status": _Widget(),
+        "quick_actions": _Widget(),
+        "review_exports": _Widget(),
+        "active_operations": _Widget(),
+    }
+
+    gui._apply_demo_mode()
+
+    assert gui._overview_sections["completion"].visible is True
+    assert gui._overview_sections["prediction_status"].visible is True
+    assert gui._overview_sections["quick_actions"].visible is True
+    assert gui._overview_sections["review_exports"].visible is False
+    assert gui._overview_sections["active_operations"].visible is False
 
 
 @patch("pbdata.pipeline.extract.download_structure_files")

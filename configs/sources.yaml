@@ -1,20 +1,46 @@
 sources:
-  bindingdb:
+  alphafold_db:
     enabled: false
+  bindingdb:
+    enabled: true
     extra: {}
+  biogrid:
+    enabled: false
   biolip:
     enabled: false
     extra: {}
+  cath:
+    enabled: false
   chembl:
+    enabled: true
+  elm:
+    enabled: false
+  intact:
+    enabled: false
+  interpro:
     enabled: false
   pdbbind:
     enabled: false
     extra: {}
+  pfam:
+    enabled: false
+  prosite:
+    enabled: false
   rcsb:
     enabled: true
     extra:
       structure_mirror: rcsb
+  reactome:
+    enabled: false
+  sabio_rk:
+    enabled: false
+  scop:
+    enabled: false
   skempi:
     enabled: false
     extra: {}
+  string:
+    enabled: false
+  uniprot:
+    enabled: false
 storage_root: C:\Users\jfvit\documents\bio-agent-lab

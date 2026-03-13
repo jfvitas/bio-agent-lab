@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import requests
 
-from pbdata.catalog import DEFAULT_MANIFEST_PATH, summarize_rcsb_entry, update_download_manifest
+from pbdata.catalog import DEFAULT_MANIFEST_PATH, summarize_rcsb_entry, update_download_manifest, _infer_rcsb_task_hint
 from pbdata.criteria import SearchCriteria
 from pbdata.storage import reuse_existing_file, validate_rcsb_raw_json
 
@@ -450,6 +450,95 @@ def count_entries(criteria: SearchCriteria) -> int:
     return int(resp.json().get("total_count", 0))
 
 
+def _resolution_bucket(entry: dict[str, Any]) -> str:
+    resolution = (entry.get("rcsb_entry_info") or {}).get("resolution_combined")
+    if isinstance(resolution, list):
+        resolution = resolution[0] if resolution else None
+    try:
+        value = float(resolution)
+    except (TypeError, ValueError):
+        return "unknown_resolution"
+    if value <= 2.0:
+        return "high_resolution"
+    if value <= 3.0:
+        return "medium_resolution"
+    return "low_resolution"
+
+
+def _primary_taxonomy_bucket(entry: dict[str, Any]) -> str:
+    polymer_entities = entry.get("polymer_entities") or []
+    for entity in polymer_entities:
+        for organism in entity.get("rcsb_entity_source_organism") or []:
+            taxonomy_id = organism.get("ncbi_taxonomy_id")
+            if taxonomy_id not in (None, ""):
+                return f"tax:{taxonomy_id}"
+    return "tax:unknown"
+
+
+def _entry_diversity_signature(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    method = str(((entry.get("exptl") or [{}])[0]).get("method") or "unknown_method")
+    task_hint = _infer_rcsb_task_hint(entry)
+    taxonomy = _primary_taxonomy_bucket(entry)
+    resolution_bucket = _resolution_bucket(entry)
+    return (task_hint, method, taxonomy, resolution_bucket)
+
+
+def _select_representative_entries(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    if limit <= 0 or len(entries) <= limit:
+        return [str(entry.get("rcsb_id") or "") for entry in entries if entry.get("rcsb_id")]
+
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    group_order: list[tuple[str, str, str, str]] = []
+    for entry in entries:
+        signature = _entry_diversity_signature(entry)
+        if signature not in grouped:
+            grouped[signature] = []
+            group_order.append(signature)
+        grouped[signature].append(entry)
+
+    selected: list[str] = []
+    while len(selected) < limit:
+        advanced = False
+        for signature in group_order:
+            bucket = grouped[signature]
+            if not bucket:
+                continue
+            advanced = True
+            pdb_id = str(bucket.pop(0).get("rcsb_id") or "")
+            if pdb_id:
+                selected.append(pdb_id)
+            if len(selected) >= limit:
+                break
+        if not advanced:
+            break
+    return selected
+
+
+def _apply_result_limit(criteria: SearchCriteria, pdb_ids: list[str]) -> list[str]:
+    if criteria.max_results is None or len(pdb_ids) <= criteria.max_results:
+        return pdb_ids
+    if not criteria.representative_sampling:
+        return pdb_ids[: criteria.max_results]
+
+    candidate_pool_size = min(
+        len(pdb_ids),
+        max(criteria.max_results * 10, criteria.max_results, 250),
+    )
+    candidate_ids = pdb_ids[:candidate_pool_size]
+    entries = fetch_entries_batch(candidate_ids)
+    selected_ids = _select_representative_entries(entries, criteria.max_results)
+    selected_set = set(selected_ids)
+    if len(selected_ids) < criteria.max_results:
+        for pdb_id in candidate_ids:
+            if pdb_id in selected_set:
+                continue
+            selected_ids.append(pdb_id)
+            selected_set.add(pdb_id)
+            if len(selected_ids) >= criteria.max_results:
+                break
+    return selected_ids[: criteria.max_results]
+
+
 def search_entries(criteria: SearchCriteria) -> list[str]:
     """Return all PDB IDs matching criteria via paginated search."""
     payload = _build_query(criteria)
@@ -475,7 +564,7 @@ def search_entries(criteria: SearchCriteria) -> list[str]:
         if start >= total:
             break
 
-    return ids
+    return _apply_result_limit(criteria, ids)
 
 
 def fetch_entries_batch(pdb_ids: list[str]) -> list[dict[str, Any]]:
@@ -505,6 +594,17 @@ def search_and_download(
     log_fn("Collecting entry IDs from RCSB Search API...")
     pdb_ids = search_entries(criteria)
     total = len(pdb_ids)
+    if criteria.max_results is not None:
+        if criteria.representative_sampling:
+            log_fn(
+                f"Representative result limit active: keeping {total:,} entries "
+                f"after diversity-aware selection (requested max={criteria.max_results:,})."
+            )
+        else:
+            log_fn(
+                f"Hard result limit active: keeping first {total:,} entries "
+                f"(requested max={criteria.max_results:,})."
+            )
     log_fn(f"{total:,} entries to download. Fetching metadata in batches of {_BATCH_SIZE}...")
 
     downloaded: list[str] = []

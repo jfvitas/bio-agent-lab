@@ -1,7 +1,9 @@
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import defaultdict
 from pathlib import Path
 from typing import Annotated, Optional
@@ -15,6 +17,7 @@ from pbdata.cli_reporting import (
     render_status_report,
 )
 from pbdata.config import AppConfig, load_config
+from pbdata.file_health import remove_problem_json_files, scan_json_directory
 from pbdata.logging_config import setup_logging
 from pbdata.pairing import parse_pair_identity_key
 from pbdata.pipeline.canonical_workflows import (
@@ -24,12 +27,14 @@ from pbdata.pipeline.canonical_workflows import (
     run_rcsb_ingest,
     run_skempi_ingest,
 )
-from pbdata.source_state import write_source_state
-from pbdata.stage_state import write_stage_state
+from pbdata.schemas.canonical_sample import CanonicalBindingSample
+from pbdata.source_state import export_source_state_run_summary, snapshot_source_state_counters, write_source_state
+from pbdata.stage_state import stage_lock, write_stage_state
 from pbdata.storage import (
     StorageLayout,
     build_storage_layout,
 )
+from pbdata.table_io import load_json_rows, load_table_json
 from pbdata.workspace_state import (
     build_demo_readiness_report as build_demo_readiness_state_report,
     build_doctor_report as build_doctor_state_report,
@@ -42,6 +47,11 @@ _DEFAULT_CONFIG      = Path("configs/sources.yaml")
 _DEFAULT_LOG_CONFIG  = Path("configs/logging.yaml")
 _DEFAULT_CRITERIA    = Path("configs/criteria.yaml")
 logger = logging.getLogger(__name__)
+
+_EXTRACT_PROGRESS_EVERY = 100
+_EXTRACT_HEARTBEAT_SECONDS = 15.0
+_EXTRACT_STAGE_STATE_UPDATE_SECONDS = 30.0
+_EXTRACT_ACTIVE_SAMPLE_LIMIT = 3
 
 
 @app.command("gui")
@@ -74,6 +84,10 @@ def _resolve_latest_feature_pipeline_run_id(layout: StorageLayout, explicit_run_
         typer.echo("Error: --run-id is required until at least one site-centric feature run exists.")
         raise typer.Exit(code=1)
     return manifests[0].name.replace("_input_manifest.json", "")
+
+
+def _validate_processed_record_json(raw: dict[str, object]) -> None:
+    CanonicalBindingSample.model_validate(raw)
 
 
 def _emit_feature_workflow_output(layout: StorageLayout, items: list[tuple[str, object]]) -> None:
@@ -135,10 +149,11 @@ def _fetch_bindingdb_samples_for_pdb(
     config: AppConfig,
     *,
     layout: StorageLayout,
+    raw: dict | None = None,
 ) -> list:
     from pbdata.pipeline.enrichment import fetch_bindingdb_samples_for_pdb
 
-    return fetch_bindingdb_samples_for_pdb(pdb_id, config, layout=layout)
+    return fetch_bindingdb_samples_for_pdb(pdb_id, config, layout=layout, raw=raw)
 
 
 def _delete_extracted_bundle(output_dir: Path, pdb_id: str) -> None:
@@ -147,26 +162,47 @@ def _delete_extracted_bundle(output_dir: Path, pdb_id: str) -> None:
 
 
 def _load_json_rows(path: Path) -> list[dict]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(raw, list):
-        return [row for row in raw if isinstance(row, dict)]
-    return [raw] if isinstance(raw, dict) else []
+    return load_json_rows(path, logger=logger, warning_prefix="Skipping unreadable CLI input")
 
 
 def _load_table_rows(table_dir: Path) -> list[dict]:
-    rows: list[dict] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        try:
-            rows.extend(_load_json_rows(path))
-        except Exception:
-            continue
-    return rows
+    return load_table_json(table_dir, logger=logger, warning_prefix="Skipping unreadable CLI input")
+
+
+def _read_metadata_rows(layout: StorageLayout) -> list[dict[str, str]]:
+    path = layout.workspace_metadata_dir / "protein_metadata.csv"
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            import csv
+
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def _normalize_delimited_values(raw: object, *, fallback: str = "") -> list[str]:
+    text = str(raw or "")
+    values = [
+        value.strip()
+        for chunk in text.replace(";", ",").split(",")
+        for value in [chunk.strip()]
+        if value.strip()
+    ]
+    deduped = list(dict.fromkeys(values))
+    return deduped or ([fallback] if fallback else [])
 
 
 def _count_extracted_assay_rows(extracted_dir: Path) -> int:
     return len(_load_table_rows(extracted_dir / "assays"))
+
+
+def _existing_extracted_pdb_ids(output_dir: Path) -> set[str]:
+    entry_dir = output_dir / "entry"
+    if not entry_dir.exists():
+        return set()
+    return {path.stem.upper() for path in entry_dir.glob("*.json")}
 
 
 def _load_external_assay_samples(
@@ -424,6 +460,11 @@ def normalize_cmd(
         typer.echo(f"No raw files found in {layout.raw_rcsb_dir}. Run 'ingest' first.")
         return
     typer.echo(f"Done. Normalized: {result.normalized:,}, Cached: {result.cached:,}, Failed: {result.failed:,}")
+    if result.unreadable_inputs:
+        typer.echo(
+            f"Unreadable raw inputs skipped: {result.unreadable_inputs:,} "
+            f"(run `pbdata clean --raw --delete` to remove them)."
+        )
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Output: {result.output_dir}")
     typer.echo(f"Stage state: {result.state_path}")
@@ -454,6 +495,11 @@ def audit(
 
     typer.echo(f"Audit complete. Mean quality score: {result.mean_quality_score:.3f}")
     typer.echo(f"Top flags: {result.top_flags}")
+    if result.unreadable_inputs:
+        typer.echo(
+            f"Unreadable/invalid processed records skipped: {result.unreadable_inputs:,} "
+            f"(run `pbdata clean --processed --delete` to remove them)."
+        )
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Summary written to {result.summary_path}")
     typer.echo(f"Stage state: {result.state_path}")
@@ -477,6 +523,11 @@ def report(ctx: typer.Context) -> None:
     typer.echo(f"Task types      : {result.task_type_counts}")
     typer.echo(f"Methods         : {result.top_methods}")
     typer.echo(f"Mean quality    : {result.mean_quality_score:.3f}" if result.mean_quality_score is not None else "")
+    if result.parse_failures:
+        typer.echo(
+            f"Skipped invalid : {result.parse_failures:,} "
+            f"(run `pbdata clean --processed --delete` to remove corrupt files)"
+        )
     typer.echo(f"Storage root    : {layout.root}")
     typer.echo(f"Report written to {result.report_path}")
     if "master_csv" in result.export_status:
@@ -547,6 +598,56 @@ def status_cmd(ctx: typer.Context) -> None:
     """Show a concise snapshot of repository data and pipeline state."""
     layout = _storage_layout(ctx)
     render_status_report(build_status_state_report(layout))
+
+
+@app.command("clean")
+def clean_cmd(
+    ctx: typer.Context,
+    processed: Annotated[
+        bool,
+        typer.Option("--processed/--no-processed", help="Scan processed JSON files."),
+    ] = True,
+    raw: Annotated[
+        bool,
+        typer.Option("--raw/--no-raw", help="Also scan raw JSON files."),
+    ] = False,
+    delete: Annotated[
+        bool,
+        typer.Option("--delete/--dry-run", help="Delete corrupt files instead of reporting only."),
+    ] = False,
+) -> None:
+    """Scan for empty/corrupt JSON files and optionally remove them."""
+    layout = _storage_layout(ctx)
+    targets: list[tuple[str, Path, object]] = []
+    if processed:
+        targets.append(("processed", layout.processed_rcsb_dir, _validate_processed_record_json))
+    if raw:
+        targets.append(("raw", layout.raw_rcsb_dir, None))
+    if not targets:
+        typer.echo("Nothing to scan. Enable --processed and/or --raw.")
+        raise typer.Exit(code=1)
+
+    total_removed = 0
+    total_problem = 0
+    for label, directory, validator in targets:
+        summary = scan_json_directory(directory, validator=validator)
+        total_problem += summary.problem_count
+        typer.echo(
+            f"{label.title()} JSON health: total={summary.total_count:,}, valid={summary.valid_count:,}, "
+            f"problems={summary.problem_count:,} (empty={summary.empty_count:,}, "
+            f"corrupt_or_invalid={summary.corrupt_count + summary.invalid_count:,})"
+        )
+        if summary.sample_problem_files:
+            typer.echo(f"Problem examples: {', '.join(summary.sample_problem_files[:5])}")
+        if delete and summary.problem_count:
+            removed = remove_problem_json_files(directory, validator=validator)
+            total_removed += len(removed)
+            typer.echo(f"Removed {len(removed):,} file(s) from {directory}")
+    typer.echo(f"Storage root: {layout.root}")
+    if delete:
+        typer.echo(f"Removed files: {total_removed:,}")
+    else:
+        typer.echo(f"Detected problem files: {total_problem:,}")
 
 
 @app.command("doctor")
@@ -682,17 +783,75 @@ def report_model_comparison_cmd(ctx: typer.Context) -> None:
     typer.echo(f"Workflow status: {report['status']}")
 
 
+@app.command("preview-rcsb-search")
+def preview_rcsb_search_cmd(
+    ctx: typer.Context,
+    criteria: Annotated[
+        Optional[Path],
+        typer.Option("--criteria", help="Path to criteria YAML (defaults to configs/criteria.yaml)."),
+    ] = None,
+) -> None:
+    """Preview the current RCSB search result set before ingest."""
+    from pbdata.criteria import load_criteria
+    from pbdata.search_preview import export_rcsb_search_preview
+
+    layout = _storage_layout(ctx)
+    criteria_path = criteria if criteria is not None else _DEFAULT_CRITERIA
+    report_criteria = load_criteria(criteria_path)
+    json_path, md_path, report = export_rcsb_search_preview(layout, report_criteria)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"RCSB search preview JSON: {json_path}")
+    typer.echo(f"RCSB search preview Markdown: {md_path}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
+@app.command("report-source-capabilities")
+def report_source_capabilities_cmd(ctx: typer.Context) -> None:
+    """Write a source-capability report from the current source configuration."""
+    from pbdata.sources.registry import export_source_capability_report
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    json_path, md_path, report = export_source_capability_report(layout, config)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Source capability JSON: {json_path}")
+    typer.echo(f"Source capability Markdown: {md_path}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
+@app.command("export-identity-crosswalk")
+def export_identity_crosswalk_cmd(ctx: typer.Context) -> None:
+    """Export conservative protein, ligand, and pair identity crosswalk tables."""
+    from pbdata.identity_crosswalk import export_identity_crosswalk
+
+    layout = _storage_layout(ctx)
+    proteins_csv, ligands_csv, pairs_csv, summary_json, report = export_identity_crosswalk(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Protein crosswalk CSV: {proteins_csv}")
+    typer.echo(f"Ligand crosswalk CSV: {ligands_csv}")
+    typer.echo(f"Pair crosswalk CSV: {pairs_csv}")
+    typer.echo(f"Identity summary JSON: {summary_json}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
 @app.command("predict-peptide-binding")
 def predict_peptide_binding_cmd(
     ctx: typer.Context,
-    structure_file: Annotated[str, typer.Option(help="Path to peptide PDB/mmCIF input.")],
+    structure_file: Annotated[
+        Optional[str],
+        typer.Option(help="Path to peptide PDB/mmCIF input."),
+    ] = None,
+    fasta: Annotated[
+        Optional[str],
+        typer.Option(help="FASTA text, raw peptide sequence, or FASTA file."),
+    ] = None,
 ) -> None:
     """Normalize peptide-binding inputs and write a workflow manifest."""
     from pbdata.prediction.engine import run_peptide_binding_workflow
 
     layout = _storage_layout(ctx)
     try:
-        out_path, manifest = run_peptide_binding_workflow(layout, structure_file=structure_file)
+        out_path, manifest = run_peptide_binding_workflow(layout, structure_file=structure_file, fasta=fasta)
     except (ValueError, ModuleNotFoundError, ImportError, RuntimeError) as exc:
         _exit_with_dependency_error(exc)
     typer.echo(f"Storage root: {layout.root}")
@@ -711,7 +870,10 @@ def score_pathway_risk_cmd(
     layout = _storage_layout(ctx)
     target_list = [item.strip() for item in str(targets or "").split(",") if item.strip()]
     if not target_list:
-        typer.echo("Error: --targets is required and must contain at least one UniProt ID.")
+        typer.echo(
+            "Error: --targets is required and must contain at least one UniProt ID. "
+            "Example: --targets P12345,Q99999"
+        )
         raise typer.Exit(code=1)
     out_path, summary = build_pathway_risk_summary(layout, targets=target_list)
     typer.echo(f"Storage root: {layout.root}")
@@ -724,6 +886,7 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
     assays = _load_table_rows(layout.extracted_dir / "assays")
     entries = _load_table_rows(layout.extracted_dir / "entry")
     training_examples = _load_json_rows(layout.training_dir / "training_examples.json") if (layout.training_dir / "training_examples.json").exists() else []
+    metadata_rows = _read_metadata_rows(layout)
     if not assays:
         return []
 
@@ -751,6 +914,8 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
 
     example_id_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
     training_example_by_id: dict[str, dict] = {}
+    metadata_by_pair_key: dict[str, dict[str, str]] = {}
+    metadata_by_pdb: dict[str, dict[str, str]] = {}
     for row in training_examples:
         provenance = row.get("provenance") or {}
         labels = row.get("labels") or {}
@@ -760,6 +925,13 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         if pair_key and example_id:
             example_id_by_key[(pair_key, affinity_type)].append(example_id)
             training_example_by_id[example_id] = row
+    for row in metadata_rows:
+        pair_key = str(row.get("pair_identity_key") or "").strip()
+        pdb_id = str(row.get("pdb_id") or "").strip().upper()
+        if pair_key and pair_key not in metadata_by_pair_key:
+            metadata_by_pair_key[pair_key] = row
+        if pdb_id and pdb_id not in metadata_by_pdb:
+            metadata_by_pdb[pdb_id] = row
 
     items: list[PairSplitItem] = []
     for assay in assays:
@@ -769,6 +941,7 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         if not pair_key or parsed_pair is None:
             continue
         pdb_id = parsed_pair.pdb_id or str(assay.get("pdb_id") or "")
+        metadata_row = metadata_by_pair_key.get(pair_key) or metadata_by_pdb.get(str(pdb_id).upper()) or {}
         receptor_chain_ids = list(parsed_pair.receptor_chain_ids)
         sequences = [
             sequence_by_pdb_chain.get((pdb_id, chain_id), "")
@@ -785,6 +958,31 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
         )
         receptor_identity = ",".join(uniprot_ids) if uniprot_ids else (
             receptor_sequence if receptor_sequence else f"{pdb_id}:{','.join(receptor_chain_ids) or '-'}"
+        )
+        interpro_ids = _normalize_delimited_values(metadata_row.get("interpro_ids"))
+        pfam_ids = _normalize_delimited_values(metadata_row.get("pfam_ids"))
+        pathway_ids = _normalize_delimited_values(metadata_row.get("reactome_pathway_ids"))
+        structural_fold = str(
+            metadata_row.get("structural_fold")
+            or metadata_row.get("oligomeric_state")
+            or ""
+        ).strip()
+        metadata_family_tokens = interpro_ids or pfam_ids
+        metadata_family_key = ",".join(metadata_family_tokens) if metadata_family_tokens else ""
+        domain_group_key = (
+            "|".join([parsed_pair.task_type, metadata_family_key])
+            if metadata_family_key
+            else ""
+        )
+        pathway_group_key = (
+            "|".join([parsed_pair.task_type, pathway_ids[0]])
+            if pathway_ids
+            else ""
+        )
+        fold_group_key = (
+            "|".join([parsed_pair.task_type, structural_fold])
+            if structural_fold
+            else ""
         )
         mutation_key = (parsed_pair.mutation_key or "wt_or_unspecified").lower()
         mutation_family = (
@@ -832,10 +1030,17 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
                 representation_key=representation_key,
                 hard_group_key=hard_group_key,
                 scaffold_key="|".join([parsed_pair.task_type, ligand_proxy]),
-                family_key="|".join([parsed_pair.task_type, receptor_identity]),
+                family_key=(
+                    "|".join([parsed_pair.task_type, metadata_family_key])
+                    if metadata_family_key
+                    else "|".join([parsed_pair.task_type, receptor_identity])
+                ),
+                domain_group_key=domain_group_key,
+                pathway_group_key=pathway_group_key,
+                fold_group_key=fold_group_key,
                 mutation_group_key="|".join([
                     parsed_pair.task_type,
-                    receptor_identity,
+                    metadata_family_key or receptor_identity,
                     ligand_proxy,
                     mutation_group,
                 ]),
@@ -1104,8 +1309,12 @@ def run_feature_pipeline_cmd(
     ] = "full_build",
     stage_name: Annotated[
         Optional[str],
-        typer.Option("--stage-name", help="Stage name for stage_only mode."),
+        typer.Option("--stage-name", help="Stage name for stage_only mode. Use --list-stages to show valid names."),
     ] = None,
+    list_stages: Annotated[
+        bool,
+        typer.Option("--list-stages", help="List valid stage names and exit."),
+    ] = False,
     run_id: Annotated[
         Optional[str],
         typer.Option("--run-id", help="Optional explicit run identifier."),
@@ -1129,8 +1338,12 @@ def run_feature_pipeline_cmd(
 ) -> None:
     """Run the new site-centric feature pipeline under artifacts/."""
     from pbdata.pipeline.feature_execution import run_feature_pipeline
+    from pbdata.pipeline.feature_pipeline_stages import feature_pipeline_stage_help_text
 
     layout = _storage_layout(ctx)
+    if list_stages:
+        typer.echo(feature_pipeline_stage_help_text())
+        return
     try:
         result = run_feature_pipeline(
             layout,
@@ -1280,12 +1493,56 @@ def setup_workspace_cmd(ctx: typer.Context) -> None:
 
 
 @app.command("harvest-metadata")
-def harvest_metadata_cmd(ctx: typer.Context) -> None:
+def harvest_metadata_cmd(
+    ctx: typer.Context,
+    with_uniprot: Annotated[
+        bool,
+        typer.Option("--with-uniprot", help="Enrich harvested metadata with UniProt annotations."),
+    ] = False,
+    with_alphafold: Annotated[
+        bool,
+        typer.Option("--with-alphafold", help="Enrich harvested metadata with AlphaFold DB prediction metadata."),
+    ] = False,
+    with_reactome: Annotated[
+        bool,
+        typer.Option("--with-reactome", help="Enrich harvested metadata with Reactome pathway memberships."),
+    ] = False,
+    with_interpro: Annotated[
+        bool,
+        typer.Option("--with-interpro", help="Enrich harvested metadata with PDBe/SIFTS InterPro domain mappings."),
+    ] = False,
+    with_pfam: Annotated[
+        bool,
+        typer.Option("--with-pfam", help="Enrich harvested metadata with PDBe/SIFTS Pfam domain mappings."),
+    ] = False,
+    with_cath: Annotated[
+        bool,
+        typer.Option("--with-cath", help="Enrich harvested metadata with PDBe/SIFTS CATH fold mappings."),
+    ] = False,
+    with_scop: Annotated[
+        bool,
+        typer.Option("--with-scop", help="Enrich harvested metadata with PDBe/SIFTS SCOP fold mappings."),
+    ] = False,
+    max_proteins: Annotated[
+        int | None,
+        typer.Option("--max-proteins", min=0, help="Limit external annotation requests to the first N unique UniProt IDs."),
+    ] = None,
+) -> None:
     """Build the unified metadata table for dataset engineering workflows."""
     from pbdata.data_pipeline.workflow_engine import harvest_unified_metadata
 
     layout = _storage_layout(ctx)
-    artifacts = harvest_unified_metadata(layout)
+    artifacts = harvest_unified_metadata(
+        layout,
+        enrich_uniprot=with_uniprot,
+        enrich_alphafold=with_alphafold,
+        enrich_reactome=with_reactome,
+        enrich_interpro=with_interpro,
+        enrich_pfam=with_pfam,
+        enrich_cath=with_cath,
+        enrich_scop=with_scop,
+        max_proteins=max_proteins,
+    )
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Metadata CSV written to {artifacts['metadata_csv']}")
     typer.echo(f"Metadata manifest written to {artifacts['manifest']}")
@@ -1733,6 +1990,7 @@ def build_splits_cmd(
         build_splits,
         build_temporal_pair_splits,
         cluster_aware_split,
+        export_split_diagnostics,
         save_splits,
     )
 
@@ -1758,10 +2016,19 @@ def build_splits_cmd(
         )
         strategy = "pair_aware_grouped"
         save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
+        diagnostics_json, diagnostics_md, _ = export_split_diagnostics(
+            pair_items,
+            result,
+            layout.splits_dir,
+            strategy=strategy,
+            extra_metadata=extra_metadata,
+        )
         sizes = result.sizes()
         typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
         typer.echo(f"Storage root: {layout.root}")
         typer.echo(f"Splits written to {layout.splits_dir}/")
+        typer.echo(f"Split diagnostics JSON: {diagnostics_json}")
+        typer.echo(f"Split diagnostics Markdown: {diagnostics_md}")
         return
 
     if split_mode in {"scaffold", "family", "mutation", "source"}:
@@ -1779,10 +2046,19 @@ def build_splits_cmd(
         )
         strategy = f"{split_mode}_grouped"
         save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
+        diagnostics_json, diagnostics_md, _ = export_split_diagnostics(
+            pair_items,
+            result,
+            layout.splits_dir,
+            strategy=strategy,
+            extra_metadata=extra_metadata,
+        )
         sizes = result.sizes()
         typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
         typer.echo(f"Storage root: {layout.root}")
         typer.echo(f"Splits written to {layout.splits_dir}/")
+        typer.echo(f"Split diagnostics JSON: {diagnostics_json}")
+        typer.echo(f"Split diagnostics Markdown: {diagnostics_md}")
         return
 
     if split_mode == "time":
@@ -1799,10 +2075,19 @@ def build_splits_cmd(
         )
         strategy = "time_ordered"
         save_splits(result, layout.splits_dir, seed=seed, strategy=strategy, extra_metadata=extra_metadata)
+        diagnostics_json, diagnostics_md, _ = export_split_diagnostics(
+            pair_items,
+            result,
+            layout.splits_dir,
+            strategy=strategy,
+            extra_metadata=extra_metadata,
+        )
         sizes = result.sizes()
         typer.echo(f"Train: {sizes['train']:,}  Val: {sizes['val']:,}  Test: {sizes['test']:,}")
         typer.echo(f"Storage root: {layout.root}")
         typer.echo(f"Splits written to {layout.splits_dir}/")
+        typer.echo(f"Split diagnostics JSON: {diagnostics_json}")
+        typer.echo(f"Split diagnostics Markdown: {diagnostics_md}")
         return
 
     if not files:
@@ -1812,13 +2097,22 @@ def build_splits_cmd(
     typer.echo(f"Loading {len(files):,} processed records...")
     sample_ids: list[str] = []
     sequences:  list[str | None] = []
+    skipped_files: list[str] = []
     for f in files:
         try:
-            raw = json.loads(f.read_text())
+            raw = json.loads(f.read_text(encoding="utf-8"))
             sample_ids.append(raw["sample_id"])
             sequences.append(raw.get("sequence_receptor"))
-        except Exception as exc:
-            logger.warning("Skipping %s: %s", f.name, exc)
+        except Exception:
+            if len(skipped_files) < 5:
+                skipped_files.append(f.name)
+    skipped_count = len(files) - len(sample_ids)
+    if skipped_count:
+        preview = ", ".join(skipped_files)
+        suffix = f" Examples: {preview}." if preview else ""
+        typer.echo(
+            f"Skipped {skipped_count:,} unreadable or invalid processed record(s) while building splits.{suffix}"
+        )
 
     has_sequences = any(s is not None for s in sequences)
 
@@ -1876,6 +2170,14 @@ def extract_cmd(
         int,
         typer.Option("--workers", min=0, help="Worker count (0 = CPU count)."),
     ] = 1,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rebuild extracted bundles even when cached outputs already exist."),
+    ] = False,
+    existing_only: Annotated[
+        bool,
+        typer.Option("--existing-only", help="Only rebuild entries that already exist in the extracted output directory."),
+    ] = False,
 ) -> None:
     """Extract multi-table records from raw RCSB data.
 
@@ -1897,119 +2199,346 @@ def extract_cmd(
     raw_dir = layout.raw_rcsb_dir
     out_dir = output if output is not None else layout.extracted_dir
     struct_dir = structures if structures is not None else layout.structures_rcsb_dir
+    worker_count = _coerce_workers(workers)
 
     files = sorted(raw_dir.glob("*.json"))
+    if existing_only:
+        existing_ids = _existing_extracted_pdb_ids(out_dir)
+        if not existing_ids:
+            typer.echo(
+                f"No existing extracted entry bundles found in {out_dir / 'entry'}. "
+                "Run extract without --existing-only first."
+            )
+            return
+        files = [path for path in files if path.stem.upper() in existing_ids]
     if not files:
         typer.echo(f"No raw files found in {raw_dir}. Run 'ingest' first.")
         return
 
-    cfg: AppConfig = ctx.obj.get("config", AppConfig())
-    structure_mirror = str(cfg.sources.rcsb.extra.get("structure_mirror") or "rcsb").strip().lower()
-    assay_samples_by_pdb = _load_external_assay_samples(cfg, layout=layout)
+    try:
+        with stage_lock(layout, stage="extract"):
+            cfg: AppConfig = ctx.obj.get("config", AppConfig())
+            structure_mirror = str(cfg.sources.rcsb.extra.get("structure_mirror") or "rcsb").strip().lower()
+            assay_samples_by_pdb = _load_external_assay_samples(cfg, layout=layout)
+            source_state_baseline = snapshot_source_state_counters(layout)
+            external_assay_sample_count = sum(len(samples) for samples in assay_samples_by_pdb.values())
+            enabled_enrichment_sources = [
+                label
+                for label, enabled in [
+                    ("BindingDB", cfg.sources.bindingdb.enabled),
+                    ("ChEMBL", cfg.sources.chembl.enabled),
+                    ("PDBbind", cfg.sources.pdbbind.enabled),
+                    ("BioLiP", cfg.sources.biolip.enabled),
+                    ("SKEMPI", cfg.sources.skempi.enabled),
+                ]
+                if enabled
+            ]
 
-    # Collect ligand comp_ids for batch descriptor fetch
-    typer.echo(f"Scanning {len(files):,} RCSB records for ligand IDs...")
-    comp_ids: list[str] = []
-    raw_data: list[tuple[Path, dict]] = []
-    for f in files:
-        try:
-            raw = json.loads(f.read_text())
-            raw_data.append((f, raw))
-            for ent in (raw.get("nonpolymer_entities") or []):
-                cid = (
-                    ((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {})
-                    .get("id", "")
-                )
-                if cid:
-                    comp_ids.append(cid)
-        except Exception as exc:
-            logger.warning("Failed to read %s: %s", f.name, exc)
+            typer.echo("Extraction plan:")
+            typer.echo(f"  Storage root: {layout.root}")
+            typer.echo(f"  Raw input dir: {raw_dir}")
+            typer.echo(f"  Output dir: {out_dir}")
+            typer.echo(f"  Workers: {worker_count}")
+            typer.echo(
+                "  Structure downloads: "
+                f"{'enabled' if download_structures else 'disabled'}"
+                + (f" ({structure_mirror})" if download_structures else "")
+            )
+            typer.echo(f"  Optional PDB downloads: {'enabled' if download_pdb else 'disabled'}")
+            typer.echo(f"  Cache policy: {'force rebuild' if force else 'reuse valid extracted bundles'}")
+            typer.echo(f"  Scope: {'existing extracted entries only' if existing_only else 'all raw entries'}")
+            typer.echo(
+                "  Enrichment sources: "
+                + (", ".join(enabled_enrichment_sources) if enabled_enrichment_sources else "none enabled")
+            )
+            typer.echo(
+                "  Preloaded external assay samples: "
+                f"{external_assay_sample_count:,} across {len(assay_samples_by_pdb):,} PDB IDs"
+            )
 
-    chem_descriptors: dict[str, dict[str, str]] = {}
-    if comp_ids:
-        unique = list(dict.fromkeys(comp_ids))
-        typer.echo(f"Fetching chem-comp descriptors for {len(unique):,} ligands...")
-        try:
-            chem_descriptors = fetch_chemcomp_descriptors(unique)
-            typer.echo(f"  Got descriptors for {len(chem_descriptors):,} ligands.")
-        except Exception as exc:
-            logger.warning("Chem-comp fetch failed: %s", exc)
-
-    typer.echo(f"Extracting {len(raw_data):,} entries to multi-table records...")
-    ok = cached = failed = 0
-    worker_count = _coerce_workers(workers)
-
-    def _extract_one(item: tuple[Path, dict]) -> tuple[str, str]:
-        path, raw = item
-        pdb_id = str(raw.get("rcsb_id") or "").upper()
-        if _validate_extracted_bundle(out_dir, pdb_id) and _is_up_to_date(path, out_dir / "entry" / f"{pdb_id}.json"):
-            return path.name, "cached"
-        _delete_extracted_bundle(out_dir, pdb_id)
-        chembl_samples = _fetch_chembl_samples_for_raw(raw, chem_descriptors, cfg, layout=layout)
-        bindingdb_samples = _fetch_bindingdb_samples_for_pdb(pdb_id, cfg, layout=layout)
-        records = extract_rcsb_entry(
-            raw,
-            chem_descriptors=chem_descriptors,
-            assay_samples=assay_samples_by_pdb.get(pdb_id, []) + bindingdb_samples + chembl_samples,
-            structures_dir=struct_dir if download_structures else None,
-            download_structures=download_structures,
-            download_pdb=download_pdb,
-            structure_mirror=structure_mirror,
-        )
-        write_records_json(records, out_dir)
-        return path.name, "ok"
-
-    processed_count = 0
-    if worker_count == 1:
-        for item in raw_data:
-            try:
-                _, status = _extract_one(item)
-                if status == "cached":
-                    cached += 1
-                else:
-                    ok += 1
-            except Exception as exc:
-                logger.warning("Failed to extract %s: %s", item[0].name, exc)
-                failed += 1
-            processed_count += 1
-            if processed_count % 100 == 0:
-                typer.echo(f"  {processed_count:,}/{len(raw_data):,} processed...")
-    else:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {executor.submit(_extract_one, item): item[0].name for item in raw_data}
-            for future in as_completed(futures):
-                name = futures[future]
+            # Collect ligand comp_ids for batch descriptor fetch
+            typer.echo(f"Scanning {len(files):,} RCSB records for ligand IDs...")
+            comp_ids: list[str] = []
+            raw_data: list[tuple[Path, dict]] = []
+            unreadable_inputs = 0
+            for f in files:
                 try:
-                    _, status = future.result()
-                    if status == "cached":
-                        cached += 1
-                    else:
-                        ok += 1
+                    raw = json.loads(f.read_text())
+                    raw_data.append((f, raw))
+                    for ent in (raw.get("nonpolymer_entities") or []):
+                        cid = (
+                            ((ent.get("nonpolymer_comp") or {}).get("chem_comp") or {})
+                            .get("id", "")
+                        )
+                        if cid:
+                            comp_ids.append(cid)
                 except Exception as exc:
-                    logger.warning("Failed to extract %s: %s", name, exc)
-                    failed += 1
-                processed_count += 1
-                if processed_count % 100 == 0:
-                    typer.echo(f"  {processed_count:,}/{len(raw_data):,} processed...")
+                    logger.warning("Failed to read %s: %s", f.name, exc)
+                    unreadable_inputs += 1
 
-    state_path = write_stage_state(
-        layout,
-        stage="extract",
-        status="completed" if failed == 0 else "completed_with_failures",
-        input_dir=raw_dir,
-        output_dir=out_dir,
-        workers=worker_count,
-        counts={
-            "inputs": len(raw_data),
-            "extracted": ok,
-            "cached": cached,
-            "failed": failed,
-        },
-        notes=(
-            "Valid extracted bundles were reused when newer than raw JSON. "
-            "BindingDB, ChEMBL, PDBbind, BioLiP, and SKEMPI enrichment may contribute assays when configured."
-        ),
-    )
+            if unreadable_inputs:
+                typer.echo(
+                    f"Skipped {unreadable_inputs:,} unreadable raw input record(s) before extraction started."
+                )
+            typer.echo(
+                f"Loaded {len(raw_data):,} readable raw record(s) from {len(files):,} discovered file(s)."
+            )
+
+            chem_descriptors: dict[str, dict[str, str]] = {}
+            if comp_ids:
+                unique = list(dict.fromkeys(comp_ids))
+                typer.echo(f"Fetching chem-comp descriptors for {len(unique):,} ligands...")
+                try:
+                    chem_descriptors = fetch_chemcomp_descriptors(unique)
+                    typer.echo(f"  Got descriptors for {len(chem_descriptors):,} ligands.")
+                except Exception as exc:
+                    logger.warning("Chem-comp fetch failed: %s", exc)
+            else:
+                typer.echo("No nonpolymer ligand IDs were found in the raw records.")
+
+            typer.echo(f"Extracting {len(raw_data):,} entries to multi-table records...")
+            ok = cached = failed = 0
+            write_stage_state(
+                layout,
+                stage="extract",
+                status="running",
+                input_dir=raw_dir,
+                output_dir=out_dir,
+                workers=worker_count,
+                counts={"inputs": len(raw_data)},
+                notes=(
+                    "Extraction in progress. A workspace-local stage lock prevents "
+                    "concurrent extract runs from rewriting the same tables."
+                ),
+            )
+
+            stage_state_last_update = time.monotonic()
+            progress_last_log = time.monotonic()
+            run_started_at = time.monotonic()
+
+            def _write_running_progress(*, active_count: int, active_preview: str = "") -> None:
+                nonlocal stage_state_last_update
+                now = time.monotonic()
+                if now - stage_state_last_update < _EXTRACT_STAGE_STATE_UPDATE_SECONDS:
+                    return
+                write_stage_state(
+                    layout,
+                    stage="extract",
+                    status="running",
+                    input_dir=raw_dir,
+                    output_dir=out_dir,
+                    workers=worker_count,
+                    counts={
+                        "inputs": len(raw_data),
+                        "processed": processed_count,
+                        "extracted": ok,
+                        "cached": cached,
+                        "failed": failed,
+                        "active": active_count,
+                    },
+                    notes=(
+                        f"Extraction in progress for {processed_count:,}/{len(raw_data):,} entries."
+                        + (f" Active sample: {active_preview}." if active_preview else "")
+                    ),
+                )
+                stage_state_last_update = now
+
+            def _emit_progress_update(prefix: str, *, active_count: int, active_preview: str = "") -> None:
+                elapsed_seconds = max(time.monotonic() - run_started_at, 0.0)
+                rate = processed_count / elapsed_seconds if elapsed_seconds > 0 else 0.0
+                remaining = max(len(raw_data) - processed_count, 0)
+                eta_seconds = int(round(remaining / rate)) if rate > 0 else None
+                percent = (processed_count / len(raw_data) * 100.0) if raw_data else 100.0
+                parts = [
+                    f"{prefix} {processed_count:,}/{len(raw_data):,} processed",
+                    f"({percent:.1f}%)",
+                    f"ok={ok:,}",
+                    f"cached={cached:,}",
+                    f"failed={failed:,}",
+                    f"active={active_count:,}",
+                    f"rate={rate:.1f}/s",
+                ]
+                if eta_seconds is not None:
+                    parts.append(f"eta~{eta_seconds}s")
+                if active_preview:
+                    parts.append(f"active sample: {active_preview}")
+                typer.echo("  " + " | ".join(parts))
+                _write_running_progress(active_count=active_count, active_preview=active_preview)
+
+            def _extract_one(item: tuple[Path, dict]) -> tuple[str, str]:
+                path, raw = item
+                pdb_id = str(raw.get("rcsb_id") or "").upper()
+                if (
+                    not force
+                    and _validate_extracted_bundle(out_dir, pdb_id)
+                    and _is_up_to_date(path, out_dir / "entry" / f"{pdb_id}.json")
+                ):
+                    return path.name, "cached"
+                _delete_extracted_bundle(out_dir, pdb_id)
+                chembl_samples = _fetch_chembl_samples_for_raw(raw, chem_descriptors, cfg, layout=layout)
+                bindingdb_samples = _fetch_bindingdb_samples_for_pdb(pdb_id, cfg, layout=layout, raw=raw)
+                records = extract_rcsb_entry(
+                    raw,
+                    chem_descriptors=chem_descriptors,
+                    assay_samples=assay_samples_by_pdb.get(pdb_id, []) + bindingdb_samples + chembl_samples,
+                    structures_dir=struct_dir if download_structures else None,
+                    download_structures=download_structures,
+                    download_pdb=download_pdb,
+                    structure_mirror=structure_mirror,
+                )
+                write_records_json(records, out_dir)
+                return path.name, "ok"
+
+            processed_count = 0
+            if worker_count == 1:
+                for item in raw_data:
+                    path, raw = item
+                    pdb_id = str(raw.get("rcsb_id") or path.stem).upper()
+                    item_status: str | None = None
+                    try:
+                        _, item_status = _extract_one(item)
+                        if item_status == "cached":
+                            cached += 1
+                        else:
+                            ok += 1
+                    except Exception as exc:
+                        logger.warning("Failed to extract %s: %s", item[0].name, exc)
+                        typer.echo(f"  ERROR {pdb_id}: {exc}")
+                        failed += 1
+                    processed_count += 1
+                    active_preview = (
+                        f"{pdb_id} ({'cached' if item_status == 'cached' else 'complete'})"
+                        if item_status is not None
+                        else pdb_id
+                    )
+                    if processed_count % _EXTRACT_PROGRESS_EVERY == 0:
+                        _emit_progress_update("progress:", active_count=0, active_preview=active_preview)
+                    else:
+                        _write_running_progress(active_count=0, active_preview=active_preview)
+            else:
+                active_jobs: dict[object, tuple[str, float]] = {}
+                active_lock = threading.Lock()
+
+                def _extract_tracked(item: tuple[Path, dict]) -> tuple[str, str]:
+                    path, raw = item
+                    pdb_id = str(raw.get("rcsb_id") or path.stem).upper()
+                    with active_lock:
+                        active_jobs[threading.current_thread().ident or id(threading.current_thread())] = (
+                            pdb_id,
+                            time.monotonic(),
+                        )
+                    try:
+                        return _extract_one(item)
+                    finally:
+                        with active_lock:
+                            active_jobs.pop(threading.current_thread().ident or id(threading.current_thread()), None)
+
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = {
+                        executor.submit(_extract_tracked, item): (
+                            item[0].name,
+                            str(item[1].get("rcsb_id") or item[0].stem).upper(),
+                        )
+                        for item in raw_data
+                    }
+                    pending = set(futures)
+                    while pending:
+                        done, pending = wait(
+                            pending,
+                            timeout=_EXTRACT_HEARTBEAT_SECONDS,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            with active_lock:
+                                active_snapshot = sorted(
+                                    active_jobs.values(),
+                                    key=lambda payload: payload[1],
+                                )
+                            preview_items = [
+                                f"{pdb_id} ({int(time.monotonic() - started_at)}s)"
+                                for pdb_id, started_at in active_snapshot[:_EXTRACT_ACTIVE_SAMPLE_LIMIT]
+                            ]
+                            _emit_progress_update(
+                                "heartbeat:",
+                                active_count=len(active_snapshot),
+                                active_preview=", ".join(preview_items),
+                            )
+                            progress_last_log = time.monotonic()
+                            continue
+
+                        for future in done:
+                            name, pdb_id = futures[future]
+                            try:
+                                _, status = future.result()
+                                if status == "cached":
+                                    cached += 1
+                                else:
+                                    ok += 1
+                            except Exception as exc:
+                                logger.warning("Failed to extract %s: %s", name, exc)
+                                typer.echo(f"  ERROR {pdb_id}: {exc}")
+                                failed += 1
+                            processed_count += 1
+                            with active_lock:
+                                active_snapshot = sorted(
+                                    active_jobs.values(),
+                                    key=lambda payload: payload[1],
+                                )
+                            preview_items = [
+                                f"{active_pdb} ({int(time.monotonic() - started_at)}s)"
+                                for active_pdb, started_at in active_snapshot[:_EXTRACT_ACTIVE_SAMPLE_LIMIT]
+                            ]
+                            now = time.monotonic()
+                            if (
+                                processed_count % _EXTRACT_PROGRESS_EVERY == 0
+                                or now - progress_last_log >= _EXTRACT_HEARTBEAT_SECONDS
+                                or not pending
+                            ):
+                                _emit_progress_update(
+                                    "progress:",
+                                    active_count=len(active_snapshot),
+                                    active_preview=", ".join(preview_items),
+                                )
+                                progress_last_log = now
+                            else:
+                                _write_running_progress(
+                                    active_count=len(active_snapshot),
+                                    active_preview=", ".join(preview_items),
+                                )
+
+            state_path = write_stage_state(
+                layout,
+                stage="extract",
+                status="completed" if failed == 0 else "completed_with_failures",
+                input_dir=raw_dir,
+                output_dir=out_dir,
+                workers=worker_count,
+                counts={
+                    "inputs": len(raw_data),
+                    "extracted": ok,
+                    "cached": cached,
+                    "failed": failed,
+                },
+                notes=(
+                    "Valid extracted bundles were reused when newer than raw JSON. "
+                    "BindingDB, ChEMBL, PDBbind, BioLiP, and SKEMPI enrichment may contribute assays when configured."
+                ),
+            )
+    except RuntimeError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        write_stage_state(
+            layout,
+            stage="extract",
+            status="failed",
+            input_dir=raw_dir,
+            output_dir=out_dir,
+            workers=_coerce_workers(workers),
+            counts={"inputs": len(files)},
+            notes=f"Extraction failed: {exc}",
+        )
+        raise
 
     typer.echo(f"Extraction complete. OK: {ok:,}, Cached: {cached:,}, Failed: {failed:,}")
     typer.echo(f"Storage root: {layout.root}")
@@ -2017,6 +2546,13 @@ def extract_cmd(
     if download_structures:
         typer.echo(f"Structures: {struct_dir}/")
     typer.echo(f"Stage state: {state_path}")
+    source_summary_json, source_summary_md, _ = export_source_state_run_summary(
+        layout,
+        baseline=source_state_baseline,
+        stage_name="extract",
+    )
+    typer.echo(f"Source Run Summary JSON: {source_summary_json}")
+    typer.echo(f"Source Run Summary Markdown: {source_summary_md}")
     assay_row_count = _count_extracted_assay_rows(out_dir)
     if assay_row_count == 0:
         typer.echo(

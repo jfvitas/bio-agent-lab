@@ -464,6 +464,37 @@ def test_assemble_labels_include_mutant_and_ddg() -> None:
     assert labels["binding_affinity_raw"] == -1.5
 
 
+def test_assemble_labels_fallback_to_pair_mean_log10() -> None:
+    tmp = _tmp_dir("assemble_pair_mean_log10")
+    extracted, features, graph, output = _setup_test_data(
+        tmp,
+        entries=[{"pdb_id": "1ABC"}],
+        chains=[],
+        bound_objects=[],
+        interfaces=[],
+        assays=[{
+            "pdb_id": "1ABC",
+            "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 5.0,
+            "binding_affinity_log10_standardized": None,
+            "reported_measurement_mean_log10_standardized": 0.845098,
+            "source_database": "BindingDB",
+        }],
+        features=[],
+        graph_nodes=[],
+        graph_edges=[],
+    )
+
+    examples_path, _ = assemble_training_examples(extracted, features, graph, output)
+    examples = json.loads(examples_path.read_text(encoding="utf-8"))
+
+    assert len(examples) == 1
+    labels = examples[0]["labels"]
+    assert labels["binding_affinity_log10"] == 0.845098
+    assert examples[0]["field_provenance"]["labels"]["binding_affinity_log10_source"] == "reported_measurement_mean_log10_standardized"
+
+
 # ---------------------------------------------------------------------------
 # Multi-PDB assembly
 # ---------------------------------------------------------------------------
@@ -824,3 +855,30 @@ def test_assemble_propagates_dense_continuous_descriptors() -> None:
     assert ex["interaction"]["microstate_record_count"] == 6
     assert ex["interaction"]["estimated_net_charge"] == -0.9
     assert ex["interaction"]["local_electrostatic_balance"] == 1.65
+
+
+def test_assemble_skips_unreadable_graph_json() -> None:
+    tmp = _tmp_dir("assemble_unreadable_graph_json")
+    extracted, features, graph, output = _setup_test_data(
+        tmp,
+        entries=[{"pdb_id": "1ABC"}],
+        chains=[{"pdb_id": "1ABC", "chain_id": "A", "is_protein": True}],
+        assays=[{
+            "pdb_id": "1ABC",
+            "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 5.0,
+            "source_database": "PDBbind",
+        }],
+        features=[],
+    )
+    (graph / "graph_nodes.json").write_text("{invalid", encoding="utf-8")
+    (graph / "graph_edges.json").write_text("[]", encoding="utf-8")
+
+    examples = json.loads(
+        assemble_training_examples(extracted, features, graph, output)[0]
+        .read_text(encoding="utf-8")
+    )
+
+    assert len(examples) == 1
+    assert examples[0]["graph_features"]["network_degree"] is None

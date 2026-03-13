@@ -37,9 +37,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-p no:tmpdir -m \"not integration\""
+addopts = "-p no:tmpdir"
 markers = [
-  "integration: tests that make real network calls (deselect with -m 'not integration')",
+  "integration: tests that make real network calls",
 ]
 
 [tool.ruff]

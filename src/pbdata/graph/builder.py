@@ -16,6 +16,7 @@ from typing import Any
 
 from pbdata.pairing import parse_pair_identity_key
 from pbdata.schemas.graph import GraphEdgeRecord, GraphNodeRecord
+from pbdata.table_io import load_json_rows, load_table_json
 
 logger = logging.getLogger(__name__)
 
@@ -72,20 +73,6 @@ def _edge_provenance(
         "source_record_key": source_record_key,
         "extraction_method": extraction_method,
     }
-
-
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
 
 def _protein_node_id(chain: dict[str, Any]) -> str:
     uniprot_id = chain.get("uniprot_id")
@@ -313,11 +300,11 @@ def build_graph_from_extracted(
     When enable_external=True, also queries STRING, Reactome, and BioGRID
     to enrich the graph with external interactions and pathway membership.
     """
-    entries = _load_table_json(extracted_dir / "entry")
-    chains = _load_table_json(extracted_dir / "chains")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
-    interfaces = _load_table_json(extracted_dir / "interfaces")
-    assays = _load_table_json(extracted_dir / "assays")
+    entries = load_table_json(extracted_dir / "entry", logger=logger, warning_prefix="Skipping unreadable extracted graph input")
+    chains = load_table_json(extracted_dir / "chains", logger=logger, warning_prefix="Skipping unreadable extracted graph input")
+    bound_objects = load_table_json(extracted_dir / "bound_objects", logger=logger, warning_prefix="Skipping unreadable extracted graph input")
+    interfaces = load_table_json(extracted_dir / "interfaces", logger=logger, warning_prefix="Skipping unreadable extracted graph input")
+    assays = load_table_json(extracted_dir / "assays", logger=logger, warning_prefix="Skipping unreadable extracted graph input")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 

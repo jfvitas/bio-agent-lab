@@ -38,7 +38,11 @@ _TO_NM = {
 _MUTATION_RE = re.compile(r"\b[A-Z]\d+[A-Z]\b")
 
 
-def _get_json(resource: str, params: dict[str, Any]) -> dict[str, Any]:
+def _normalized_params_key(params: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((str(key), str(value)) for key, value in params.items()))
+
+
+def _get_json_uncached(resource: str, params: dict[str, Any]) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(1, _RETRY_ATTEMPTS + 1):
         try:
@@ -180,6 +184,9 @@ def _activity_to_sample(
 class ChEMBLAdapter(BaseAdapter):
     """Adapter for exact-identifier ChEMBL activity lookup."""
 
+    def __init__(self) -> None:
+        self._response_cache: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, Any]] = {}
+
     @property
     def source_name(self) -> str:
         return "ChEMBL"
@@ -202,7 +209,7 @@ class ChEMBLAdapter(BaseAdapter):
         return sample
 
     def resolve_target_chembl_ids(self, accession: str) -> list[str]:
-        body = _get_json("target", {
+        body = self._get_json("target", {
             "target_components__accession__iexact": accession,
             "limit": 100,
         })
@@ -213,7 +220,7 @@ class ChEMBLAdapter(BaseAdapter):
         ]
 
     def resolve_molecule_chembl_ids(self, inchikey: str) -> list[str]:
-        body = _get_json("molecule", {
+        body = self._get_json("molecule", {
             "molecule_structures__standard_inchi_key__iexact": inchikey,
             "limit": 100,
         })
@@ -229,13 +236,19 @@ class ChEMBLAdapter(BaseAdapter):
         target_chembl_id: str,
         molecule_chembl_id: str,
     ) -> list[dict[str, Any]]:
-        body = _get_json("activity", {
+        body = self._get_json("activity", {
             "target_chembl_id": target_chembl_id,
             "molecule_chembl_id": molecule_chembl_id,
             "standard_type__in": "Kd,Ki,IC50,EC50,dG",
             "limit": 1000,
         })
         return list(body.get("activities") or [])
+
+    def _get_json(self, resource: str, params: dict[str, Any]) -> dict[str, Any]:
+        key = (resource, _normalized_params_key(params))
+        if key not in self._response_cache:
+            self._response_cache[key] = _get_json_uncached(resource, params)
+        return self._response_cache[key]
 
     def fetch_by_uniprot_and_inchikey(
         self,

@@ -5,6 +5,9 @@ from typer.testing import CliRunner
 
 from pbdata.cli import app
 from pbdata.gui import PbdataGUI
+from pbdata.schemas.bound_objects import BoundObject
+from pbdata.sources.rcsb_classify import disambiguate_roles
+from pbdata.training.assembler import assemble_training_examples
 from tests.test_feature_execution import _tmp_dir
 
 
@@ -145,3 +148,50 @@ def test_gui_stage_prerequisite_message_covers_engineer_dataset() -> None:
 
     assert message is not None
     assert "harvest-metadata" in message
+
+
+def test_training_manifest_reports_missing_and_present_sources() -> None:
+    tmp_root = _tmp_dir("handoff_training_completeness")
+    extracted = tmp_root / "extracted"
+    features = tmp_root / "features"
+    graph = tmp_root / "graph"
+    output = tmp_root / "training"
+
+    for name in ["entry", "chains", "assays"]:
+        (extracted / name).mkdir(parents=True, exist_ok=True)
+    features.mkdir(parents=True, exist_ok=True)
+    graph.mkdir(parents=True, exist_ok=True)
+
+    (extracted / "assays" / "pairs.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 5.0,
+            "source_database": "PDBbind",
+        }
+    ]), encoding="utf-8")
+    (features / "feature_records.json").write_text("[]", encoding="utf-8")
+    (graph / "graph_nodes.json").write_text("[]", encoding="utf-8")
+    (graph / "graph_edges.json").write_text("[]", encoding="utf-8")
+
+    _, manifest_path = assemble_training_examples(extracted, features, graph, output)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert "assays" in manifest["sources_present"]
+    assert "bound_objects" in manifest["sources_missing"]
+    assert "features" in manifest["sources_empty"]
+    assert manifest["data_completeness"]["warning_count"] >= 1
+
+
+def test_disambiguate_roles_only_promotes_chain_local_metals() -> None:
+    objects = [
+        BoundObject(comp_id="ATP", chain_ids=["A"], binder_type="small_molecule", role="primary_ligand"),
+        BoundObject(comp_id="ZN", chain_ids=["A"], binder_type="metal_ion", role="structural_ion"),
+        BoundObject(comp_id="MG", chain_ids=["B"], binder_type="metal_ion", role="structural_ion"),
+    ]
+
+    updated = disambiguate_roles(objects)
+
+    assert updated[1].role == "metal_mediated_contact"
+    assert updated[2].role == "structural_ion"

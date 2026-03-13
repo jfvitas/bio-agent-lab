@@ -649,20 +649,39 @@ def disambiguate_roles(objects: list[BoundObject]) -> list[BoundObject]:
     Rules applied in order:
     1. If more than one small_molecule is present, keep the first as
        'primary_ligand' and mark the rest as 'co_ligand'.
-    2. If a metal_ion is present alongside a small_molecule, flag
-       the ion as 'metal_mediated_contact' if both exist.
+    2. If a metal_ion shares chain-local context with a small_molecule, flag
+       the ion as 'metal_mediated_contact'. Do not blanket-promote every metal
+       in entries that merely contain any ligand.
 
     Returns a new list of (possibly updated) BoundObject instances.
     """
     sm_indices = [i for i, o in enumerate(objects) if o.binder_type == "small_molecule"]
-    metal_present = any(o.binder_type == "metal_ion" for o in objects)
+    ligand_chain_ids = {
+        chain_id
+        for obj in objects
+        if obj.binder_type == "small_molecule"
+        for chain_id in (obj.chain_ids or [])
+        if chain_id
+    }
 
     updated: list[BoundObject] = []
     for i, obj in enumerate(objects):
         if obj.binder_type == "small_molecule" and i in sm_indices[1:]:
             obj = obj.model_copy(update={"role": "co_ligand"})
-        if obj.binder_type == "metal_ion" and metal_present and sm_indices:
-            obj = obj.model_copy(update={"role": "metal_mediated_contact"})
+        if (
+            obj.binder_type == "metal_ion"
+            and sm_indices
+            and ligand_chain_ids
+            and set(obj.chain_ids or []).intersection(ligand_chain_ids)
+        ):
+            rationale = obj.classification_rationale
+            if rationale:
+                rationale += "; "
+            rationale += "shares chain-local context with a small-molecule ligand"
+            obj = obj.model_copy(update={
+                "role": "metal_mediated_contact",
+                "classification_rationale": rationale,
+            })
         updated.append(obj)
     return updated
 

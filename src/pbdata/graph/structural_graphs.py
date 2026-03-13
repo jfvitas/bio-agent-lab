@@ -11,6 +11,7 @@ Assumptions:
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -269,6 +270,39 @@ def _distance(a: dict[str, Any], b: dict[str, Any]) -> float:
     ) ** 0.5
 
 
+def _spatial_cell_id(node: dict[str, Any], cell_size: float) -> tuple[int, int, int]:
+    if cell_size <= 0:
+        raise ValueError("cell_size must be positive")
+    return (
+        math.floor(float(node["x"]) / cell_size),
+        math.floor(float(node["y"]) / cell_size),
+        math.floor(float(node["z"]) / cell_size),
+    )
+
+
+def _candidate_node_pairs(nodes: list[dict[str, Any]], radius: float) -> list[tuple[int, int]]:
+    if radius <= 0 or len(nodes) < 2:
+        return []
+
+    buckets: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for index, node in enumerate(nodes):
+        buckets[_spatial_cell_id(node, radius)].append(index)
+
+    offsets = (-1, 0, 1)
+    pairs: list[tuple[int, int]] = []
+    for left_index, left in enumerate(nodes):
+        left_cell = _spatial_cell_id(left, radius)
+        for dx in offsets:
+            for dy in offsets:
+                for dz in offsets:
+                    neighbor_cell = (left_cell[0] + dx, left_cell[1] + dy, left_cell[2] + dz)
+                    for right_index in buckets.get(neighbor_cell, []):
+                        if right_index <= left_index:
+                            continue
+                        pairs.append((left_index, right_index))
+    return pairs
+
+
 def _residue_edges(nodes: list[dict[str, Any]], chain_groups: dict[str, list[dict[str, Any]]], shell_radius: float) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -278,50 +312,52 @@ def _residue_edges(nodes: list[dict[str, Any]], chain_groups: dict[str, list[dic
             key = (left["node_id"], right["node_id"], "covalent_bond")
             seen.add(key)
             edges.append({"source": left["node_id"], "target": right["node_id"], "edge_type": "covalent_bond", "distance": _distance(left, right)})
-    for i, left in enumerate(nodes):
-        for right in nodes[i + 1 :]:
-            dist = _distance(left, right)
-            if dist > shell_radius:
-                continue
-            edge_type = "distance_neighbor"
-            if left["charge"] > 0 and right["charge"] < 0 or left["charge"] < 0 and right["charge"] > 0:
-                edge_type = "salt_bridge"
-            elif left["hydrophobic_flag"] and right["hydrophobic_flag"]:
-                edge_type = "hydrophobic_contact"
-            elif left["aromatic_flag"] and right["aromatic_flag"] and dist <= 6.0:
-                edge_type = "pi_stacking"
-            key = (left["node_id"], right["node_id"], edge_type)
-            if key in seen:
-                continue
-            seen.add(key)
-            edges.append({"source": left["node_id"], "target": right["node_id"], "edge_type": edge_type, "distance": dist})
+    for left_index, right_index in _candidate_node_pairs(nodes, shell_radius):
+        left = nodes[left_index]
+        right = nodes[right_index]
+        dist = _distance(left, right)
+        if dist > shell_radius:
+            continue
+        edge_type = "distance_neighbor"
+        if left["charge"] > 0 and right["charge"] < 0 or left["charge"] < 0 and right["charge"] > 0:
+            edge_type = "salt_bridge"
+        elif left["hydrophobic_flag"] and right["hydrophobic_flag"]:
+            edge_type = "hydrophobic_contact"
+        elif left["aromatic_flag"] and right["aromatic_flag"] and dist <= 6.0:
+            edge_type = "pi_stacking"
+        key = (left["node_id"], right["node_id"], edge_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"source": left["node_id"], "target": right["node_id"], "edge_type": edge_type, "distance": dist})
     return edges
 
 
 def _atom_edges(nodes: list[dict[str, Any]], shell_radius: float) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
-    for i, left in enumerate(nodes):
-        for right in nodes[i + 1 :]:
-            dist = _distance(left, right)
-            if dist > shell_radius:
-                continue
-            sum_vdw = float(left["vdw_radius"]) + float(right["vdw_radius"])
-            edge_type = "distance_neighbor"
-            if dist <= 1.9:
-                edge_type = "covalent_bond"
-            elif bool(left.get("metal_flag")) or bool(right.get("metal_flag")):
-                edge_type = "metal_coordination"
-            elif left["donor_acceptor"] == "donor" and right["donor_acceptor"] == "acceptor" and dist <= 3.5:
-                edge_type = "hydrogen_bond"
-            elif right["donor_acceptor"] == "donor" and left["donor_acceptor"] == "acceptor" and dist <= 3.5:
-                edge_type = "hydrogen_bond"
-            elif float(left["formal_charge"]) * float(right["formal_charge"]) < 0 and dist <= 4.5:
-                edge_type = "salt_bridge"
-            elif left["aromatic_flag"] and right["aromatic_flag"] and dist <= 5.5:
-                edge_type = "pi_stacking"
-            elif dist <= min(sum_vdw, 5.0):
-                edge_type = "hydrophobic_contact"
-            edges.append({"source": left["node_id"], "target": right["node_id"], "edge_type": edge_type, "distance": dist})
+    for left_index, right_index in _candidate_node_pairs(nodes, shell_radius):
+        left = nodes[left_index]
+        right = nodes[right_index]
+        dist = _distance(left, right)
+        if dist > shell_radius:
+            continue
+        sum_vdw = float(left["vdw_radius"]) + float(right["vdw_radius"])
+        edge_type = "distance_neighbor"
+        if dist <= 1.9:
+            edge_type = "covalent_bond"
+        elif bool(left.get("metal_flag")) or bool(right.get("metal_flag")):
+            edge_type = "metal_coordination"
+        elif left["donor_acceptor"] == "donor" and right["donor_acceptor"] == "acceptor" and dist <= 3.5:
+            edge_type = "hydrogen_bond"
+        elif right["donor_acceptor"] == "donor" and left["donor_acceptor"] == "acceptor" and dist <= 3.5:
+            edge_type = "hydrogen_bond"
+        elif float(left["formal_charge"]) * float(right["formal_charge"]) < 0 and dist <= 4.5:
+            edge_type = "salt_bridge"
+        elif left["aromatic_flag"] and right["aromatic_flag"] and dist <= 5.5:
+            edge_type = "pi_stacking"
+        elif dist <= min(sum_vdw, 5.0):
+            edge_type = "hydrophobic_contact"
+        edges.append({"source": left["node_id"], "target": right["node_id"], "edge_type": edge_type, "distance": dist})
     return edges
 
 

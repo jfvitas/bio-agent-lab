@@ -240,6 +240,10 @@ class StorageLayout:
         return self.data_dir / "training_examples"
 
     @property
+    def identity_dir(self) -> Path:
+        return self.data_dir / "identity"
+
+    @property
     def releases_dir(self) -> Path:
         return self.data_dir / "releases"
 

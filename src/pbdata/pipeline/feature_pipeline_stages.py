@@ -9,6 +9,21 @@ from pbdata.storage import StorageLayout
 from pbdata.table_io import read_dataframe
 
 
+FEATURE_PIPELINE_STAGE_NAMES = [
+    "canonical_input_resolution",
+    "structure_preparation",
+    "base_feature_extraction",
+    "site_physics_enrichment",
+    "graph_construction",
+    "training_example_assembly",
+    "validation_reporting_export",
+]
+
+
+def feature_pipeline_stage_help_text() -> str:
+    return "Valid stage names: " + ", ".join(FEATURE_PIPELINE_STAGE_NAMES)
+
+
 def build_feature_pipeline_stages(
     layout: StorageLayout,
     *,
@@ -343,11 +358,11 @@ def build_feature_pipeline_stages(
         return 1, 1, 0, [str(summary_path), str(coverage), str(failures), str(performance)], []
 
     return [
-        ("canonical_input_resolution", [], stage1),
-        ("structure_preparation", ["canonical_input_resolution"], stage2),
-        ("base_feature_extraction", ["structure_preparation"], stage3),
-        ("site_physics_enrichment", ["base_feature_extraction"], stage4),
-        ("graph_construction", ["site_physics_enrichment"], stage5),
-        ("training_example_assembly", ["graph_construction"], stage6),
-        ("validation_reporting_export", ["training_example_assembly"], stage7),
+        (FEATURE_PIPELINE_STAGE_NAMES[0], [], stage1),
+        (FEATURE_PIPELINE_STAGE_NAMES[1], [FEATURE_PIPELINE_STAGE_NAMES[0]], stage2),
+        (FEATURE_PIPELINE_STAGE_NAMES[2], [FEATURE_PIPELINE_STAGE_NAMES[1]], stage3),
+        (FEATURE_PIPELINE_STAGE_NAMES[3], [FEATURE_PIPELINE_STAGE_NAMES[2]], stage4),
+        (FEATURE_PIPELINE_STAGE_NAMES[4], [FEATURE_PIPELINE_STAGE_NAMES[3]], stage5),
+        (FEATURE_PIPELINE_STAGE_NAMES[5], [FEATURE_PIPELINE_STAGE_NAMES[4]], stage6),
+        (FEATURE_PIPELINE_STAGE_NAMES[6], [FEATURE_PIPELINE_STAGE_NAMES[5]], stage7),
     ]

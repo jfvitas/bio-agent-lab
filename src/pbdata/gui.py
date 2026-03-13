@@ -41,6 +41,7 @@ from pbdata.criteria import (
     save_criteria,
 )
 from pbdata.gui_overview import (
+    GUIOverviewSnapshot,
     build_curation_review_summary as _build_curation_review_summary,
     build_gui_overview_snapshot,
     build_review_health_summary as _build_review_health_summary,
@@ -58,17 +59,19 @@ from pbdata.storage import (
     validate_rcsb_raw_json,
     validate_skempi_csv,
 )
+from pbdata.sources.registry import list_source_descriptors
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_SOURCES = ["rcsb", "bindingdb", "chembl", "pdbbind", "biolip", "skempi"]
+_SOURCE_DESCRIPTORS = list_source_descriptors()
+_SOURCE_DESCRIPTOR_BY_NAME = {descriptor.name: descriptor for descriptor in _SOURCE_DESCRIPTORS}
+_SOURCES = [descriptor.name for descriptor in _SOURCE_DESCRIPTORS]
 _SOURCE_PATH_FIELDS = {
-    "bindingdb": "local_dir",
-    "pdbbind": "local_dir",
-    "biolip": "local_dir",
-    "skempi": "local_path",
+    descriptor.name: str(descriptor.local_path_field)
+    for descriptor in _SOURCE_DESCRIPTORS
+    if descriptor.local_path_field
 }
 _STRUCTURE_MIRROR_OPTIONS = ["rcsb", "pdbj"]
 
@@ -95,7 +98,7 @@ _SOURCE_INGEST_NOTES: dict[str, str] = {
 _SUBPROCESS_STAGES = [
     "extract", "normalize", "audit", "report",
     "setup-workspace", "harvest-metadata", "build-structural-graphs", "engineer-dataset",
-    "report-bias", "export-demo-snapshot",
+    "report-bias", "export-demo-snapshot", "report-source-capabilities", "export-identity-crosswalk",
     "build-conformational-states", "build-graph", "build-microstates", "build-physics-features", "build-microstate-refinement", "build-mm-job-manifests", "run-mm-jobs", "run-feature-pipeline", "export-analysis-queue", "ingest-physics-results", "train-site-physics-surrogate", "build-features", "build-training-examples", "build-splits", "train-baseline-model", "evaluate-baseline-model", "build-custom-training-set", "build-release", "run-scenario-tests",
 ]
 
@@ -146,6 +149,10 @@ _PIPELINE_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
 ]
 
 _ALL_STAGE_KEYS = [key for _, stages in _PIPELINE_GROUPS for key, _ in stages]
+_STAGE_DISPLAY_NAMES = {
+    "ingest": "Ingest Sources",
+    **{key: label for _, stages in _PIPELINE_GROUPS for key, label in stages},
+}
 
 _CRITERIA_PATH = Path("configs/criteria.yaml")
 _SOURCES_CFG   = Path("configs/sources.yaml")
@@ -575,6 +582,8 @@ class PbdataGUI:
         self._organism_name_var       = tk.StringVar(value="")
         self._taxonomy_id_var         = tk.StringVar(value="")
         self._pdb_ids_var             = tk.StringVar(value="")
+        self._max_results_var         = tk.StringVar(value="")
+        self._representative_sampling_var = tk.BooleanVar(value=True)
         self._membrane_only_var       = tk.BooleanVar(value=False)
         self._require_multimer_var    = tk.BooleanVar(value=False)
         self._require_protein_var     = tk.BooleanVar(value=True)
@@ -612,6 +621,14 @@ class PbdataGUI:
         self._site_pipeline_degraded_mode_var = tk.BooleanVar(value=True)
         self._site_pipeline_run_id_var = tk.StringVar(value="")
         self._site_physics_batch_id_var = tk.StringVar(value="")
+        self._harvest_uniprot_var = tk.BooleanVar(value=True)
+        self._harvest_alphafold_var = tk.BooleanVar(value=False)
+        self._harvest_reactome_var = tk.BooleanVar(value=False)
+        self._harvest_interpro_var = tk.BooleanVar(value=False)
+        self._harvest_pfam_var = tk.BooleanVar(value=False)
+        self._harvest_cath_var = tk.BooleanVar(value=False)
+        self._harvest_scop_var = tk.BooleanVar(value=False)
+        self._harvest_max_proteins_var = tk.StringVar(value="")
         self._structural_graph_level_var = tk.StringVar(value="residue")
         self._structural_graph_scope_var = tk.StringVar(value="whole_protein")
         self._structural_graph_exports_var = tk.StringVar(value="pyg,networkx")
@@ -638,6 +655,27 @@ class PbdataGUI:
             key: tk.StringVar(value="idle") for key in _ALL_STAGE_KEYS
         }
         self._status_labels: dict[str, tk.Label] = {}
+        self._action_buttons: list[tk.Widget] = []
+        self._run_state_var = tk.StringVar(value="Idle")
+        self._run_current_stage_var = tk.StringVar(value="No active stage")
+        self._run_progress_var = tk.StringVar(value="0 / 0 stages complete")
+        self._run_next_stage_var = tk.StringVar(value="Nothing queued")
+        self._run_last_message_var = tk.StringVar(value="Choose a stage or workflow to begin.")
+        self._run_elapsed_var = tk.StringVar(value="0s")
+        self._run_plan: list[str] = []
+        self._run_completed_count = 0
+        self._run_started_at: float | None = None
+        self._run_in_progress = False
+        self._run_active_label = ""
+        self._run_current_stage_key: str | None = None
+        self._demo_mode_var = tk.BooleanVar(value=False)
+        self._overview_sections: dict[str, tk.Widget] = {}
+        self._overview_deferred_built = False
+        self._overview_deferred_host: ttk.Frame | None = None
+        self._left_notebook: ttk.Notebook | None = None
+        self._left_tab_frames: dict[str, ttk.Frame] = {}
+        self._left_tab_builders: dict[str, Callable[[ttk.Frame], None]] = {}
+        self._left_tabs_built: set[str] = set()
 
         # --- Data overview labels ---
         self._overview_vars: dict[str, tk.StringVar] = {}
@@ -646,6 +684,45 @@ class PbdataGUI:
             "readiness": tk.StringVar(value="--"),
             "coverage": tk.StringVar(value="--"),
             "quality": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._presenter_banner_vars: dict[str, tk.StringVar] = {
+            "headline": tk.StringVar(value="--"),
+            "subhead": tk.StringVar(value="--"),
+            "state": tk.StringVar(value="--"),
+            "next_step": tk.StringVar(value="--"),
+        }
+        self._completion_summary_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "headline": tk.StringVar(value="--"),
+            "detail": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._completion_row_vars: list[dict[str, tk.StringVar]] = [
+            {
+                "area": tk.StringVar(value="--"),
+                "current": tk.StringVar(value="--"),
+                "target": tk.StringVar(value="--"),
+                "gap": tk.StringVar(value="--"),
+                "status": tk.StringVar(value="--"),
+            }
+            for _ in range(8)
+        ]
+        self._completion_status_labels: list[tk.Label] = []
+        self._artifact_freshness_vars: dict[str, tk.StringVar] = {
+            "release_check": tk.StringVar(value="--"),
+            "demo_snapshot": tk.StringVar(value="--"),
+            "prediction_manifest": tk.StringVar(value="--"),
+            "risk_summary": tk.StringVar(value="--"),
+            "model_comparison": tk.StringVar(value="--"),
+            "training_quality": tk.StringVar(value="--"),
+            "release_manifest": tk.StringVar(value="--"),
+        }
+        self._last_run_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "last_stage": tk.StringVar(value="--"),
+            "last_result": tk.StringVar(value="--"),
             "next_action": tk.StringVar(value="--"),
         }
         self._training_set_vars: dict[str, tk.StringVar] = {
@@ -693,6 +770,116 @@ class PbdataGUI:
             "test_winner": tk.StringVar(value="--"),
             "val_gap": tk.StringVar(value="--"),
         }
+        self._split_diagnostics_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._split_diagnostics_kpi_vars: dict[str, tk.StringVar] = {
+            "strategy": tk.StringVar(value="--"),
+            "held_out": tk.StringVar(value="--"),
+            "hard_overlap": tk.StringVar(value="--"),
+            "family_overlap": tk.StringVar(value="--"),
+            "source_overlap": tk.StringVar(value="--"),
+            "fold_overlap": tk.StringVar(value="--"),
+            "dominance": tk.StringVar(value="--"),
+        }
+        self._search_preview_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._search_preview_kpi_vars: dict[str, tk.StringVar] = {
+            "total": tk.StringVar(value="--"),
+            "selected": tk.StringVar(value="--"),
+            "sample": tk.StringVar(value="--"),
+            "mode": tk.StringVar(value="--"),
+        }
+        self._source_configuration_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._source_configuration_kpi_vars: dict[str, tk.StringVar] = {
+            "enabled": tk.StringVar(value="--"),
+            "implemented": tk.StringVar(value="--"),
+            "planned": tk.StringVar(value="--"),
+            "misconfigured": tk.StringVar(value="--"),
+        }
+        self._source_run_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._source_run_kpi_vars: dict[str, tk.StringVar] = {
+            "sources": tk.StringVar(value="--"),
+            "attempts": tk.StringVar(value="--"),
+            "records": tk.StringVar(value="--"),
+            "mode": tk.StringVar(value="--"),
+        }
+        self._data_integrity_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+            "detail": tk.StringVar(value="--"),
+        }
+        self._data_integrity_kpi_vars: dict[str, tk.StringVar] = {
+            "valid": tk.StringVar(value="--"),
+            "issues": tk.StringVar(value="--"),
+            "empty": tk.StringVar(value="--"),
+            "corrupt": tk.StringVar(value="--"),
+            "invalid": tk.StringVar(value="--"),
+            "scan": tk.StringVar(value="--"),
+        }
+        self._active_operations_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "active_detail": tk.StringVar(value="--"),
+            "failed_detail": tk.StringVar(value="--"),
+            "latest_detail": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._active_operations_kpi_vars: dict[str, tk.StringVar] = {
+            "active": tk.StringVar(value="--"),
+            "running": tk.StringVar(value="--"),
+            "failed": tk.StringVar(value="--"),
+            "stale": tk.StringVar(value="--"),
+            "latest": tk.StringVar(value="--"),
+        }
+        self._identity_crosswalk_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._identity_crosswalk_kpi_vars: dict[str, tk.StringVar] = {
+            "proteins": tk.StringVar(value="--"),
+            "ligands": tk.StringVar(value="--"),
+            "pairs": tk.StringVar(value="--"),
+            "fallbacks": tk.StringVar(value="--"),
+        }
+        self._release_readiness_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._release_readiness_kpi_vars: dict[str, tk.StringVar] = {
+            "entries": tk.StringVar(value="--"),
+            "pairs": tk.StringVar(value="--"),
+            "model_ready": tk.StringVar(value="--"),
+            "held_out": tk.StringVar(value="--"),
+            "blockers": tk.StringVar(value="--"),
+        }
+        self._risk_vars: dict[str, tk.StringVar] = {
+            "status": tk.StringVar(value="--"),
+            "summary": tk.StringVar(value="--"),
+            "next_action": tk.StringVar(value="--"),
+        }
+        self._risk_kpi_vars: dict[str, tk.StringVar] = {
+            "severity": tk.StringVar(value="--"),
+            "score": tk.StringVar(value="--"),
+            "matches": tk.StringVar(value="--"),
+            "pathways": tk.StringVar(value="--"),
+        }
         self._prediction_status_vars: dict[str, tk.StringVar] = {
             "status": tk.StringVar(value="--"),
             "method": tk.StringVar(value="--"),
@@ -721,19 +908,25 @@ class PbdataGUI:
         self._demo_readiness_vars: dict[str, tk.StringVar] = {
             "readiness": tk.StringVar(value="--"),
             "summary": tk.StringVar(value="--"),
+            "customer_message": tk.StringVar(value="--"),
+            "walkthrough": tk.StringVar(value="--"),
             "blockers": tk.StringVar(value="--"),
             "warnings": tk.StringVar(value="--"),
         }
 
         # Serialise "Run All"
         self._running = threading.Lock()
+        self._overview_refresh_generation = 0
         self._closing = False
         self._active_processes: set[subprocess.Popen[str]] = set()
+        self._pipeline_scroll_canvas: tk.Canvas | None = None
+        self._pipeline_scroll_frame: ttk.Frame | None = None
 
         self._build_ui()
         self._load_sources_into_ui()
         self._load_criteria_into_ui()
-        self._refresh_overview()
+        # Let the window paint before the first overview snapshot runs.
+        self._root.after(10, lambda: self._refresh_overview(prefer_cached_status=True))
 
     def _storage_layout(self):
         return build_storage_layout(self._storage_root_var.get().strip() or Path.cwd())
@@ -815,7 +1008,7 @@ class PbdataGUI:
         self._root.columnconfigure(0, weight=0, minsize=360)
         self._root.columnconfigure(1, weight=1)
         self._root.rowconfigure(1, weight=1)
-        self._root.rowconfigure(2, weight=2)
+        self._root.rowconfigure(2, weight=2, minsize=220)
 
         self._build_header()
         self._build_left_panel()
@@ -836,6 +1029,33 @@ class PbdataGUI:
 
         for widget in (canvas, frame):
             _bind_recursive(widget)
+
+    def _make_scrollable_pane(
+        self,
+        outer: ttk.Frame | tk.Frame,
+        *,
+        canvas_bg: str = _APP_BG,
+        frame_padding: int = 8,
+    ) -> tuple[tk.Canvas, ttk.Scrollbar, ttk.Frame]:
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=canvas_bg)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        frame = ttk.Frame(canvas, padding=frame_padding)
+        frame.bind(
+            "<Configure>",
+            lambda _: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        window_id = canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(window_id, width=e.width),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        return canvas, scrollbar, frame
 
     def _bind_text_mousewheel(self, widget: Any) -> None:
         def _scroll(event: Any) -> str:
@@ -902,6 +1122,20 @@ class PbdataGUI:
             justify="right",
         ).pack(side="top", anchor="e", pady=(3, 0))
 
+        tk.Checkbutton(
+            right,
+            text="Demo Mode",
+            variable=self._demo_mode_var,
+            command=self._apply_demo_mode,
+            bg=_HEADER_BG,
+            fg=_HEADER_FG,
+            activebackground=_HEADER_BG,
+            activeforeground=_HEADER_FG,
+            selectcolor=_HEADER_BG,
+            highlightthickness=0,
+            font=("Segoe UI Semibold", 8),
+        ).pack(side="top", anchor="e", pady=(8, 0))
+
     def _build_left_panel(self) -> None:
         left = tk.Frame(self._root, bg=_APP_BG)
         left.grid(row=1, column=0, sticky="nsew", padx=(10, 4), pady=(10, 4))
@@ -910,35 +1144,47 @@ class PbdataGUI:
 
         notebook = ttk.Notebook(left)
         notebook.grid(row=0, column=0, sticky="nsew")
+        self._left_notebook = notebook
+        self._left_tab_builders = {
+            "sources": self._build_sources_tab,
+            "search": self._build_search_tab,
+            "options": self._build_options_tab,
+        }
+        for key, label in [
+            ("sources", " Sources "),
+            ("search", " Search Criteria "),
+            ("options", " Options "),
+        ]:
+            frame = ttk.Frame(notebook, padding=8)
+            self._left_tab_frames[key] = frame
+            notebook.add(frame, text=label)
 
-        self._build_sources_tab(notebook)
-        self._build_search_tab(notebook)
-        self._build_options_tab(notebook)
+        self._build_sources_tab(self._left_tab_frames["sources"])
+        self._left_tabs_built.add("sources")
+        notebook.bind("<<NotebookTabChanged>>", self._on_left_tab_changed, add="+")
+
+    def _on_left_tab_changed(self, _event: tk.Event) -> None:
+        notebook = self._left_notebook
+        if notebook is None:
+            return
+        current = notebook.select()
+        if not current:
+            return
+        current_widget = str(notebook.nametowidget(current))
+        for key, frame in self._left_tab_frames.items():
+            if str(frame) != current_widget or key in self._left_tabs_built:
+                continue
+            builder = self._left_tab_builders.get(key)
+            if builder is None:
+                return
+            builder(frame)
+            self._left_tabs_built.add(key)
+            return
 
     # --- Tab 1: Data Sources ---
 
-    def _build_sources_tab(self, notebook: ttk.Notebook) -> None:
-        outer = ttk.Frame(notebook, padding=8)
-        notebook.add(outer, text=" Sources ")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
-
-        canvas = tk.Canvas(outer, highlightthickness=0, bg=_APP_BG)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        frame = ttk.Frame(canvas, padding=8)
-        frame.bind(
-            "<Configure>",
-            lambda _: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfigure(wid, width=e.width),
-        )
-        wid = canvas.create_window((0, 0), window=frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self._bind_canvas_mousewheel(canvas, frame)
+    def _build_sources_tab(self, outer: ttk.Frame) -> None:
+        canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
 
         frame.columnconfigure(0, weight=1)
         row = 0
@@ -952,13 +1198,14 @@ class PbdataGUI:
         row += 1
 
         for src in _SOURCES:
+            descriptor = _SOURCE_DESCRIPTOR_BY_NAME.get(src)
             src_frame = ttk.Frame(frame)
             src_frame.grid(row=row, column=0, sticky="ew", pady=2)
             src_frame.columnconfigure(1, weight=1)
 
             ttk.Checkbutton(
                 src_frame,
-                text=src.upper(),
+                text=(descriptor.label if descriptor is not None else src.upper()),
                 variable=self._src_enabled[src],
             ).grid(row=0, column=0, sticky="w")
 
@@ -1046,6 +1293,7 @@ class PbdataGUI:
             frame, text="Save Source Config",
             command=self._save_sources,
         ).grid(row=row, column=0, sticky="ew")
+        self._bind_canvas_mousewheel(canvas, frame)
 
     def _browse_path(self, src: str, is_dir: bool) -> None:
         if is_dir:
@@ -1062,32 +1310,12 @@ class PbdataGUI:
         path = filedialog.askdirectory(title="Select storage root folder")
         if path:
             self._storage_root_var.set(path)
-            self._refresh_overview()
+            self._refresh_overview_async()
 
     # --- Tab 2: Search Criteria ---
 
-    def _build_search_tab(self, notebook: ttk.Notebook) -> None:
-        outer = ttk.Frame(notebook, padding=8)
-        notebook.add(outer, text=" Search Criteria ")
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
-
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        frame = ttk.Frame(canvas, padding=8)
-        frame.bind(
-            "<Configure>",
-            lambda _: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfigure(wid, width=e.width),
-        )
-        wid = canvas.create_window((0, 0), window=frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self._bind_canvas_mousewheel(canvas, frame)
+    def _build_search_tab(self, outer: ttk.Frame) -> None:
+        canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
 
         frame.columnconfigure(1, weight=1)
         row = 0
@@ -1116,6 +1344,27 @@ class PbdataGUI:
         ttk.Entry(frame, textvariable=self._pdb_ids_var).grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0),
         )
+        row += 1
+
+        ttk.Label(frame, text="Optional result limit:").grid(
+            row=row, column=0, sticky="w", pady=(6, 0),
+        )
+        ttk.Entry(frame, textvariable=self._max_results_var, width=10).grid(
+            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0),
+        )
+        row += 1
+        ttk.Checkbutton(
+            frame,
+            text="Use representative sampling when a result limit is set",
+            variable=self._representative_sampling_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        row += 1
+        ttk.Label(
+            frame,
+            text="Best-effort diversity pass across task type, method, taxonomy, and resolution buckets before download.",
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -1311,6 +1560,12 @@ class PbdataGUI:
         ).grid(row=row, column=0, columnspan=2, sticky="ew")
         row += 1
 
+        ttk.Button(
+            frame, text="Preview RCSB Search",
+            command=self._preview_rcsb_search,
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        row += 1
+
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=8,
         )
@@ -1399,23 +1654,23 @@ class PbdataGUI:
             text="Refresh Root Exports",
             command=self._refresh_review_exports,
         ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self._bind_canvas_mousewheel(canvas, frame)
 
     # --- Tab 3: Pipeline Options ---
 
-    def _build_options_tab(self, notebook: ttk.Notebook) -> None:
-        outer = ttk.Frame(notebook, padding=8)
-        notebook.add(outer, text=" Options ")
-        outer.columnconfigure(0, weight=1)
+    def _build_options_tab(self, outer: ttk.Frame) -> None:
+        canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
+        frame.columnconfigure(0, weight=1)
 
         row = 0
 
         ttk.Label(
-            outer, text="Storage Root",
+            frame, text="Storage Root",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        root_frame = ttk.Frame(outer)
+        root_frame = ttk.Frame(frame)
         root_frame.grid(row=row, column=0, sticky="ew")
         root_frame.columnconfigure(0, weight=1)
         ttk.Entry(root_frame, textvariable=self._storage_root_var).grid(
@@ -1428,7 +1683,7 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text=(
                 "All generated files will be stored under <storage root>/data/\n"
                 "for raw, processed, extracted, structures, graph, features, reports, and splits."
@@ -1438,18 +1693,18 @@ class PbdataGUI:
         ).grid(row=row, column=0, sticky="w", pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Pipeline Mode",
+            frame, text="Pipeline Mode",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        pipeline_mode_frame = ttk.Frame(outer)
+        pipeline_mode_frame = ttk.Frame(frame)
         pipeline_mode_frame.grid(row=row, column=0, sticky="ew")
         pipeline_mode_frame.columnconfigure(1, weight=1)
         ttk.Label(pipeline_mode_frame, text="Execution mode:").grid(row=0, column=0, sticky="w", pady=2)
@@ -1485,7 +1740,7 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text=(
                 "legacy: current pipeline only\n"
                 "site-centric: new artifacts/ pipeline only\n"
@@ -1496,72 +1751,119 @@ class PbdataGUI:
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         # --- Extract options ---
         ttk.Label(
-            outer, text="Extract Options",
+            frame, text="Extract Options",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
         ttk.Checkbutton(
-            outer, text="Download mmCIF structure files",
+            frame, text="Download mmCIF structure files",
             variable=self._download_structures_var,
         ).grid(row=row, column=0, sticky="w")
         row += 1
 
         ttk.Checkbutton(
-            outer, text="Also download PDB format files",
+            frame, text="Also download PDB format files",
             variable=self._download_pdb_var,
         ).grid(row=row, column=0, sticky="w", pady=(2, 0))
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="mmCIF files are downloaded to <storage root>/data/structures/rcsb/",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Workflow Engine",
+            frame, text="Workflow Engine",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
+        workflow_frame = ttk.Frame(frame)
+        workflow_frame.grid(row=row, column=0, sticky="ew")
+        workflow_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest UniProt annotations",
+            variable=self._harvest_uniprot_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest AlphaFold DB metadata",
+            variable=self._harvest_alphafold_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest Reactome pathway memberships",
+            variable=self._harvest_reactome_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest InterPro domain mappings",
+            variable=self._harvest_interpro_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest Pfam domain mappings",
+            variable=self._harvest_pfam_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest CATH fold mappings",
+            variable=self._harvest_cath_var,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Checkbutton(
+            workflow_frame,
+            text="Harvest SCOP fold mappings",
+            variable=self._harvest_scop_var,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=1)
+        ttk.Label(workflow_frame, text="Max proteins:").grid(row=7, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(
+            workflow_frame,
+            textvariable=self._harvest_max_proteins_var,
+            width=10,
+        ).grid(row=7, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        row += 1
+
         ttk.Label(
-            outer,
+            frame,
             text=(
                 "Use Setup Workspace to create the instruction-pack workspace layout,\n"
-                "then Harvest Metadata to build metadata/protein_metadata.csv for graph and dataset steps."
+                "then Harvest Metadata to build metadata/protein_metadata.csv for graph and dataset steps.\n"
+                "Optional UniProt / AlphaFold / Reactome enrichment adds annotation columns for downstream grouping."
             ),
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Structural Graph Options",
+            frame, text="Structural Graph Options",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        graph_frame = ttk.Frame(outer)
+        graph_frame = ttk.Frame(frame)
         graph_frame.grid(row=row, column=0, sticky="ew")
         graph_frame.columnconfigure(1, weight=1)
         ttk.Label(graph_frame, text="Graph level:").grid(row=0, column=0, sticky="w", pady=2)
@@ -1589,26 +1891,26 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="Comma-separated export formats. Supported: pyg, dgl, networkx.",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         # --- Split options ---
         ttk.Label(
-            outer, text="Split Options",
+            frame, text="Split Options",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        split_frame = ttk.Frame(outer)
+        split_frame = ttk.Frame(frame)
         split_frame.grid(row=row, column=0, sticky="ew")
         split_frame.columnconfigure(1, weight=1)
 
@@ -1638,13 +1940,13 @@ class PbdataGUI:
         row += 1
 
         ttk.Checkbutton(
-            outer, text="Hash-only split (no sequence clustering)",
+            frame, text="Hash-only split (no sequence clustering)",
             variable=self._hash_only_var,
         ).grid(row=row, column=0, sticky="w", pady=(4, 0))
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="Default uses k-mer Jaccard clustering to prevent\n"
                  "sequence-identity leakage between train/val/test.",
             font=("Helvetica", 7),
@@ -1652,18 +1954,18 @@ class PbdataGUI:
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Dataset Engineering",
+            frame, text="Dataset Engineering",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        dataset_frame = ttk.Frame(outer)
+        dataset_frame = ttk.Frame(frame)
         dataset_frame.grid(row=row, column=0, sticky="ew")
         dataset_frame.columnconfigure(1, weight=1)
         dataset_fields: list[tuple[str, tk.Variable, list[str] | None]] = [
@@ -1695,25 +1997,25 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="Builds train.csv, test.csv, optional cv_folds/, and reproducibility configs from metadata/protein_metadata.csv.",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Release Options",
+            frame, text="Release Options",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        release_frame = ttk.Frame(outer)
+        release_frame = ttk.Frame(frame)
         release_frame.grid(row=row, column=0, sticky="ew")
         release_frame.columnconfigure(1, weight=1)
         ttk.Label(release_frame, text="Release tag:").grid(row=0, column=0, sticky="w")
@@ -1723,25 +2025,25 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="Optional. If blank, build-release uses the current UTC timestamp.",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
-        ttk.Separator(outer, orient="horizontal").grid(
+        ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, sticky="ew", pady=10,
         )
         row += 1
 
         ttk.Label(
-            outer, text="Custom Training Set",
+            frame, text="Custom Training Set",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 6))
         row += 1
 
-        custom_frame = ttk.Frame(outer)
+        custom_frame = ttk.Frame(frame)
         custom_frame.grid(row=row, column=0, sticky="ew")
         custom_frame.columnconfigure(1, weight=1)
         custom_fields: list[tuple[str, tk.StringVar, list[str] | None]] = [
@@ -1767,45 +2069,55 @@ class PbdataGUI:
         row += 1
 
         ttk.Label(
-            outer,
+            frame,
             text="Builds a diversity-optimized subset from model-ready pairs, emphasizing broad coverage and low redundancy.",
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
+        self._bind_canvas_mousewheel(canvas, frame)
 
     # --- Pipeline panel (right side) ---
 
     def _build_pipeline_panel(self) -> None:
         right = tk.Frame(self._root, bg=_APP_BG)
         right.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(10, 4))
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=1)
-
-        canvas = tk.Canvas(right, highlightthickness=0, bg=_APP_BG)
-        scrollbar = ttk.Scrollbar(right, orient="vertical", command=canvas.yview)
-        outer = ttk.Frame(canvas)
-        outer.bind(
-            "<Configure>",
-            lambda _: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfigure(wid, width=e.width),
-        )
-        wid = canvas.create_window((0, 0), window=outer, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self._bind_canvas_mousewheel(canvas, outer)
+        canvas, _scrollbar, outer = self._make_scrollable_pane(right)
+        self._pipeline_scroll_canvas = canvas
+        self._pipeline_scroll_frame = outer
 
         outer.columnconfigure(0, weight=1)
 
         # Data overview at top
         self._build_overview(outer)
 
+        status_frame = ttk.LabelFrame(outer, text="Run Status", padding=10, style="Section.TLabelframe")
+        status_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        status_frame.columnconfigure(1, weight=1)
+        status_items = [
+            ("Workflow state:", self._run_state_var),
+            ("Current stage:", self._run_current_stage_var),
+            ("Progress:", self._run_progress_var),
+            ("Next step:", self._run_next_stage_var),
+            ("Last update:", self._run_last_message_var),
+            ("Elapsed:", self._run_elapsed_var),
+        ]
+        for row, (label, var) in enumerate(status_items):
+            ttk.Label(
+                status_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=row, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                status_frame,
+                textvariable=var,
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=1, sticky="w", pady=1)
+
         # Pipeline stages
         pipeline_frame = ttk.LabelFrame(outer, text="Pipeline", padding=12, style="Section.TLabelframe")
-        pipeline_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        pipeline_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
         pipeline_frame.columnconfigure(1, weight=1)
 
         prow = 0
@@ -1824,15 +2136,18 @@ class PbdataGUI:
                 if stage_key == "ingest":
                     cmd = self._spawn_ingest
                 else:
-                    cmd = lambda s=stage_key: self._spawn_stage(s)
+                    def cmd(s: str = stage_key) -> None:
+                        self._spawn_stage(s)
 
-                ttk.Button(
+                button = ttk.Button(
                     pipeline_frame,
                     text=btn_text,
                     width=28,
                     style="Accent.TButton" if stage_key in {"ingest", "extract", "build-release", "build-custom-training-set"} else "TButton",
                     command=cmd,
-                ).grid(row=prow, column=0, sticky="w", pady=3, padx=(8, 12))
+                )
+                button.grid(row=prow, column=0, sticky="w", pady=3, padx=(8, 12))
+                self._action_buttons.append(button)
 
                 lbl = tk.Label(
                     pipeline_frame,
@@ -1857,18 +2172,23 @@ class PbdataGUI:
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
 
-        ttk.Button(
+        run_full_btn = ttk.Button(
             btn_frame,
             text="Run Full Pipeline",
             style="Accent.TButton",
             command=self._spawn_all,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        )
+        run_full_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._action_buttons.append(run_full_btn)
 
-        ttk.Button(
+        refresh_btn = ttk.Button(
             btn_frame,
             text="Refresh Overview",
             command=self._refresh_overview,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        )
+        refresh_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._action_buttons.append(refresh_btn)
+        self._bind_canvas_mousewheel(canvas, outer)
 
     def _build_overview(self, parent: tk.Frame) -> None:
         overview = ttk.LabelFrame(parent, text="Data Overview", padding=10, style="Section.TLabelframe")
@@ -1878,7 +2198,7 @@ class PbdataGUI:
 
         ttk.Label(
             overview,
-            text="Recommended flow: save sources and search criteria, run ingest -> extract -> review root exports, then graph/features/training/splits/release.",
+            text="Recommended flow: configure sources, build a clean dataset slice, review release health, then move into features, training, and demo exports.",
             font=("Helvetica", 8),
             foreground="#666666",
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
@@ -1887,6 +2207,7 @@ class PbdataGUI:
             ("raw_rcsb",     "Raw RCSB entries:"),
             ("raw_skempi",   "SKEMPI CSV:"),
             ("processed",    "Processed records:"),
+            ("processed_valid", "Processed valid:"),
             ("extracted",    "Extracted entries:"),
             ("chains",       "Chains:"),
             ("bound_objects", "Bound objects:"),
@@ -1894,6 +2215,7 @@ class PbdataGUI:
             ("graph_nodes",  "Graph nodes:"),
             ("graph_edges",  "Graph edges:"),
             ("splits",       "Split files:"),
+            ("processed_issues", "Processed issues:"),
         ]
 
         for i, (key, label) in enumerate(items):
@@ -1912,8 +2234,82 @@ class PbdataGUI:
                 font=("Helvetica", 8, "bold"),
             ).grid(row=r, column=col_offset + 1, sticky="w", padx=(0, 16), pady=1)
 
+        presenter_frame = ttk.LabelFrame(overview, text="Presenter Banner", padding=8, style="Section.TLabelframe")
+        presenter_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["presenter_banner"] = presenter_frame
+        presenter_frame.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate([
+            ("headline", "Headline:"),
+            ("subhead", "Story:"),
+            ("state", "Workspace state:"),
+            ("next_step", "Open with:"),
+        ]):
+            ttk.Label(presenter_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=row, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                presenter_frame,
+                textvariable=self._presenter_banner_vars[key],
+                wraplength=860,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=1, sticky="w", pady=1)
+
+        completion_frame = ttk.LabelFrame(overview, text="Completion Status", padding=8, style="Section.TLabelframe")
+        completion_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["completion"] = completion_frame
+        for column in range(5):
+            completion_frame.columnconfigure(column, weight=1 if column else 0)
+
+        summary_items = [
+            ("status", "Overall status:"),
+            ("headline", "Headline:"),
+            ("detail", "Progress detail:"),
+            ("next_action", "Priority next step:"),
+        ]
+        for row, (key, label) in enumerate(summary_items):
+            ttk.Label(completion_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=row, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                completion_frame,
+                textvariable=self._completion_summary_vars[key],
+                wraplength=860,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=1, columnspan=4, sticky="w", pady=1)
+
+        header_row = len(summary_items)
+        for column, text in enumerate(["Area", "Current state", "Target", "Gap to close", "Status"]):
+            ttk.Label(completion_frame, text=text, font=("Segoe UI Semibold", 8)).grid(
+                row=header_row, column=column, sticky="w", padx=(0, 8), pady=(8, 2)
+            )
+
+        for index, row_vars in enumerate(self._completion_row_vars, start=header_row + 1):
+            for column, key in enumerate(["area", "current", "target", "gap", "status"]):
+                if key == "status":
+                    label = tk.Label(
+                        completion_frame,
+                        textvariable=row_vars[key],
+                        bg=_CARD_BG,
+                        fg=_MUTED_FG,
+                        justify="left",
+                        font=("Segoe UI Semibold", 8),
+                    )
+                    label.grid(row=index, column=column, sticky="nw", padx=(0, 8), pady=2)
+                    self._completion_status_labels.append(label)
+                    continue
+                ttk.Label(
+                    completion_frame,
+                    textvariable=row_vars[key],
+                    wraplength=190,
+                    justify="left",
+                    font=("Segoe UI", 8),
+                ).grid(row=index, column=column, sticky="nw", padx=(0, 8), pady=2)
+
         review_frame = ttk.LabelFrame(overview, text="Root Review Exports", padding=8, style="Section.TLabelframe")
-        review_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        review_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["review_exports"] = review_frame
         review_frame.columnconfigure(1, weight=1)
 
         review_items = [
@@ -1949,7 +2345,8 @@ class PbdataGUI:
         ).grid(row=0, column=3, rowspan=5, sticky="ns", padx=(8, 0))
 
         release_frame = ttk.LabelFrame(overview, text="Release Artifacts", padding=8, style="Section.TLabelframe")
-        release_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        release_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["release_artifacts"] = release_frame
         release_frame.columnconfigure(1, weight=1)
 
         release_items = [
@@ -1984,7 +2381,8 @@ class PbdataGUI:
         ).grid(row=0, column=2, rowspan=len(release_items), sticky="ns", padx=(8, 0))
 
         training_frame = ttk.LabelFrame(overview, text="Training Set Builder", padding=8, style="Section.TLabelframe")
-        training_frame.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        training_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["training_builder"] = training_frame
         training_frame.columnconfigure(1, weight=1)
         training_items = [
             ("status", "Builder status:"),
@@ -2060,17 +2458,21 @@ class PbdataGUI:
         training_actions.grid(row=0, column=2, rowspan=6, sticky="ns", padx=(8, 0))
         for index in range(2):
             training_actions.columnconfigure(index, weight=1)
-        ttk.Button(
+        run_training_btn = ttk.Button(
             training_actions,
             text="Run Training Set Workflow",
             style="Accent.TButton",
             command=self._spawn_training_set_workflow,
-        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Button(
+        )
+        run_training_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self._action_buttons.append(run_training_btn)
+        custom_set_btn = ttk.Button(
             training_actions,
             text="Build Custom Set",
             command=lambda: self._spawn_stage("build-custom-training-set"),
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
+        )
+        custom_set_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
+        self._action_buttons.append(custom_set_btn)
         ttk.Button(
             training_actions,
             text="Open Benchmark",
@@ -2081,14 +2483,35 @@ class PbdataGUI:
             text="Open Exclusions",
             command=lambda: self._open_path(self._existing_review_path("custom_training_exclusions_csv")),
         ).grid(row=2, column=0, sticky="ew", padx=(0, 4), pady=2)
-        ttk.Button(
+        release_btn = ttk.Button(
             training_actions,
             text="Build Release",
             command=lambda: self._spawn_stage("build-release"),
-        ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=2)
+        )
+        release_btn.grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=2)
+        self._action_buttons.append(release_btn)
+
+        deferred_host = ttk.Frame(overview)
+        deferred_host.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        deferred_host.columnconfigure(0, weight=1)
+        self._overview_deferred_host = deferred_host
+        ttk.Label(
+            deferred_host,
+            text="Loading detailed overview panels after startup...",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            deferred_host,
+            text="Load Detailed Panels Now",
+            command=self._build_overview_deferred_sections,
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._root.after(150, self._build_overview_deferred_sections)
+        self._apply_demo_mode()
+        return
 
         quality_frame = ttk.LabelFrame(overview, text="Training Example Quality", padding=8, style="Section.TLabelframe")
-        quality_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        quality_frame.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["training_quality"] = quality_frame
         quality_frame.columnconfigure(1, weight=1)
         quality_items = [
             ("status", "Corpus status:"),
@@ -2136,7 +2559,8 @@ class PbdataGUI:
         ).grid(row=0, column=2, rowspan=len(quality_items), sticky="ns", padx=(8, 0))
 
         comparison_frame = ttk.LabelFrame(overview, text="Model Comparison", padding=8, style="Section.TLabelframe")
-        comparison_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        comparison_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["model_comparison"] = comparison_frame
         comparison_frame.columnconfigure(1, weight=1)
         comparison_items = [
             ("status", "Comparison status:"),
@@ -2182,8 +2606,424 @@ class PbdataGUI:
             command=lambda: self._spawn_stage("report-model-comparison"),
         ).grid(row=0, column=2, rowspan=len(comparison_items), sticky="ns", padx=(8, 0))
 
+        split_diag_frame = ttk.LabelFrame(overview, text="Split Diagnostics", padding=8, style="Section.TLabelframe")
+        split_diag_frame.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["split_diagnostics"] = split_diag_frame
+        split_diag_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Split status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(split_diag_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=r, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                split_diag_frame,
+                textvariable=self._split_diagnostics_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        split_diag_metrics = ttk.Frame(split_diag_frame)
+        split_diag_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            split_diag_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("strategy", "Strategy"),
+            ("held_out", "Held-out items"),
+            ("hard_overlap", "Hard overlap"),
+            ("family_overlap", "Family overlap"),
+            ("source_overlap", "Source overlap"),
+            ("fold_overlap", "Fold overlap"),
+            ("dominance", "Max family share"),
+        ]):
+            card = ttk.Frame(split_diag_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._split_diagnostics_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            split_diag_frame,
+            text="Open Split Diagnostics",
+            command=lambda: self._open_path(self._storage_layout().splits_dir / "split_diagnostics.md"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        search_preview_frame = ttk.LabelFrame(overview, text="Search Preview", padding=8, style="Section.TLabelframe")
+        search_preview_frame.grid(row=14, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["search_preview"] = search_preview_frame
+        search_preview_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Preview status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(search_preview_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=r, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                search_preview_frame,
+                textvariable=self._search_preview_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        search_preview_metrics = ttk.Frame(search_preview_frame)
+        search_preview_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            search_preview_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("total", "Total matches"),
+            ("selected", "Selected"),
+            ("sample", "Preview sample"),
+            ("mode", "Selection mode"),
+        ]):
+            card = ttk.Frame(search_preview_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._search_preview_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(
+                row=1, column=0, sticky="w", pady=(2, 0)
+            )
+        ttk.Button(
+            search_preview_frame,
+            text="Preview RCSB Search",
+            command=self._preview_rcsb_search,
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        source_config_frame = ttk.LabelFrame(overview, text="Source Configuration", padding=8, style="Section.TLabelframe")
+        source_config_frame.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["source_configuration"] = source_config_frame
+        source_config_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Configuration status:"),
+            ("summary", "Current source surface:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                source_config_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                source_config_frame,
+                textvariable=self._source_configuration_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        source_config_metrics = ttk.Frame(source_config_frame)
+        source_config_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            source_config_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("enabled", "Enabled"),
+            ("implemented", "Implemented"),
+            ("planned", "Planned"),
+            ("misconfigured", "Needs path"),
+        ]):
+            card = ttk.Frame(source_config_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._source_configuration_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            source_config_frame,
+            text="Export Source Capabilities",
+            command=lambda: self._spawn_stage("report-source-capabilities"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        source_frame = ttk.LabelFrame(overview, text="Source Activity", padding=8, style="Section.TLabelframe")
+        source_frame.grid(row=16, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["source_activity"] = source_frame
+        source_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Run status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                source_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                source_frame,
+                textvariable=self._source_run_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        source_metrics = ttk.Frame(source_frame)
+        source_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            source_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("sources", "Sources touched"),
+            ("attempts", "Attempts"),
+            ("records", "Records observed"),
+            ("mode", "Dominant mode"),
+        ]):
+            card = ttk.Frame(source_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._source_run_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            source_frame,
+            text="Open Source Summary",
+            command=lambda: self._open_path(self._storage_layout().reports_dir / "extract_source_run_summary.md"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        data_integrity_frame = ttk.LabelFrame(overview, text="Data Integrity", padding=8, style="Section.TLabelframe")
+        data_integrity_frame.grid(row=17, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["data_integrity"] = data_integrity_frame
+        data_integrity_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Integrity status:"),
+            ("summary", "Current summary:"),
+            ("detail", "What needs attention:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                data_integrity_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                data_integrity_frame,
+                textvariable=self._data_integrity_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        data_integrity_metrics = ttk.Frame(data_integrity_frame)
+        data_integrity_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(6):
+            data_integrity_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("valid", "Valid"),
+            ("issues", "Issues"),
+            ("empty", "Empty"),
+            ("corrupt", "Corrupt"),
+            ("invalid", "Schema-invalid"),
+            ("scan", "Last scan"),
+        ]):
+            card = ttk.Frame(data_integrity_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._data_integrity_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+                wraplength=160 if key == "scan" else 120,
+                justify="left",
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            data_integrity_frame,
+            text="Open Health Report",
+            command=lambda: self._open_path(self._storage_layout().reports_dir / "processed_json_health.md"),
+        ).grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
+        ttk.Button(
+            data_integrity_frame,
+            text="Show Clean Command",
+            command=lambda: self._log_line(
+                "Run `pbdata clean --processed --delete` to remove empty, corrupt, or schema-invalid processed JSON files."
+            ),
+        ).grid(row=2, column=2, rowspan=2, sticky="ns", padx=(8, 0))
+
+        active_ops_frame = ttk.LabelFrame(overview, text="Active Operations", padding=8, style="Section.TLabelframe")
+        active_ops_frame.grid(row=18, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["active_operations"] = active_ops_frame
+        active_ops_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Operational status:"),
+            ("summary", "Current summary:"),
+            ("active_detail", "Lock detail:"),
+            ("failed_detail", "Failure detail:"),
+            ("latest_detail", "Latest manifest:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                active_ops_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                active_ops_frame,
+                textvariable=self._active_operations_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        active_ops_metrics = ttk.Frame(active_ops_frame)
+        active_ops_metrics.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            active_ops_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("active", "Active locks"),
+            ("running", "Running states"),
+            ("failed", "Failed states"),
+            ("stale", "Stale locks"),
+            ("latest", "Latest stage"),
+        ]):
+            card = ttk.Frame(active_ops_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._active_operations_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            active_ops_frame,
+            text="Open Stage State Folder",
+            command=lambda: self._open_path(self._storage_layout().stage_state_dir),
+        ).grid(row=0, column=2, rowspan=6, sticky="ns", padx=(8, 0))
+
+        identity_frame = ttk.LabelFrame(overview, text="Identity Crosswalk", padding=8, style="Section.TLabelframe")
+        identity_frame.grid(row=19, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["identity_crosswalk"] = identity_frame
+        identity_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Crosswalk status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                identity_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                identity_frame,
+                textvariable=self._identity_crosswalk_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        identity_metrics = ttk.Frame(identity_frame)
+        identity_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            identity_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("proteins", "Protein IDs"),
+            ("ligands", "Ligand IDs"),
+            ("pairs", "Pair IDs"),
+            ("fallbacks", "Fallbacks"),
+        ]):
+            card = ttk.Frame(identity_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._identity_crosswalk_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            identity_frame,
+            text="Export Identity Crosswalk",
+            command=lambda: self._spawn_stage("export-identity-crosswalk"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        release_frame = ttk.LabelFrame(overview, text="Release Readiness", padding=8, style="Section.TLabelframe")
+        release_frame.grid(row=20, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["release_readiness"] = release_frame
+        release_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Release status:"),
+            ("summary", "Current summary:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(release_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=r, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                release_frame,
+                textvariable=self._release_readiness_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        release_metrics = ttk.Frame(release_frame)
+        release_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            release_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("entries", "Canonical entries"),
+            ("pairs", "Canonical pairs"),
+            ("model_ready", "Model-ready"),
+            ("held_out", "Held-out"),
+            ("blockers", "Blockers"),
+        ]):
+            card = ttk.Frame(release_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._release_readiness_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(
+                row=1, column=0, sticky="w", pady=(2, 0)
+            )
+        ttk.Button(
+            release_frame,
+            text="Run Release Check",
+            command=lambda: self._spawn_stage("release-check"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
+        risk_frame = ttk.LabelFrame(overview, text="Pathway Risk Context", padding=8, style="Section.TLabelframe")
+        risk_frame.grid(row=21, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["risk_context"] = risk_frame
+        risk_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("status", "Context status:"),
+            ("summary", "Interpretation:"),
+            ("next_action", "Recommended next step:"),
+        ]):
+            ttk.Label(
+                risk_frame,
+                text=label,
+                font=("Segoe UI Semibold", 8),
+            ).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(
+                risk_frame,
+                textvariable=self._risk_vars[key],
+                wraplength=760,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=r, column=1, sticky="w", pady=1)
+        risk_metrics = ttk.Frame(risk_frame)
+        risk_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            risk_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("severity", "Severity"),
+            ("score", "Risk score"),
+            ("matches", "Matched pairs"),
+            ("pathways", "Pathway overlap"),
+        ]):
+            card = ttk.Frame(risk_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._risk_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(
+            risk_frame,
+            text="Open Risk Summary",
+            command=lambda: self._open_path(self._storage_layout().risk_dir / "pathway_risk_summary.json"),
+        ).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+
         prediction_frame = ttk.LabelFrame(overview, text="Prediction Status", padding=8, style="Section.TLabelframe")
-        prediction_frame.grid(row=11, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        prediction_frame.grid(row=22, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["prediction_status"] = prediction_frame
         prediction_frame.columnconfigure(1, weight=1)
         prediction_items = [
             ("status", "Prediction status:"),
@@ -2224,7 +3064,8 @@ class PbdataGUI:
             ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         workflow_frame = ttk.LabelFrame(overview, text="Recommended Workflow", padding=8, style="Section.TLabelframe")
-        workflow_frame.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        workflow_frame.grid(row=23, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["workflow_guidance"] = workflow_frame
         workflow_frame.columnconfigure(1, weight=1)
         workflow_items = [
             ("phase", "Current phase:"),
@@ -2248,7 +3089,8 @@ class PbdataGUI:
             ).grid(row=r, column=1, sticky="w", pady=1)
 
         curation_frame = ttk.LabelFrame(overview, text="Curation Review", padding=8, style="Section.TLabelframe")
-        curation_frame.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        curation_frame.grid(row=24, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["curation_review"] = curation_frame
         curation_frame.columnconfigure(1, weight=1)
         curation_items = [
             ("exclusions", "Exclusion review:"),
@@ -2290,11 +3132,14 @@ class PbdataGUI:
         ).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=2)
 
         demo_frame = ttk.LabelFrame(overview, text="Demo Readiness", padding=8, style="Section.TLabelframe")
-        demo_frame.grid(row=14, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        demo_frame.grid(row=25, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["demo_readiness"] = demo_frame
         demo_frame.columnconfigure(1, weight=1)
         demo_items = [
             ("readiness", "Current state:"),
             ("summary", "Summary:"),
+            ("customer_message", "Customer-facing note:"),
+            ("walkthrough", "Presenter flow:"),
             ("blockers", "Blockers:"),
             ("warnings", "Warnings:"),
         ]
@@ -2311,14 +3156,22 @@ class PbdataGUI:
                 justify="left",
                 font=("Segoe UI", 8),
             ).grid(row=r, column=1, sticky="w", pady=1)
+        demo_actions = ttk.Frame(demo_frame)
+        demo_actions.grid(row=0, column=2, rowspan=len(demo_items), sticky="ns", padx=(8, 0))
         ttk.Button(
-            demo_frame,
+            demo_actions,
             text="Export Demo Snapshot",
             command=lambda: self._spawn_stage("export-demo-snapshot"),
-        ).grid(row=0, column=2, rowspan=len(demo_items), sticky="ns", padx=(8, 0))
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            demo_actions,
+            text="Open Demo Walkthrough",
+            command=lambda: self._open_path(self._storage_layout().feature_reports_dir / "demo_walkthrough.md"),
+        ).grid(row=1, column=0, sticky="ew")
 
         health_frame = ttk.LabelFrame(overview, text="Review Health", padding=8, style="Section.TLabelframe")
-        health_frame.grid(row=15, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        health_frame.grid(row=26, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["review_health"] = health_frame
         health_frame.columnconfigure(1, weight=1)
         health_items = [
             ("readiness", "Release readiness:"),
@@ -2341,7 +3194,8 @@ class PbdataGUI:
             ).grid(row=r, column=1, sticky="w", pady=1)
 
         help_frame = ttk.LabelFrame(overview, text="Interpretation Guide", padding=8, style="Section.TLabelframe")
-        help_frame.grid(row=16, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        help_frame.grid(row=27, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["interpretation_guide"] = help_frame
         help_frame.columnconfigure(0, weight=1)
         help_lines = [
             "High confidence means a field came from direct structured data or a deterministic merge with no unresolved ambiguity.",
@@ -2359,7 +3213,8 @@ class PbdataGUI:
             ).grid(row=r, column=0, sticky="w", pady=1)
 
         actions_frame = ttk.LabelFrame(overview, text="Quick Actions", padding=8, style="Section.TLabelframe")
-        actions_frame.grid(row=17, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        actions_frame.grid(row=28, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["quick_actions"] = actions_frame
         for index in range(7):
             actions_frame.columnconfigure(index, weight=1)
         ttk.Button(
@@ -2398,14 +3253,514 @@ class PbdataGUI:
             command=lambda: self._open_path(self._storage_layout().root),
         ).grid(row=0, column=6, sticky="ew", padx=(4, 0))
 
-    def _refresh_overview(self) -> None:
+        last_run_frame = ttk.LabelFrame(overview, text="Last Workflow Run", padding=8, style="Section.TLabelframe")
+        last_run_frame.grid(row=29, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["last_run"] = last_run_frame
+        last_run_frame.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate([
+            ("status", "Run state:"),
+            ("summary", "Summary:"),
+            ("last_stage", "Last stage:"),
+            ("last_result", "Last result:"),
+            ("next_action", "Next step:"),
+        ]):
+            ttk.Label(last_run_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=row, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                last_run_frame,
+                textvariable=self._last_run_vars[key],
+                wraplength=860,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=1, sticky="w", pady=1)
+
+        freshness_frame = ttk.LabelFrame(overview, text="Artifact Freshness", padding=8, style="Section.TLabelframe")
+        freshness_frame.grid(row=30, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self._overview_sections["artifact_freshness"] = freshness_frame
+        freshness_frame.columnconfigure(1, weight=1)
+        for row, (key, label) in enumerate([
+            ("release_check", "Release check:"),
+            ("demo_snapshot", "Demo snapshot:"),
+            ("prediction_manifest", "Prediction manifest:"),
+            ("risk_summary", "Risk summary:"),
+            ("model_comparison", "Model comparison:"),
+            ("training_quality", "Training quality:"),
+            ("release_manifest", "Release manifest:"),
+        ]):
+            ttk.Label(freshness_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=row, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                freshness_frame,
+                textvariable=self._artifact_freshness_vars[key],
+                wraplength=860,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=row, column=1, sticky="w", pady=1)
+        self._apply_demo_mode()
+
+    def _build_overview_deferred_sections(self) -> None:
+        if not hasattr(self, "_overview_deferred_built"):
+            self._overview_deferred_built = False
+        if not hasattr(self, "_overview_deferred_host"):
+            self._overview_deferred_host = None
+        if self._overview_deferred_built or self._overview_deferred_host is None or self._closing:
+            return
+        host = self._overview_deferred_host
+        for child in host.winfo_children():
+            child.destroy()
+        host.columnconfigure(0, weight=1)
+        self._overview_deferred_built = True
+
+        row = 0
+
+        quality_frame = ttk.LabelFrame(host, text="Training Example Quality", padding=8, style="Section.TLabelframe")
+        quality_frame.grid(row=row, column=0, sticky="ew")
+        self._overview_sections["training_quality"] = quality_frame
+        quality_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Corpus status:"), ("coverage", "Coverage snapshot:"), ("quality", "Quality snapshot:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(quality_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(quality_frame, textvariable=self._training_quality_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        quality_metrics = ttk.Frame(quality_frame)
+        quality_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            quality_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("examples", "Examples"), ("supervised", "Supervised"), ("targets", "Targets"), ("ligands", "Ligands"), ("conflicts", "Conflict rate")]):
+            card = ttk.Frame(quality_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._training_quality_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(quality_frame, text="Export Quality Report", command=lambda: self._spawn_stage("report-training-set-quality")).grid(row=0, column=2, rowspan=4, sticky="ns", padx=(8, 0))
+        row += 1
+
+        comparison_frame = ttk.LabelFrame(host, text="Model Comparison", padding=8, style="Section.TLabelframe")
+        comparison_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["model_comparison"] = comparison_frame
+        comparison_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Comparison status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(comparison_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(comparison_frame, textvariable=self._model_comparison_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        comparison_metrics = ttk.Frame(comparison_frame)
+        comparison_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            comparison_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("baseline", "Baseline"), ("tabular", "Tabular"), ("val_winner", "Val winner"), ("test_winner", "Test winner"), ("val_gap", "Val gap")]):
+            card = ttk.Frame(comparison_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._model_comparison_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(comparison_frame, text="Export Model Comparison", command=lambda: self._spawn_stage("report-model-comparison")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        split_diag_frame = ttk.LabelFrame(host, text="Split Diagnostics", padding=8, style="Section.TLabelframe")
+        split_diag_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["split_diagnostics"] = split_diag_frame
+        split_diag_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Split status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(split_diag_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(split_diag_frame, textvariable=self._split_diagnostics_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        split_diag_metrics = ttk.Frame(split_diag_frame)
+        split_diag_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(7):
+            split_diag_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("strategy", "Strategy"), ("held_out", "Held-out items"), ("hard_overlap", "Hard overlap"), ("family_overlap", "Family overlap"), ("source_overlap", "Source overlap"), ("fold_overlap", "Fold overlap"), ("dominance", "Max family share")]):
+            card = ttk.Frame(split_diag_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._split_diagnostics_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(split_diag_frame, text="Open Split Diagnostics", command=lambda: self._open_path(self._storage_layout().splits_dir / "split_diagnostics.md")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        search_preview_frame = ttk.LabelFrame(host, text="Search Preview", padding=8, style="Section.TLabelframe")
+        search_preview_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["search_preview"] = search_preview_frame
+        search_preview_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Preview status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(search_preview_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(search_preview_frame, textvariable=self._search_preview_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        search_preview_metrics = ttk.Frame(search_preview_frame)
+        search_preview_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            search_preview_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("total", "Total matches"), ("selected", "Selected"), ("sample", "Preview sample"), ("mode", "Selection mode")]):
+            card = ttk.Frame(search_preview_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._search_preview_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(search_preview_frame, text="Preview RCSB Search", command=self._preview_rcsb_search).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        source_config_frame = ttk.LabelFrame(host, text="Source Configuration", padding=8, style="Section.TLabelframe")
+        source_config_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["source_configuration"] = source_config_frame
+        source_config_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Configuration status:"), ("summary", "Current source surface:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(source_config_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(source_config_frame, textvariable=self._source_configuration_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        source_config_metrics = ttk.Frame(source_config_frame)
+        source_config_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            source_config_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("enabled", "Enabled"), ("implemented", "Implemented"), ("planned", "Planned"), ("misconfigured", "Needs path")]):
+            card = ttk.Frame(source_config_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._source_configuration_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(source_config_frame, text="Export Source Capabilities", command=lambda: self._spawn_stage("report-source-capabilities")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        source_frame = ttk.LabelFrame(host, text="Source Activity", padding=8, style="Section.TLabelframe")
+        source_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["source_activity"] = source_frame
+        source_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Run status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(source_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(source_frame, textvariable=self._source_run_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        source_metrics = ttk.Frame(source_frame)
+        source_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            source_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("sources", "Sources touched"), ("attempts", "Attempts"), ("records", "Records observed"), ("mode", "Dominant mode")]):
+            card = ttk.Frame(source_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._source_run_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(source_frame, text="Open Source Summary", command=lambda: self._open_path(self._storage_layout().reports_dir / "extract_source_run_summary.md")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        data_integrity_frame = ttk.LabelFrame(host, text="Data Integrity", padding=8, style="Section.TLabelframe")
+        data_integrity_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["data_integrity"] = data_integrity_frame
+        data_integrity_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Integrity status:"), ("summary", "Current summary:"), ("detail", "What needs attention:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(data_integrity_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(data_integrity_frame, textvariable=self._data_integrity_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        data_integrity_metrics = ttk.Frame(data_integrity_frame)
+        data_integrity_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(6):
+            data_integrity_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("valid", "Valid"), ("issues", "Issues"), ("empty", "Empty"), ("corrupt", "Corrupt"), ("invalid", "Schema-invalid"), ("scan", "Last scan")]):
+            card = ttk.Frame(data_integrity_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._data_integrity_kpi_vars[key], font=("Segoe UI Semibold", 11), wraplength=160 if key == "scan" else 120, justify="left").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(data_integrity_frame, text="Open Health Report", command=lambda: self._open_path(self._storage_layout().reports_dir / "processed_json_health.md")).grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
+        row += 1
+
+        active_ops_frame = ttk.LabelFrame(host, text="Active Operations", padding=8, style="Section.TLabelframe")
+        active_ops_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["active_operations"] = active_ops_frame
+        active_ops_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Operational status:"), ("summary", "Current summary:"), ("active_detail", "Lock detail:"), ("failed_detail", "Failure detail:"), ("latest_detail", "Latest manifest:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(active_ops_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(active_ops_frame, textvariable=self._active_operations_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        active_ops_metrics = ttk.Frame(active_ops_frame)
+        active_ops_metrics.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            active_ops_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("active", "Active locks"), ("running", "Running states"), ("failed", "Failed states"), ("stale", "Stale locks"), ("latest", "Latest stage")]):
+            card = ttk.Frame(active_ops_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._active_operations_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(active_ops_frame, text="Open Stage State Folder", command=lambda: self._open_path(self._storage_layout().stage_state_dir)).grid(row=0, column=2, rowspan=6, sticky="ns", padx=(8, 0))
+        row += 1
+
+        identity_frame = ttk.LabelFrame(host, text="Identity Crosswalk", padding=8, style="Section.TLabelframe")
+        identity_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["identity_crosswalk"] = identity_frame
+        identity_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Crosswalk status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(identity_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(identity_frame, textvariable=self._identity_crosswalk_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        identity_metrics = ttk.Frame(identity_frame)
+        identity_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            identity_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("proteins", "Protein IDs"), ("ligands", "Ligand IDs"), ("pairs", "Pair IDs"), ("fallbacks", "Fallbacks")]):
+            card = ttk.Frame(identity_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._identity_crosswalk_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(identity_frame, text="Export Identity Crosswalk", command=lambda: self._spawn_stage("export-identity-crosswalk")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        release_frame = ttk.LabelFrame(host, text="Release Readiness", padding=8, style="Section.TLabelframe")
+        release_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["release_readiness"] = release_frame
+        release_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Release status:"), ("summary", "Current summary:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(release_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(release_frame, textvariable=self._release_readiness_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        release_metrics = ttk.Frame(release_frame)
+        release_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(5):
+            release_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("entries", "Canonical entries"), ("pairs", "Canonical pairs"), ("model_ready", "Model-ready"), ("held_out", "Held-out"), ("blockers", "Blockers")]):
+            card = ttk.Frame(release_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._release_readiness_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(release_frame, text="Run Release Check", command=lambda: self._spawn_stage("release-check")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        risk_frame = ttk.LabelFrame(host, text="Pathway Risk Context", padding=8, style="Section.TLabelframe")
+        risk_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["risk_context"] = risk_frame
+        risk_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Context status:"), ("summary", "Interpretation:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(risk_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(risk_frame, textvariable=self._risk_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        risk_metrics = ttk.Frame(risk_frame)
+        risk_metrics.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            risk_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("severity", "Severity"), ("score", "Risk score"), ("matches", "Matched pairs"), ("pathways", "Pathway overlap")]):
+            card = ttk.Frame(risk_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._risk_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Button(risk_frame, text="Open Risk Summary", command=lambda: self._open_path(self._storage_layout().risk_dir / "pathway_risk_summary.json")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        prediction_frame = ttk.LabelFrame(host, text="Prediction Status", padding=8, style="Section.TLabelframe")
+        prediction_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["prediction_status"] = prediction_frame
+        prediction_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Prediction status:"), ("method", "Selected model:"), ("preference", "Current preference:"), ("summary", "Interpretation:")]):
+            ttk.Label(prediction_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(prediction_frame, textvariable=self._prediction_status_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        prediction_metrics = ttk.Frame(prediction_frame)
+        prediction_metrics.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(4):
+            prediction_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([("targets", "Targets"), ("top_target", "Top target"), ("confidence", "Confidence"), ("query_features", "Query features")]):
+            card = ttk.Frame(prediction_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._prediction_status_kpi_vars[key], font=("Segoe UI Semibold", 11)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        row += 1
+
+        workflow_frame = ttk.LabelFrame(host, text="Recommended Workflow", padding=8, style="Section.TLabelframe")
+        workflow_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["workflow_guidance"] = workflow_frame
+        workflow_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("phase", "Current phase:"), ("summary", "Why this is next:"), ("step_1", "Step 1:"), ("step_2", "Step 2:"), ("step_3", "Step 3:")]):
+            ttk.Label(workflow_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(workflow_frame, textvariable=self._workflow_guidance_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        row += 1
+
+        curation_frame = ttk.LabelFrame(host, text="Curation Review", padding=8, style="Section.TLabelframe")
+        curation_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["curation_review"] = curation_frame
+        curation_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("exclusions", "Exclusion review:"), ("conflicts", "Conflict review:"), ("issues", "Issue review:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(curation_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(curation_frame, textvariable=self._curation_review_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        curation_actions = ttk.Frame(curation_frame)
+        curation_actions.grid(row=0, column=2, rowspan=4, sticky="ns", padx=(8, 0))
+        for index in range(2):
+            curation_actions.columnconfigure(index, weight=1)
+        ttk.Button(curation_actions, text="Refresh Filtered Review", command=self._refresh_filtered_review_csv).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(curation_actions, text="Open Issues", command=lambda: self._open_path(self._existing_review_path("issue_csv"))).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Button(curation_actions, text="Open Conflicts", command=lambda: self._open_path(self._existing_review_path("conflict_csv"))).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=2)
+        row += 1
+
+        demo_frame = ttk.LabelFrame(host, text="Demo Readiness", padding=8, style="Section.TLabelframe")
+        demo_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["demo_readiness"] = demo_frame
+        demo_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("readiness", "Current state:"), ("summary", "Summary:"), ("customer_message", "Customer-facing note:"), ("walkthrough", "Presenter flow:"), ("blockers", "Blockers:"), ("warnings", "Warnings:")]):
+            ttk.Label(demo_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(demo_frame, textvariable=self._demo_readiness_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        ttk.Button(demo_frame, text="Open Demo Walkthrough", command=lambda: self._open_path(self._storage_layout().feature_reports_dir / "demo_walkthrough.md")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        row += 1
+
+        health_frame = ttk.LabelFrame(host, text="Review Health", padding=8, style="Section.TLabelframe")
+        health_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["review_health"] = health_frame
+        health_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("readiness", "Release readiness:"), ("coverage", "Coverage snapshot:"), ("quality", "Quality snapshot:"), ("next_action", "Recommended next step:")]):
+            ttk.Label(health_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(health_frame, textvariable=self._review_health_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        row += 1
+
+        help_frame = ttk.LabelFrame(host, text="Interpretation Guide", padding=8, style="Section.TLabelframe")
+        help_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["interpretation_guide"] = help_frame
+        help_frame.columnconfigure(0, weight=1)
+        for r, text in enumerate([
+            "High confidence means a field came from direct structured data or a deterministic merge with no unresolved ambiguity.",
+            "Medium or low confidence usually indicates fallback logic, partial source coverage, or unresolved biological context.",
+            "A conflicted pair means multiple sources reported materially divergent values for the same pair and assay type.",
+            "Model-ready outputs are conservative by design. Excluded pairs stay out until the blockers are resolved or accepted.",
+        ]):
+            ttk.Label(help_frame, text=f"- {text}", wraplength=980, justify="left", style="Muted.TLabel").grid(row=r, column=0, sticky="w", pady=1)
+        row += 1
+
+        last_run_frame = ttk.LabelFrame(host, text="Last Workflow Run", padding=8, style="Section.TLabelframe")
+        last_run_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["last_run"] = last_run_frame
+        last_run_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("status", "Run state:"), ("summary", "Summary:"), ("last_stage", "Last stage:"), ("last_result", "Last result:"), ("next_action", "Next step:")]):
+            ttk.Label(last_run_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(last_run_frame, textvariable=self._last_run_vars[key], wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        row += 1
+
+        freshness_frame = ttk.LabelFrame(host, text="Artifact Freshness", padding=8, style="Section.TLabelframe")
+        freshness_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["artifact_freshness"] = freshness_frame
+        freshness_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([("release_check", "Release check:"), ("demo_snapshot", "Demo snapshot:"), ("prediction_manifest", "Prediction manifest:"), ("risk_summary", "Risk summary:"), ("model_comparison", "Model comparison:"), ("training_quality", "Training quality:"), ("release_manifest", "Release manifest:")]):
+            ttk.Label(freshness_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(freshness_frame, textvariable=self._artifact_freshness_vars[key], wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        row += 1
+
+        actions_frame = ttk.LabelFrame(host, text="Quick Actions", padding=8, style="Section.TLabelframe")
+        actions_frame.grid(row=row, column=0, sticky="ew", pady=(8, 0))
+        self._overview_sections["quick_actions"] = actions_frame
+        for index in range(7):
+            actions_frame.columnconfigure(index, weight=1)
+        ttk.Button(actions_frame, text="Open Filtered Review CSV", command=lambda: self._open_path(self._filtered_review_csv_path())).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(actions_frame, text="Open Model-ready CSV", command=lambda: self._open_path(self._existing_review_path("model_ready_pairs_csv"))).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(actions_frame, text="Open Custom Training Set", command=lambda: self._open_path(self._existing_review_path("custom_training_set_csv"))).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(actions_frame, text="Open Split Benchmark", command=lambda: self._open_path(self._existing_review_path("custom_training_split_benchmark_csv"))).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(actions_frame, text="Open Training Scorecard", command=lambda: self._open_path(self._existing_review_path("custom_training_scorecard_json"))).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(actions_frame, text="Open Coverage Summary", command=lambda: self._open_path(self._existing_review_path("scientific_coverage_json"))).grid(row=0, column=5, sticky="ew", padx=4)
+        ttk.Button(actions_frame, text="Open Storage Root", command=lambda: self._open_path(self._storage_layout().root)).grid(row=0, column=6, sticky="ew", padx=(4, 0))
+        self._apply_demo_mode()
+        if self._pipeline_scroll_canvas is not None and self._pipeline_scroll_frame is not None:
+            self._bind_canvas_mousewheel(self._pipeline_scroll_canvas, self._pipeline_scroll_frame)
+
+    @staticmethod
+    def _demo_customer_message(readiness: str) -> str:
+        if readiness == "ready_for_internal_demo":
+            return "Good for a customer-facing baseline walkthrough. Keep claims tied to the artifacts shown on screen."
+        if readiness == "technically_reviewable_not_polished":
+            return "Good for a technical preview, but call out unfinished areas as roadmap items instead of implied capabilities."
+        if readiness == "not_demo_ready":
+            return "Finish the blockers before using this workspace for a live customer demo."
+        return "Review the current workspace state before presenting it externally."
+
+    @staticmethod
+    def _format_demo_walkthrough(steps: list[object]) -> str:
+        clean_steps = [str(step).strip() for step in steps if str(step).strip()]
+        if not clean_steps:
+            return "1. Open the overview and confirm the current workspace state."
+        return "\n".join(f"{index}. {step}" for index, step in enumerate(clean_steps, start=1))
+
+    @staticmethod
+    def _completion_status_color(status: str) -> str:
+        normalized = status.strip().lower()
+        if normalized in {"done", "complete"}:
+            return _SUCCESS_FG
+        if normalized in {"blocked", "error"}:
+            return _ERROR_FG
+        if normalized in {"partial", "in_progress", "in progress"}:
+            return _WARNING_FG
+        return _MUTED_FG
+
+    def _apply_demo_mode(self) -> None:
+        if not hasattr(self, "_overview_sections"):
+            return
+        demo_mode = bool(self._demo_mode_var.get())
+        demo_visible = {
+            "presenter_banner",
+            "completion",
+            "training_quality",
+            "model_comparison",
+            "search_preview",
+            "source_configuration",
+            "data_integrity",
+            "release_readiness",
+            "risk_context",
+            "prediction_status",
+            "workflow_guidance",
+            "demo_readiness",
+            "last_run",
+            "artifact_freshness",
+            "quick_actions",
+        }
+        for key, widget in self._overview_sections.items():
+            if not demo_mode or key in demo_visible:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _build_overview_snapshot(self, *, prefer_cached_status: bool = False) -> GUIOverviewSnapshot:
         layout = self._storage_layout()
         try:
             cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
         except Exception:
             cfg = AppConfig(storage_root=str(layout.root))
-        snapshot = build_gui_overview_snapshot(layout, cfg, repo_root=Path.cwd())
+        return build_gui_overview_snapshot(
+            layout,
+            cfg,
+            repo_root=Path.cwd(),
+            prefer_cached_status=prefer_cached_status,
+        )
 
+    def _ensure_overview_refresh_state(self) -> None:
+        if not hasattr(self, "_overview_refresh_generation"):
+            self._overview_refresh_generation = 0
+
+    def _refresh_overview(self, *, prefer_cached_status: bool = False) -> None:
+        self._ensure_overview_refresh_state()
+        self._overview_refresh_generation += 1
+        snapshot = self._build_overview_snapshot(prefer_cached_status=prefer_cached_status)
+        self._apply_overview_snapshot(snapshot, prefer_cached_status=prefer_cached_status)
+
+    def _refresh_overview_async(self, *, prefer_cached_status: bool = False) -> None:
+        if not hasattr(self, "_root"):
+            self._refresh_overview(prefer_cached_status=prefer_cached_status)
+            return
+        self._ensure_overview_refresh_state()
+        self._overview_refresh_generation += 1
+        generation = self._overview_refresh_generation
+        layout = self._storage_layout()
+        try:
+            cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+        except Exception:
+            cfg = AppConfig(storage_root=str(layout.root))
+
+        def _worker() -> None:
+            try:
+                snapshot = build_gui_overview_snapshot(
+                    layout,
+                    cfg,
+                    repo_root=Path.cwd(),
+                    prefer_cached_status=prefer_cached_status,
+                )
+            except Exception as exc:
+                self._root.after(0, self._log_line, f"Overview refresh failed: {exc}")
+                return
+            self._root.after(
+                0,
+                self._apply_overview_snapshot_async,
+                generation,
+                snapshot,
+                prefer_cached_status,
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_overview_snapshot_async(
+        self,
+        generation: int,
+        snapshot: GUIOverviewSnapshot,
+        prefer_cached_status: bool,
+    ) -> None:
+        if self._closing or generation != self._overview_refresh_generation:
+            return
+        self._apply_overview_snapshot(snapshot, prefer_cached_status=prefer_cached_status)
+
+    def _apply_overview_snapshot(
+        self,
+        snapshot: GUIOverviewSnapshot,
+        *,
+        prefer_cached_status: bool = False,
+    ) -> None:
         for key, value in snapshot.counts.items():
             self._overview_vars[key].set(value)
         for key, path in snapshot.review_paths.items():
@@ -2413,6 +3768,28 @@ class PbdataGUI:
         for key, value in snapshot.review_health.items():
             if key in self._review_health_vars:
                 self._review_health_vars[key].set(value)
+        for key, value in snapshot.presenter_banner.items():
+            if key in self._presenter_banner_vars:
+                self._presenter_banner_vars[key].set(value)
+        for key, value in snapshot.completion_summary.items():
+            if key in self._completion_summary_vars:
+                self._completion_summary_vars[key].set(value)
+        for index, row in enumerate(snapshot.completion_rows):
+            if index >= len(self._completion_row_vars):
+                break
+            for key, value in row.items():
+                if key in self._completion_row_vars[index]:
+                    self._completion_row_vars[index][key].set(value)
+            if index < len(self._completion_status_labels):
+                self._completion_status_labels[index].configure(
+                    fg=self._completion_status_color(str(row.get("status") or ""))
+                )
+        for key, value in snapshot.artifact_freshness.items():
+            if key in self._artifact_freshness_vars:
+                self._artifact_freshness_vars[key].set(value)
+        for key, value in snapshot.last_run_summary.items():
+            if key in self._last_run_vars:
+                self._last_run_vars[key].set(value)
         for key, value in snapshot.training_summary.items():
             if key in self._training_set_vars:
                 self._training_set_vars[key].set(value)
@@ -2434,6 +3811,60 @@ class PbdataGUI:
         for key, value in snapshot.model_comparison_kpis.items():
             if key in self._model_comparison_kpi_vars:
                 self._model_comparison_kpi_vars[key].set(value)
+        for key, value in snapshot.split_diagnostics_summary.items():
+            if key in self._split_diagnostics_vars:
+                self._split_diagnostics_vars[key].set(value)
+        for key, value in snapshot.split_diagnostics_kpis.items():
+            if key in self._split_diagnostics_kpi_vars:
+                self._split_diagnostics_kpi_vars[key].set(value)
+        for key, value in snapshot.search_preview_summary.items():
+            if key in self._search_preview_vars:
+                self._search_preview_vars[key].set(value)
+        for key, value in snapshot.search_preview_kpis.items():
+            if key in self._search_preview_kpi_vars:
+                self._search_preview_kpi_vars[key].set(value)
+        for key, value in snapshot.source_configuration_summary.items():
+            if key in self._source_configuration_vars:
+                self._source_configuration_vars[key].set(value)
+        for key, value in snapshot.source_configuration_kpis.items():
+            if key in self._source_configuration_kpi_vars:
+                self._source_configuration_kpi_vars[key].set(value)
+        for key, value in snapshot.source_run_summary.items():
+            if key in self._source_run_vars:
+                self._source_run_vars[key].set(value)
+        for key, value in snapshot.source_run_kpis.items():
+            if key in self._source_run_kpi_vars:
+                self._source_run_kpi_vars[key].set(value)
+        for key, value in snapshot.data_integrity_summary.items():
+            if key in self._data_integrity_vars:
+                self._data_integrity_vars[key].set(value)
+        for key, value in snapshot.data_integrity_kpis.items():
+            if key in self._data_integrity_kpi_vars:
+                self._data_integrity_kpi_vars[key].set(value)
+        for key, value in snapshot.active_operations_summary.items():
+            if key in self._active_operations_vars:
+                self._active_operations_vars[key].set(value)
+        for key, value in snapshot.active_operations_kpis.items():
+            if key in self._active_operations_kpi_vars:
+                self._active_operations_kpi_vars[key].set(value)
+        for key, value in snapshot.identity_crosswalk_summary.items():
+            if key in self._identity_crosswalk_vars:
+                self._identity_crosswalk_vars[key].set(value)
+        for key, value in snapshot.identity_crosswalk_kpis.items():
+            if key in self._identity_crosswalk_kpi_vars:
+                self._identity_crosswalk_kpi_vars[key].set(value)
+        for key, value in snapshot.release_readiness_summary.items():
+            if key in self._release_readiness_vars:
+                self._release_readiness_vars[key].set(value)
+        for key, value in snapshot.release_readiness_kpis.items():
+            if key in self._release_readiness_kpi_vars:
+                self._release_readiness_kpi_vars[key].set(value)
+        for key, value in snapshot.risk_summary.items():
+            if key in self._risk_vars:
+                self._risk_vars[key].set(value)
+        for key, value in snapshot.risk_kpis.items():
+            if key in self._risk_kpi_vars:
+                self._risk_kpi_vars[key].set(value)
         for key, value in snapshot.prediction_status_summary.items():
             if key in self._prediction_status_vars:
                 self._prediction_status_vars[key].set(value)
@@ -2448,10 +3879,19 @@ class PbdataGUI:
                 self._curation_review_vars[key].set(value)
         self._demo_readiness_vars["readiness"].set(snapshot.demo_readiness.readiness or "--")
         self._demo_readiness_vars["summary"].set(snapshot.demo_readiness.summary or "--")
+        self._demo_readiness_vars["customer_message"].set(
+            self._demo_customer_message(snapshot.demo_readiness.readiness or "")
+        )
+        self._demo_readiness_vars["walkthrough"].set(
+            self._format_demo_walkthrough(snapshot.demo_readiness.recommended_demo_flow)
+        )
         blockers = snapshot.demo_readiness.blockers
         warnings = snapshot.demo_readiness.warnings
         self._demo_readiness_vars["blockers"].set(", ".join(str(item) for item in blockers) if blockers else "none")
         self._demo_readiness_vars["warnings"].set(", ".join(str(item) for item in warnings) if warnings else "none")
+        self._apply_demo_mode()
+        if prefer_cached_status and snapshot.demo_readiness.status_snapshot.processed_health_cache_stale:
+            self._root.after(50, self._refresh_overview_async)
 
     def _review_export_paths(self) -> dict[str, str]:
         return _review_export_paths_impl(self._storage_layout(), repo_root=Path.cwd())
@@ -2488,7 +3928,7 @@ class PbdataGUI:
                 self._log_line(f"Root export warning: {export_status[key]}")
         if "release_exports_error" in export_status:
             self._log_line(f"Root export warning: {export_status['release_exports_error']}")
-        self._refresh_overview()
+        self._refresh_overview_async()
 
     def _filtered_review_csv_path(self) -> Path:
         return Path.cwd() / _FILTERED_REVIEW_CSV_NAME
@@ -2570,6 +4010,7 @@ class PbdataGUI:
         self._log = scrolledtext.ScrolledText(
             frame,
             state="disabled",
+            height=12,
             font=("Cascadia Code", 9),
             bg=_LOG_BG, fg=_LOG_FG,
             insertbackground=_HEADER_FG,
@@ -2620,6 +4061,8 @@ class PbdataGUI:
         self._keyword_query_var.set(sc.keyword_query or "")
         self._organism_name_var.set(sc.organism_name_query or "")
         self._taxonomy_id_var.set("" if sc.taxonomy_id is None else str(sc.taxonomy_id))
+        self._max_results_var.set("" if sc.max_results is None else str(sc.max_results))
+        self._representative_sampling_var.set(sc.representative_sampling)
         for key, var in self._method_vars.items():
             var.set(key in sc.experimental_methods)
         self._resolution_var.set(resolution_value_to_label(sc.max_resolution_angstrom))
@@ -2668,6 +4111,9 @@ class PbdataGUI:
         keyword_query = self._keyword_query_var.get().strip() or None
         organism_name_query = self._organism_name_var.get().strip() or None
         taxonomy_str = self._taxonomy_id_var.get().strip()
+        max_results_var = getattr(self, "_max_results_var", None)
+        representative_sampling_var = getattr(self, "_representative_sampling_var", None)
+        max_results_str = max_results_var.get().strip() if max_results_var is not None else ""
         min_protein_str = self._min_protein_entities_var.get().strip()
         min_nonpolymer_str = self._min_nonpolymer_entities_var.get().strip()
         max_nonpolymer_str = self._max_nonpolymer_entities_var.get().strip()
@@ -2679,6 +4125,7 @@ class PbdataGUI:
         min_year_str = self._min_year_var.get().strip()
         max_year_str = self._max_year_var.get().strip()
         taxonomy_id: int | None = int(taxonomy_str) if taxonomy_str.isdigit() else None
+        max_results: int | None = int(max_results_str) if max_results_str.isdigit() else None
         min_protein_entities: int | None = int(min_protein_str) if min_protein_str.isdigit() else None
         min_nonpolymer_entities: int | None = int(min_nonpolymer_str) if min_nonpolymer_str.isdigit() else None
         max_nonpolymer_entities: int | None = int(max_nonpolymer_str) if max_nonpolymer_str.isdigit() else None
@@ -2694,6 +4141,12 @@ class PbdataGUI:
             keyword_query=keyword_query,
             organism_name_query=organism_name_query,
             taxonomy_id=taxonomy_id,
+            max_results=max_results,
+            representative_sampling=(
+                representative_sampling_var.get()
+                if representative_sampling_var is not None
+                else True
+            ),
             experimental_methods=methods,
             max_resolution_angstrom=resolution_label_to_value(self._resolution_var.get()),
             task_types=task_types,
@@ -2719,11 +4172,19 @@ class PbdataGUI:
         save_criteria(sc, _CRITERIA_PATH)
         self._log_line("Criteria saved to configs/criteria.yaml")
 
+    def _preview_rcsb_search(self) -> None:
+        save_criteria(self._criteria_from_ui(), _CRITERIA_PATH)
+        self._spawn_stage("preview-rcsb-search")
+
     # ------------------------------------------------------------------
     # Logging helpers
     # ------------------------------------------------------------------
 
     def _log_line(self, text: str) -> None:
+        if self._run_in_progress:
+            normalized = " ".join(text.strip().split())
+            if normalized and set(normalized) != {"─"} and set(normalized) != {"═"}:
+                self._run_last_message_var.set(normalized)
         self._log.configure(state="normal")
         self._log.insert("end", text.rstrip() + "\n")
         self._log.see("end")
@@ -2733,6 +4194,114 @@ class PbdataGUI:
         self._log.configure(state="normal")
         self._log.delete("1.0", "end")
         self._log.configure(state="disabled")
+
+    def _display_stage_name(self, stage: str) -> str:
+        return _STAGE_DISPLAY_NAMES.get(stage, stage.replace("-", " ").title())
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for button in self._action_buttons:
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                continue
+
+    def _update_run_elapsed(self) -> None:
+        if not self._run_in_progress or self._run_started_at is None:
+            return
+        elapsed_seconds = max(0, int(time.time() - self._run_started_at))
+        if elapsed_seconds < 60:
+            elapsed = f"{elapsed_seconds}s"
+        else:
+            minutes, seconds = divmod(elapsed_seconds, 60)
+            elapsed = f"{minutes}m {seconds:02d}s"
+        self._run_elapsed_var.set(elapsed)
+        self._root.after(1000, self._update_run_elapsed)
+
+    def _start_run_tracking(self, run_label: str, planned_stages: list[str]) -> None:
+        self._run_active_label = run_label
+        self._run_plan = list(planned_stages)
+        self._run_completed_count = 0
+        self._run_current_stage_key = None
+        self._run_started_at = time.time()
+        self._run_in_progress = True
+        self._run_state_var.set(f"{run_label} running")
+        self._run_current_stage_var.set("Preparing workspace")
+        self._run_progress_var.set(f"0 / {len(self._run_plan)} stages complete")
+        next_stage = self._display_stage_name(self._run_plan[0]) if self._run_plan else "Nothing queued"
+        self._run_next_stage_var.set(next_stage)
+        self._run_last_message_var.set("Preparing workspace and validating prerequisites.")
+        self._run_elapsed_var.set("0s")
+        self._update_run_elapsed()
+
+    def _mark_stage_started(self, stage: str) -> None:
+        self._run_current_stage_key = stage
+        display_name = self._display_stage_name(stage)
+        total = len(self._run_plan)
+        current_index = self._run_completed_count + 1 if total else 0
+        self._run_state_var.set(f"{self._run_active_label or 'Workflow'} running")
+        self._run_current_stage_var.set(display_name)
+        self._run_progress_var.set(f"Stage {current_index} of {total}" if total else "Single stage run")
+        if stage in self._run_plan:
+            stage_index = self._run_plan.index(stage)
+            next_stage = (
+                self._display_stage_name(self._run_plan[stage_index + 1])
+                if stage_index + 1 < len(self._run_plan)
+                else "Final stage in plan"
+            )
+        else:
+            next_stage = "Not part of current plan"
+        self._run_next_stage_var.set(next_stage)
+        self._run_last_message_var.set(f"Running {display_name}...")
+
+    def _mark_stage_finished(self, stage: str, status: str) -> None:
+        display_name = self._display_stage_name(stage)
+        if status == "done":
+            self._run_completed_count += 1
+            self._run_progress_var.set(
+                f"{self._run_completed_count} / {len(self._run_plan)} stages complete"
+                if self._run_plan
+                else "Single stage complete"
+            )
+            pending = self._run_plan[self._run_completed_count:] if self._run_plan else []
+            self._run_next_stage_var.set(
+                self._display_stage_name(pending[0]) if pending else "No remaining stages"
+            )
+            self._run_last_message_var.set(f"{display_name} completed successfully.")
+        elif status == "cancelled":
+            self._run_last_message_var.set(f"{display_name} was cancelled.")
+        else:
+            self._run_state_var.set(f"{self._run_active_label or 'Workflow'} needs attention")
+            self._run_next_stage_var.set("Resolve the failing stage before continuing")
+            self._run_last_message_var.set(f"{display_name} failed. Check the live log for details.")
+
+    def _finish_run_tracking(self, status: str, summary: str) -> None:
+        label = self._run_active_label or "Workflow"
+        state_label = {
+            "done": f"{label} complete",
+            "cancelled": f"{label} cancelled",
+            "error": f"{label} needs attention",
+        }.get(status, f"{label} finished")
+        self._run_state_var.set(state_label)
+        if status != "done":
+            self._run_current_stage_var.set("No active stage")
+        self._run_next_stage_var.set("Choose the next stage or refresh the overview.")
+        self._run_last_message_var.set(summary)
+        self._run_in_progress = False
+        self._run_current_stage_key = None
+
+    def _try_begin_background_run(self, run_label: str, planned_stages: list[str]) -> bool:
+        if not self._running.acquire(blocking=False):
+            self._log_line("Another workflow is already running. Wait for it to finish before starting a new one.")
+            return False
+        self._root.after(0, self._set_action_buttons_enabled, False)
+        self._root.after(0, self._start_run_tracking, run_label, planned_stages)
+        return True
+
+    def _complete_background_run(self, status: str, summary: str) -> None:
+        self._root.after(0, self._finish_run_tracking, status, summary)
+        self._root.after(0, self._set_action_buttons_enabled, True)
+        self._running.release()
 
     def _existing_review_path(self, key: str) -> Path | None:
         path = self._review_export_paths().get(key, "")
@@ -2866,6 +4435,24 @@ class PbdataGUI:
                 cmd.extend(["--batch-id", batch_id])
             if run_id:
                 cmd.extend(["--source-run-id", run_id])
+        elif stage == "harvest-metadata":
+            max_proteins = self._harvest_max_proteins_var.get().strip()
+            if self._harvest_uniprot_var.get():
+                cmd.append("--with-uniprot")
+            if self._harvest_alphafold_var.get():
+                cmd.append("--with-alphafold")
+            if self._harvest_reactome_var.get():
+                cmd.append("--with-reactome")
+            if getattr(self, "_harvest_interpro_var", None) and self._harvest_interpro_var.get():
+                cmd.append("--with-interpro")
+            if getattr(self, "_harvest_pfam_var", None) and self._harvest_pfam_var.get():
+                cmd.append("--with-pfam")
+            if getattr(self, "_harvest_cath_var", None) and self._harvest_cath_var.get():
+                cmd.append("--with-cath")
+            if getattr(self, "_harvest_scop_var", None) and self._harvest_scop_var.get():
+                cmd.append("--with-scop")
+            if max_proteins:
+                cmd.extend(["--max-proteins", max_proteins])
 
         elif stage == "build-splits":
             split_mode = self._split_mode_var.get().strip()
@@ -3008,6 +4595,7 @@ class PbdataGUI:
         """
         if self._closing:
             return "cancelled"
+        self._root.after(0, self._mark_stage_started, stage)
         self._root.after(0, self._set_status, stage, "running")
         self._root.after(0, self._log_line, f"\n{'─' * 40}")
         self._root.after(0, self._log_line, f"  {stage}")
@@ -3047,16 +4635,35 @@ class PbdataGUI:
         if self._closing:
             return "cancelled"
         self._root.after(0, self._set_status, stage, status)
+        self._root.after(0, self._mark_stage_finished, stage, status)
         self._root.after(0, self._log_line, f"[{stage}] {status}.")
         self._root.after(0, self._refresh_overview)
         return status
 
     def _spawn_stage(self, stage: str) -> None:
-        threading.Thread(target=self._run_stage, args=(stage,), daemon=True).start()
+        if not self._try_begin_background_run(self._display_stage_name(stage), [stage]):
+            return
+
+        def _thread_target() -> None:
+            status = "error"
+            summary = f"{self._display_stage_name(stage)} failed."
+            try:
+                status = self._run_stage(stage)
+                summary = (
+                    f"{self._display_stage_name(stage)} completed."
+                    if status == "done"
+                    else f"{self._display_stage_name(stage)} was cancelled."
+                    if status == "cancelled"
+                    else f"{self._display_stage_name(stage)} failed."
+                )
+            finally:
+                self._complete_background_run(status, summary)
+
+        threading.Thread(target=_thread_target, daemon=True).start()
 
     def _spawn_training_set_workflow(self) -> None:
-        if not self._running.acquire(blocking=False):
-            self._log_line("Pipeline already running — please wait.")
+        stages = ["build-splits", "build-custom-training-set", "build-release"]
+        if not self._try_begin_background_run("Training set workflow", stages):
             return
         threading.Thread(target=self._run_training_set_workflow_thread, daemon=True).start()
 
@@ -3074,6 +4681,10 @@ class PbdataGUI:
                 status = self._run_stage(stage)
                 if status == "error":
                     self._root.after(0, self._log_line, f"\nTraining set workflow stopped at '{stage}'.")
+                    self._complete_background_run("error", f"Training set workflow stopped at {self._display_stage_name(stage)}.")
+                    return
+                if status == "cancelled":
+                    self._complete_background_run("cancelled", "Training set workflow was cancelled.")
                     return
             self._root.after(0, self._log_line, f"\n{'═' * 50}")
             self._root.after(0, self._log_line, "  TRAINING SET WORKFLOW COMPLETE")
@@ -3084,23 +4695,27 @@ class PbdataGUI:
                 "  Review custom_training_scorecard.json and custom_training_split_benchmark.csv before shipping the set.",
             )
             self._root.after(0, self._refresh_overview)
+            self._complete_background_run("done", "Training set workflow completed.")
         finally:
-            self._running.release()
+            pass
 
     # ------------------------------------------------------------------
     # Ingest — multi-source aware
     # ------------------------------------------------------------------
 
     def _spawn_ingest(self) -> None:
-        threading.Thread(target=self._run_ingest, daemon=True).start()
+        if not self._try_begin_background_run("Ingest", ["ingest"]):
+            return
+        threading.Thread(target=self._run_ingest, kwargs={"finalize_background_run": True}, daemon=True).start()
 
-    def _run_ingest(self) -> str:
+    def _run_ingest(self, *, finalize_background_run: bool = False) -> str:
         """Background thread: ingest from all enabled sources.
 
         Returns 'done', 'error', or 'cancelled'.
         """
         if self._closing:
             return "cancelled"
+        self._root.after(0, self._mark_stage_started, "ingest")
         self._root.after(0, self._set_status, "ingest", "running")
         self._root.after(0, self._log_line, f"\n{'═' * 40}")
         self._root.after(0, self._log_line, "  Ingest Sources")
@@ -3185,7 +4800,15 @@ class PbdataGUI:
             self._root.after(0, self._log_line, f"    {s}")
 
         self._root.after(0, self._set_status, "ingest", overall_status)
+        self._root.after(0, self._mark_stage_finished, "ingest", overall_status)
         self._root.after(0, self._refresh_overview)
+        if finalize_background_run:
+            self._complete_background_run(
+                overall_status,
+                "Ingest finished successfully." if overall_status == "done"
+                else "Ingest was cancelled." if overall_status == "cancelled"
+                else "Ingest finished with errors.",
+            )
         return overall_status
 
     def _ingest_rcsb(self) -> str:
@@ -3394,8 +5017,9 @@ class PbdataGUI:
     # ------------------------------------------------------------------
 
     def _spawn_all(self) -> None:
-        if not self._running.acquire(blocking=False):
-            self._log_line("Pipeline already running — please wait.")
+        mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
+        planned_stages = ["ingest", *self._pipeline_stages_for_mode(mode)]
+        if not self._try_begin_background_run("Full pipeline", planned_stages):
             return
         threading.Thread(target=self._run_all_thread, daemon=True).start()
 
@@ -3410,12 +5034,14 @@ class PbdataGUI:
         )
         try:
             # Ingest (in-process with confirm dialog)
-            status = self._run_ingest()
+            status = self._run_ingest(finalize_background_run=False)
             if status == "error":
                 self._root.after(0, self._log_line, "\nPipeline stopped: ingest failed.")
+                self._complete_background_run("error", "Full pipeline stopped during Ingest Sources.")
                 return
             if status == "cancelled":
                 self._root.after(0, self._log_line, "\nPipeline cancelled.")
+                self._complete_background_run("cancelled", "Full pipeline was cancelled during ingest.")
                 return
 
             mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
@@ -3437,14 +5063,19 @@ class PbdataGUI:
                         0, self._log_line,
                         f"\nPipeline stopped at '{stage}'.",
                     )
+                    self._complete_background_run("error", f"Full pipeline stopped at {self._display_stage_name(stage)}.")
+                    return
+                if status == "cancelled":
+                    self._complete_background_run("cancelled", f"Full pipeline was cancelled at {self._display_stage_name(stage)}.")
                     return
 
             self._root.after(0, self._log_line, f"\n{'═' * 50}")
             self._root.after(0, self._log_line, "  PIPELINE COMPLETE")
             self._root.after(0, self._log_line, f"{'═' * 50}")
             self._root.after(0, self._refresh_overview)
+            self._complete_background_run("done", "Full pipeline completed.")
         finally:
-            self._running.release()
+            pass
 
 
 # ---------------------------------------------------------------------------

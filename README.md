@@ -58,6 +58,8 @@ pbdata-gui
 ```
 
 That's it. The GUI opens and you can start building datasets immediately.
+By default, out-of-the-box runs use live RCSB, BindingDB, and ChEMBL enrichment.
+Local-file sources such as PDBbind, BioLiP, and SKEMPI remain opt-in.
 
 ---
 
@@ -202,33 +204,43 @@ enabled.
    IDs (e.g. `1ATP, 3HTB, 6LU7`). When set, this bypasses the RCSB Search
    API and fetches those entries directly.
 
-2. **Text filters:**
+2. **Optional result limit:** Set a maximum number of structures to keep from
+   the RCSB search.
+
+3. **Representative sampling:** When a result limit is active, leave this on
+   to make a best-effort representative selection across task-type, method,
+   taxonomy, and resolution buckets instead of taking a naive top-N slice.
+
+4. **Text filters:**
    - Keywords / full-text -- free-text search across PDB titles and descriptions
    - Organism name -- e.g. "Homo sapiens"
    - NCBI taxonomy ID -- e.g. `9606`
 
-3. **Checkboxes:**
+5. **Checkboxes:**
    - Membrane-related structures only
    - Require multimeric protein entries
 
-4. **Experimental methods:** tick X-Ray, Cryo-EM, NMR, Neutron Diffraction.
+6. **Experimental methods:** tick X-Ray, Cryo-EM, NMR, Neutron Diffraction.
 
-5. **Max resolution:** dropdown from 1.0 A to 5.0 A (default 3.0 A).
+7. **Max resolution:** dropdown from 1.0 A to 5.0 A (default 3.0 A).
 
-6. **Interaction types:**
+8. **Interaction types:**
    - Protein-Ligand binding
    - Protein-Protein interaction
    - Mutation ddG
 
-7. **Structure filters:**
+9. **Structure filters:**
    - Require protein entity / ligand / branched entities
    - Min/max counts for protein entities, nonpolymer entities, branched
      entities, biological assemblies
    - Max deposited atom count
 
-8. **Release year range:** From / To year fields.
+10. **Release year range:** From / To year fields.
 
-9. Click **Save Search Criteria**. This writes `configs/criteria.yaml`.
+11. Click **Save Search Criteria**. This writes `configs/criteria.yaml`.
+12. Click **Preview RCSB Search** to write a preview report showing total
+    matches, selected matches under the current cap, and a small distribution
+    summary before download.
 
 #### Local review filters (bottom of the Search Criteria tab)
 
@@ -557,6 +569,7 @@ detailed options.
 ```bash
 pbdata ingest --source rcsb          # download raw metadata
 pbdata ingest --source skempi        # download SKEMPI v2
+pbdata preview-rcsb-search           # preview capped/representative RCSB search
 pbdata extract                       # multi-table extraction + structure download
 pbdata normalize                     # canonicalize records
 pbdata audit                         # quality score + flag
@@ -587,6 +600,8 @@ pbdata train-tabular-affinity-model  # supervised affinity model
 pbdata evaluate-tabular-affinity-model
 pbdata report-training-set-quality   # training set quality report
 pbdata report-model-comparison       # model comparison summary
+pbdata export-identity-crosswalk     # protein / ligand / pair crosswalk tables
+pbdata report-source-capabilities    # source capability and config summary
 ```
 
 ### Physics and site-centric pipeline
@@ -658,6 +673,7 @@ data/
   splits/          *.txt     train.txt, val.txt, test.txt
   audit/                     Quality audit outputs
   reports/                   Summary and bias reports
+  identity/                  Protein / ligand / pair crosswalk exports
   models/                    Trained model artifacts
   prediction/                Prediction outputs
   releases/                  Versioned release snapshots
@@ -699,6 +715,8 @@ You can also edit them by hand -- they are plain YAML.
 **Example `configs/criteria.yaml`:**
 ```yaml
 direct_pdb_ids: []
+max_results: 250
+representative_sampling: true
 experimental_methods: [xray, em]
 max_resolution_angstrom: 3.0
 task_types: [protein_ligand, protein_protein]
@@ -726,18 +744,24 @@ storage_root: /path/to/workspace
 ## Testing
 
 ```bash
-# Run all unit tests (integration tests excluded by default)
+# Run the full test suite
 .venv/Scripts/python.exe -m pytest               # Windows
 python -m pytest                                  # macOS / Linux
 
-# Run integration tests (requires network)
+# Run the suite in shorter sequential shards
+.venv/Scripts/python.exe scripts/run_test_shards.py
+make test-sharded
+
+# Run only the integration-marked subset
 python -m pytest -m integration
 
 # Run a specific test file
 python -m pytest tests/test_extract_pipeline.py -v
 ```
 
-Current test suite: **326 tests passing** across 48 test files.
+If your environment is unstable with a single long `pytest` invocation, prefer
+the sharded runner above. It executes the suite in smaller file batches and
+stops on the first failing shard.
 
 The test suite includes three immutable stress test panels (32 adversarial
 PDB entries) that validate classification logic against biological ground
