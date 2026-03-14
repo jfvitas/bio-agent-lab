@@ -337,3 +337,266 @@ def test_run_precompute_build_graph_shard_and_merge() -> None:
     assert merge_result.exit_code == 0
     assert (storage_root / "data" / "graph" / "graph_nodes.json").exists()
     assert (storage_root / "data" / "graph" / "graph_edges.json").exists()
+
+
+def test_run_precompute_extract_shard_from_packaged_raw_input() -> None:
+    tmp_path = _tmp_dir("precompute_packaged_extract")
+    storage_root = tmp_path / "storage"
+    raw_dir = storage_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    for pdb_id in ["1ABC", "2DEF"]:
+        _write_raw_record(raw_dir / f"{pdb_id}.json", pdb_id)
+
+    config_path = tmp_path / "sources.yaml"
+    _write_sources_config(config_path)
+    runner = CliRunner()
+    package_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "package-raw-rcsb",
+            "--package-id",
+            "raw_pkg_for_precompute",
+            "--shard-size",
+            "2",
+        ],
+        catch_exceptions=False,
+    )
+    assert package_result.exit_code == 0
+
+    for path in raw_dir.glob("*.json"):
+        path.unlink()
+
+    plan_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "plan-precompute",
+            "--stage",
+            "extract",
+            "--chunk-size",
+            "1",
+            "--run-id",
+            "extract_from_package",
+            "--input-package",
+            str(storage_root / "data" / "packaged" / "raw_rcsb" / "raw_pkg_for_precompute"),
+        ],
+        catch_exceptions=False,
+    )
+    assert plan_result.exit_code == 0
+
+    def _fake_extract_rcsb_entry(raw, **_kwargs):
+        pdb_id = raw["rcsb_id"]
+        return {
+            "entry": EntryRecord(source_database="RCSB", source_record_id=pdb_id, pdb_id=pdb_id),
+            "chains": [],
+            "bound_objects": [],
+            "interfaces": [],
+            "assays": [],
+            "provenance": [],
+        }
+
+    with patch("pbdata.precompute.extract_rcsb_entry", side_effect=_fake_extract_rcsb_entry):
+        run_result = runner.invoke(
+            app,
+            [
+                "--storage-root",
+                str(storage_root),
+                "--config",
+                str(config_path),
+                "run-precompute-shard",
+                "--run-id",
+                "extract_from_package",
+                "--chunk-index",
+                "0",
+                "--no-download-structures",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert run_result.exit_code == 0
+    shard_entry = (
+        storage_root
+        / "runs"
+        / "precompute"
+        / "extract_from_package"
+        / "shards"
+        / "extract"
+        / "chunk_00000"
+        / "extracted"
+        / "entry"
+        / "1ABC.json"
+    )
+    assert shard_entry.exists()
+    shard_entry_2 = shard_entry.with_name("2DEF.json")
+    assert shard_entry_2.exists()
+
+
+def test_plan_precompute_extract_from_packaged_raw_with_foreign_absolute_paths() -> None:
+    tmp_path = _tmp_dir("precompute_packaged_extract_foreign_paths")
+    storage_root = tmp_path / "storage"
+    raw_dir = storage_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    _write_raw_record(raw_dir / "1ABC.json", "1ABC")
+
+    config_path = tmp_path / "sources.yaml"
+    _write_sources_config(config_path)
+    runner = CliRunner()
+    package_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "package-raw-rcsb",
+            "--package-id",
+            "raw_pkg_foreign_plan",
+        ],
+        catch_exceptions=False,
+    )
+    assert package_result.exit_code == 0
+
+    manifest_path = storage_root / "data" / "packaged" / "raw_rcsb" / "raw_pkg_foreign_plan" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["shards"][0]["path"] = r"C:\Users\jfvit\Documents\bio-agent-lab\data\packaged\raw_rcsb\raw_pkg_foreign_plan\shards\raw_rcsb_shard_00000.jsonl.gz"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    plan_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "plan-precompute",
+            "--stage",
+            "extract",
+            "--chunk-size",
+            "1",
+            "--run-id",
+            "extract_foreign_plan",
+            "--input-package",
+            str(storage_root / "data" / "packaged" / "raw_rcsb" / "raw_pkg_foreign_plan"),
+        ],
+        catch_exceptions=False,
+    )
+    assert plan_result.exit_code == 0
+    chunk_manifest = json.loads(
+        (
+            storage_root
+            / "runs"
+            / "precompute"
+            / "extract_foreign_plan"
+            / "chunks"
+            / "chunk_00000.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert chunk_manifest["items"][0]["source_path"].endswith("raw_rcsb_shard_00000.jsonl.gz")
+    assert Path(chunk_manifest["items"][0]["source_path"]).exists()
+
+
+def test_run_precompute_build_graph_from_consolidated_extracted_package() -> None:
+    tmp_path = _tmp_dir("precompute_packaged_graph")
+    storage_root = tmp_path / "storage"
+    extracted_dir = storage_root / "data" / "extracted"
+    for table_name in ["entry", "chains", "bound_objects", "interfaces", "assays", "provenance"]:
+        table_dir = extracted_dir / table_name
+        table_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"pdb_id": "1ABC", "table": table_name}
+        if table_name == "entry":
+            payload = {"pdb_id": "1ABC", "source_database": "RCSB", "source_record_id": "1ABC"}
+        (table_dir / "1ABC.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    config_path = tmp_path / "sources.yaml"
+    _write_sources_config(config_path)
+    runner = CliRunner()
+    consolidate_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "consolidate-extracted",
+            "--run-id",
+            "extracted_pkg_for_graph",
+            "--shard-size",
+            "1",
+        ],
+        catch_exceptions=False,
+    )
+    assert consolidate_result.exit_code == 0
+
+    for table_name in ["entry", "chains", "bound_objects", "interfaces", "assays", "provenance"]:
+        for path in (extracted_dir / table_name).glob("*.json"):
+            path.unlink()
+
+    plan_result = runner.invoke(
+        app,
+        [
+            "--storage-root",
+            str(storage_root),
+            "--config",
+            str(config_path),
+            "plan-precompute",
+            "--stage",
+            "build-graph",
+            "--chunk-size",
+            "1",
+            "--run-id",
+            "graph_from_package",
+            "--input-package",
+            str(storage_root / "data" / "consolidated" / "extracted" / "extracted_pkg_for_graph"),
+        ],
+        catch_exceptions=False,
+    )
+    assert plan_result.exit_code == 0
+
+    def _fake_build_graph_from_extracted(_extracted_dir, output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        nodes = output_dir / "graph_nodes.json"
+        edges = output_dir / "graph_edges.json"
+        manifest = output_dir / "graph_manifest.json"
+        nodes.write_text(json.dumps([{"node_id": "protein:1ABC", "metadata": {"pdb_id": "1ABC"}}], indent=2), encoding="utf-8")
+        edges.write_text(json.dumps([{"edge_id": "edge:1", "source_node_id": "protein:1ABC", "target_node_id": "protein:1ABC"}], indent=2), encoding="utf-8")
+        manifest.write_text(json.dumps({"status": "ok"}, indent=2), encoding="utf-8")
+        assert (_extracted_dir / "entry" / "1ABC.json").exists()
+        return nodes, edges, manifest
+
+    with patch("pbdata.graph.builder.build_graph_from_extracted", side_effect=_fake_build_graph_from_extracted):
+        run_result = runner.invoke(
+            app,
+            [
+                "--storage-root",
+                str(storage_root),
+                "--config",
+                str(config_path),
+                "run-precompute-shard",
+                "--run-id",
+                "graph_from_package",
+                "--chunk-index",
+                "0",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert run_result.exit_code == 0
+    graph_nodes = (
+        storage_root
+        / "runs"
+        / "precompute"
+        / "graph_from_package"
+        / "shards"
+        / "build-graph"
+        / "chunk_00000"
+        / "graph"
+        / "graph_nodes.json"
+    )
+    assert graph_nodes.exists()

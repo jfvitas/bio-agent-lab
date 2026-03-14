@@ -76,6 +76,22 @@ class StorageLayout:
         return self.data_dir / "interim"
 
     @property
+    def packaged_dir(self) -> Path:
+        return self.data_dir / "packaged"
+
+    @property
+    def consolidated_dir(self) -> Path:
+        return self.data_dir / "consolidated"
+
+    @property
+    def raw_rcsb_packages_dir(self) -> Path:
+        return self.packaged_dir / "raw_rcsb"
+
+    @property
+    def extracted_consolidated_dir(self) -> Path:
+        return self.consolidated_dir / "extracted"
+
+    @property
     def raw_rcsb_dir(self) -> Path:
         return self.data_dir / "raw" / "rcsb"
 

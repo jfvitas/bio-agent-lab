@@ -34,6 +34,12 @@ from pbdata.storage import (
     StorageLayout,
     build_storage_layout,
 )
+from pbdata.storage_packaging import (
+    consolidate_extracted_tables,
+    package_raw_rcsb_records,
+    unpack_raw_rcsb_package,
+)
+from pbdata.storage_audit import build_storage_usage_report, render_storage_usage_report
 from pbdata.table_io import load_json_rows, load_table_json
 from pbdata.workspace_state import (
     build_demo_readiness_report as build_demo_readiness_state_report,
@@ -760,6 +766,13 @@ def plan_precompute_cmd(
         Optional[str],
         typer.Option("--run-id", help="Optional explicit run identifier."),
     ] = None,
+    input_package: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--input-package",
+            help="Optional package dir or manifest for extract planning (e.g. packaged raw_rcsb shards).",
+        ),
+    ] = None,
 ) -> None:
     """Plan a generic shard-aware preprocessing run."""
     layout = _storage_layout(ctx)
@@ -770,6 +783,7 @@ def plan_precompute_cmd(
             chunk_size=chunk_size,
             chunk_count=chunk_count,
             run_id=run_id,
+            input_package=input_package,
         )
     except Exception as exc:
         typer.echo(f"Error: {exc}")
@@ -903,6 +917,96 @@ def report_precompute_run_status_cmd(
         typer.echo(f"Error: {exc}")
         raise typer.Exit(code=1) from exc
     _render_precompute_status(status)
+
+
+@app.command("package-raw-rcsb")
+def package_raw_rcsb_cmd(
+    ctx: typer.Context,
+    shard_size: Annotated[
+        int,
+        typer.Option("--shard-size", min=1, help="Approximate raw records per gzipped JSONL shard."),
+    ] = 5000,
+    package_id: Annotated[
+        Optional[str],
+        typer.Option("--package-id", help="Optional explicit package identifier."),
+    ] = None,
+) -> None:
+    """Package raw RCSB JSON files into gzipped JSONL shards for transfer/HPC use."""
+    layout = _storage_layout(ctx)
+    try:
+        result = package_raw_rcsb_records(layout, shard_size=shard_size, package_id=package_id)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Raw RCSB packaging complete.")
+    typer.echo(f"Package ID: {result.package_id}")
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Package dir: {result.package_dir}")
+    typer.echo(f"Manifest: {result.manifest_path}")
+    typer.echo(f"Shards: {result.shard_count:,}")
+    typer.echo(f"Readable records: {result.total_records:,}")
+    typer.echo(f"Unreadable records skipped: {result.unreadable_records:,}")
+
+
+@app.command("unpack-raw-rcsb-package")
+def unpack_raw_rcsb_package_cmd(
+    ctx: typer.Context,
+    package: Annotated[
+        Path,
+        typer.Option("--package", exists=True, file_okay=True, dir_okay=True, help="Package dir or manifest.json path."),
+    ],
+    output_dir: Annotated[
+        Optional[Path],
+        typer.Option("--output-dir", help="Optional alternate output directory for restored raw JSON files."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Overwrite existing raw JSON files."),
+    ] = False,
+) -> None:
+    """Restore raw RCSB JSON files from a packaged shard archive."""
+    layout = _storage_layout(ctx)
+    try:
+        result = unpack_raw_rcsb_package(layout, package=package, output_dir=output_dir, overwrite=overwrite)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Raw RCSB package unpack complete.")
+    typer.echo(f"Package ID: {result.package_id}")
+    typer.echo(f"Output dir: {result.output_dir}")
+    typer.echo(f"Restored records: {result.restored_records:,}")
+
+
+@app.command("consolidate-extracted")
+def consolidate_extracted_cmd(
+    ctx: typer.Context,
+    shard_size: Annotated[
+        int,
+        typer.Option("--shard-size", min=1, help="Approximate extracted records per gzipped JSONL shard."),
+    ] = 5000,
+    run_id: Annotated[
+        Optional[str],
+        typer.Option("--run-id", help="Optional explicit consolidation run identifier."),
+    ] = None,
+) -> None:
+    """Consolidate per-PDB extracted tables into gzipped JSONL shard stores."""
+    layout = _storage_layout(ctx)
+    try:
+        result = consolidate_extracted_tables(layout, shard_size=shard_size, run_id=run_id)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Extracted-table consolidation complete.")
+    typer.echo(f"Run ID: {result.run_id}")
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Output dir: {result.output_dir}")
+    typer.echo(f"Manifest: {result.manifest_path}")
+    typer.echo(f"Tables: {result.table_count:,}")
+    typer.echo(f"Readable records: {result.total_records:,}")
+    typer.echo(f"Unreadable records skipped: {result.unreadable_records:,}")
 
 
 @app.command("train-baseline-model")
@@ -2805,6 +2909,15 @@ def extract_cmd(
         typer.echo(f"Source State CSV refresh warning: {export_status['source_state_csv_error']}")
     if "release_exports_error" in export_status:
         typer.echo(f"Release export refresh warning: {export_status['release_exports_error']}")
+
+
+@app.command("report-storage")
+def report_storage_cmd(ctx: typer.Context) -> None:
+    """Report disk usage across the main managed storage areas."""
+    layout = _storage_layout(ctx)
+    report = build_storage_usage_report(layout)
+    for line in render_storage_usage_report(report):
+        typer.echo(line)
 
 
 if __name__ == "__main__":

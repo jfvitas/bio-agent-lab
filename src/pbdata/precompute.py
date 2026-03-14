@@ -28,6 +28,11 @@ from pbdata.pipeline.enrichment import (
 from pbdata.pipeline.extract import extract_rcsb_entry, write_records_json
 from pbdata.sources.rcsb_search import fetch_chemcomp_descriptors
 from pbdata.storage import StorageLayout
+from pbdata.storage_packaging import (
+    iter_extracted_bundle_shards,
+    load_packaged_manifest,
+    resolve_packaged_file_ref,
+)
 
 _SUPPORTED_STAGES = {
     "extract",
@@ -172,6 +177,66 @@ def _stage_input_files(layout: StorageLayout, stage: str) -> list[Path]:
     raise ValueError(f"Unsupported precompute stage '{stage}'.")
 
 
+def _stage_input_items(
+    layout: StorageLayout,
+    stage: str,
+    *,
+    input_package: Path | None = None,
+) -> list[dict[str, Any]]:
+    if stage == "extract" and input_package is not None:
+        manifest, package_dir = load_packaged_manifest(input_package)
+        if str(manifest.get("record_type") or "") != "raw_rcsb":
+            raise ValueError(f"Packaged extract input must be a raw_rcsb package, got {manifest.get('record_type')!r}.")
+        items: list[dict[str, Any]] = []
+        for shard in manifest.get("shards") or []:
+            shard_path = resolve_packaged_file_ref(input_package, str(shard.get("path") or ""), "shards")
+            items.append(
+                {
+                    "pdb_id": None,
+                    "source_path": str(shard_path.resolve()),
+                    "source_kind": "raw_rcsb_package_shard",
+                    "package_id": manifest.get("package_id"),
+                    "record_count": int(shard.get("record_count") or 0),
+                    "first_pdb_id": shard.get("first_pdb_id"),
+                    "last_pdb_id": shard.get("last_pdb_id"),
+                }
+            )
+        return items
+    if stage in {"build-structural-graphs", "build-graph", "build-features", "build-training-examples"} and input_package is not None:
+        manifest, package_dir = load_packaged_manifest(input_package)
+        resolved_package_dir = package_dir.resolve()
+        if str(manifest.get("record_type") or "") != "extracted_tables":
+            raise ValueError(
+                f"Packaged input for stage '{stage}' must be an extracted_tables package, "
+                f"got {manifest.get('record_type')!r}."
+            )
+        items = []
+        for bundle in manifest.get("bundle_shards") or []:
+            items.append(
+                {
+                    "pdb_id": None,
+                    "source_path": str(resolved_package_dir),
+                    "source_kind": "extracted_bundle_package_shard",
+                    "package_id": manifest.get("run_id") or manifest.get("package_id"),
+                    "shard_index": int(bundle.get("shard_index") or 0),
+                    "record_count": int(bundle.get("record_count") or 0),
+                    "first_pdb_id": bundle.get("first_pdb_id"),
+                    "last_pdb_id": bundle.get("last_pdb_id"),
+                    "tables": bundle.get("tables") or {},
+                }
+            )
+        return items
+    files = _stage_input_files(layout, stage)
+    return [
+        {
+            "pdb_id": path.stem.upper(),
+            "source_path": str(path),
+            "source_kind": "file",
+        }
+        for path in files
+    ]
+
+
 def plan_precompute_run(
     layout: StorageLayout,
     *,
@@ -179,10 +244,11 @@ def plan_precompute_run(
     chunk_size: int = 500,
     chunk_count: int | None = None,
     run_id: str | None = None,
+    input_package: Path | None = None,
 ) -> PrecomputePlanResult:
     normalized_stage = _ensure_supported_stage(stage)
-    files = _stage_input_files(layout, normalized_stage)
-    if not files:
+    items = _stage_input_items(layout, normalized_stage, input_package=input_package)
+    if not items:
         if normalized_stage == "extract":
             raise FileNotFoundError(f"No raw extract inputs found in {layout.raw_rcsb_dir}.")
         raise FileNotFoundError(f"No extracted entry inputs found in {layout.extracted_dir / 'entry'}.")
@@ -193,9 +259,9 @@ def plan_precompute_run(
         raise ValueError("--chunk-size must be positive.")
 
     if chunk_count is None:
-        chunk_count = max(math.ceil(len(files) / chunk_size), 1)
+        chunk_count = max(math.ceil(len(items) / chunk_size), 1)
     else:
-        chunk_size = max(math.ceil(len(files) / chunk_count), 1)
+        chunk_size = max(math.ceil(len(items) / chunk_count), 1)
 
     run_id = run_id or f"{normalized_stage}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     run_dir = _run_root(layout, run_id)
@@ -204,28 +270,26 @@ def plan_precompute_run(
     status_dir = _status_dir(layout, run_id)
     if manifest_path.exists():
         raise FileExistsError(f"Precompute run '{run_id}' already exists at {run_dir}.")
+    if input_package is not None:
+        _input_manifest, input_package_dir = load_packaged_manifest(input_package)
+        input_dir_value = str(input_package_dir.resolve())
+    else:
+        input_dir_value = str(layout.raw_rcsb_dir if normalized_stage == "extract" else layout.extracted_dir / "entry")
 
     chunk_payloads: list[dict[str, Any]] = []
     for chunk_index in range(chunk_count):
         start = chunk_index * chunk_size
-        stop = min(start + chunk_size, len(files))
-        if start >= len(files):
+        stop = min(start + chunk_size, len(items))
+        if start >= len(items):
             break
-        chunk_files = files[start:stop]
-        items = [
-            {
-                "pdb_id": path.stem.upper(),
-                "source_path": str(path),
-            }
-            for path in chunk_files
-        ]
+        chunk_items = items[start:stop]
         chunk_manifest = {
             "run_id": run_id,
             "stage": normalized_stage,
             "chunk_index": chunk_index,
             "created_at": _utc_now(),
-            "input_count": len(items),
-            "items": items,
+            "input_count": len(chunk_items),
+            "items": chunk_items,
         }
         chunk_path = chunk_dir / _chunk_filename(chunk_index)
         _write_json(chunk_path, chunk_manifest)
@@ -233,9 +297,9 @@ def plan_precompute_run(
             {
                 "chunk_index": chunk_index,
                 "manifest_path": str(chunk_path),
-                "input_count": len(items),
-                "first_pdb_id": items[0]["pdb_id"] if items else None,
-                "last_pdb_id": items[-1]["pdb_id"] if items else None,
+                "input_count": len(chunk_items),
+                "first_pdb_id": chunk_items[0].get("pdb_id") or chunk_items[0].get("first_pdb_id"),
+                "last_pdb_id": chunk_items[-1].get("pdb_id") or chunk_items[-1].get("last_pdb_id"),
             }
         )
 
@@ -244,8 +308,9 @@ def plan_precompute_run(
         "stage": normalized_stage,
         "created_at": _utc_now(),
         "storage_root": str(layout.root),
-        "input_dir": str(layout.raw_rcsb_dir if normalized_stage == "extract" else layout.extracted_dir / "entry"),
-        "total_inputs": len(files),
+        "input_dir": input_dir_value,
+        "input_mode": "package" if input_package is not None else "filesystem",
+        "total_inputs": len(items),
         "chunk_count": len(chunk_payloads),
         "chunk_size": chunk_size,
         "chunks": chunk_payloads,
@@ -262,7 +327,7 @@ def plan_precompute_run(
             "chunk_count": len(chunk_payloads),
             "completed_chunks": 0,
             "failed_chunks": 0,
-            "total_inputs": len(files),
+            "total_inputs": len(items),
         },
     )
     return PrecomputePlanResult(
@@ -272,7 +337,7 @@ def plan_precompute_run(
         manifest_path=manifest_path,
         chunk_dir=chunk_dir,
         chunk_count=len(chunk_payloads),
-        total_inputs=len(files),
+        total_inputs=len(items),
     )
 
 
@@ -297,18 +362,51 @@ def _write_chunk_status(
 def _load_raw_items(chunk_manifest: dict[str, Any]) -> list[tuple[Path, dict[str, Any]]]:
     items: list[tuple[Path, dict[str, Any]]] = []
     for item in chunk_manifest.get("items") or []:
+        source_kind = str(item.get("source_kind") or "file")
         source_path = Path(str(item.get("source_path") or ""))
+        if source_kind == "raw_rcsb_package_shard":
+            import gzip
+
+            with gzip.open(source_path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    raw = row.get("raw")
+                    pdb_id = str(row.get("pdb_id") or "").upper()
+                    if isinstance(raw, dict):
+                        items.append((source_path / f"{pdb_id}.json", raw))
+            continue
         raw = json.loads(source_path.read_text(encoding="utf-8"))
         items.append((source_path, raw))
     return items
 
 
 def _chunk_pdb_ids(chunk_manifest: dict[str, Any]) -> list[str]:
-    return [
+    ids = [
         str(item.get("pdb_id") or "").upper()
         for item in (chunk_manifest.get("items") or [])
         if str(item.get("pdb_id") or "").strip()
     ]
+    if ids:
+        return ids
+    for item in chunk_manifest.get("items") or []:
+        source_kind = str(item.get("source_kind") or "")
+        if source_kind == "extracted_bundle_package_shard":
+            package = Path(str(item.get("source_path") or ""))
+            shard_index = int(item.get("shard_index") or 0)
+            for bundle, table_rows in iter_extracted_bundle_shards(package):
+                bundle_shard_index = bundle.get("shard_index")
+                if int(bundle_shard_index if bundle_shard_index is not None else -1) != shard_index:
+                    continue
+                entry_rows = table_rows.get("entry", [])
+                return [
+                    str(row.get("pdb_id") or "").upper()
+                    for row in entry_rows
+                    if str(row.get("pdb_id") or "").strip()
+                ]
+    return []
 
 
 def _copy_extracted_subset(layout: StorageLayout, pdb_ids: list[str], target_root: Path) -> Path:
@@ -323,6 +421,42 @@ def _copy_extracted_subset(layout: StorageLayout, pdb_ids: list[str], target_roo
             src_path = src_dir / f"{pdb_id}.json"
             if src_path.exists():
                 shutil.copy2(src_path, dst_dir / src_path.name)
+    return subset_dir
+
+
+def _write_extracted_subset_from_chunk_manifest(chunk_manifest: dict[str, Any], target_root: Path) -> Path:
+    subset_dir = target_root / "data" / "extracted"
+    subset_dir.mkdir(parents=True, exist_ok=True)
+    items = chunk_manifest.get("items") or []
+    if not items:
+        return subset_dir
+    first_kind = str(items[0].get("source_kind") or "")
+    if first_kind != "extracted_bundle_package_shard":
+        return subset_dir
+    wrote_any = False
+    for item in items:
+        package = Path(str(item.get("source_path") or ""))
+        shard_index = int(item.get("shard_index") or 0)
+        for bundle, table_rows in iter_extracted_bundle_shards(package):
+            bundle_shard_index = bundle.get("shard_index")
+            if int(bundle_shard_index if bundle_shard_index is not None else -1) != shard_index:
+                continue
+            for table_name, rows in table_rows.items():
+                table_dir = subset_dir / table_name
+                table_dir.mkdir(parents=True, exist_ok=True)
+                for row in rows:
+                    pdb_id = str(row.get("pdb_id") or "").upper()
+                    payload = row.get("payload")
+                    if not pdb_id:
+                        continue
+                    (table_dir / f"{pdb_id}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    wrote_any = True
+            break
+    if not wrote_any:
+        raise FileNotFoundError(
+            "No extracted bundle rows were restored from the consolidated package chunk. "
+            "Verify the package path and bundle shard metadata."
+        )
     return subset_dir
 
 
@@ -695,7 +829,10 @@ def _run_structural_graphs_shard(
     pdb_ids = _chunk_pdb_ids(chunk_manifest)
     shard_dir = _shards_dir(layout, run_id, "build-structural-graphs") / f"chunk_{chunk_index:05d}"
     temp_root = shard_dir / "workspace"
-    _copy_extracted_subset(layout, pdb_ids, temp_root)
+    if any(str(item.get("source_kind") or "") == "extracted_bundle_package_shard" for item in (chunk_manifest.get("items") or [])):
+        _write_extracted_subset_from_chunk_manifest(chunk_manifest, temp_root)
+    else:
+        _copy_extracted_subset(layout, pdb_ids, temp_root)
     temp_layout = build_storage_layout(temp_root)
     outputs = build_structural_graphs(
         temp_layout,
@@ -737,7 +874,10 @@ def _run_graph_shard(layout: StorageLayout, *, run_id: str, chunk_index: int) ->
     pdb_ids = _chunk_pdb_ids(chunk_manifest)
     shard_dir = _shards_dir(layout, run_id, "build-graph") / f"chunk_{chunk_index:05d}"
     temp_root = shard_dir / "workspace"
-    extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
+    if any(str(item.get("source_kind") or "") == "extracted_bundle_package_shard" for item in (chunk_manifest.get("items") or [])):
+        extracted_dir = _write_extracted_subset_from_chunk_manifest(chunk_manifest, temp_root)
+    else:
+        extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
     shard_graph_dir = shard_dir / "graph"
     nodes_path, edges_path, manifest_path = build_graph_from_extracted(extracted_dir, shard_graph_dir)
     status_path = _write_chunk_status(
@@ -772,7 +912,10 @@ def _run_feature_shard(layout: StorageLayout, *, run_id: str, chunk_index: int) 
     pdb_ids = _chunk_pdb_ids(chunk_manifest)
     shard_dir = _shards_dir(layout, run_id, "build-features") / f"chunk_{chunk_index:05d}"
     temp_root = shard_dir / "workspace"
-    extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
+    if any(str(item.get("source_kind") or "") == "extracted_bundle_package_shard" for item in (chunk_manifest.get("items") or [])):
+        extracted_dir = _write_extracted_subset_from_chunk_manifest(chunk_manifest, temp_root)
+    else:
+        extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
     graph_dir = _copy_graph_subset(layout, pdb_ids, temp_root, use_full_graph=True)
     micro_dir, physics_dir = _copy_microstate_and_physics_subset(layout, pdb_ids, temp_root)
     output_dir = shard_dir / "features"
@@ -814,7 +957,10 @@ def _run_training_example_shard(layout: StorageLayout, *, run_id: str, chunk_ind
     pdb_ids = _chunk_pdb_ids(chunk_manifest)
     shard_dir = _shards_dir(layout, run_id, "build-training-examples") / f"chunk_{chunk_index:05d}"
     temp_root = shard_dir / "workspace"
-    extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
+    if any(str(item.get("source_kind") or "") == "extracted_bundle_package_shard" for item in (chunk_manifest.get("items") or [])):
+        extracted_dir = _write_extracted_subset_from_chunk_manifest(chunk_manifest, temp_root)
+    else:
+        extracted_dir = _copy_extracted_subset(layout, pdb_ids, temp_root)
     graph_dir = _copy_graph_subset(layout, pdb_ids, temp_root, use_full_graph=True)
     features_dir = _copy_feature_subset(layout, pdb_ids, temp_root)
     output_dir = shard_dir / "training_examples"
