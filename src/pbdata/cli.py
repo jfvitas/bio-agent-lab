@@ -2395,6 +2395,24 @@ def extract_cmd(
                     path, raw = item
                     pdb_id = str(raw.get("rcsb_id") or path.stem).upper()
                     item_status: str | None = None
+                    item_started_at = time.monotonic()
+                    item_done = threading.Event()
+
+                    def _single_worker_heartbeat() -> None:
+                        while not item_done.wait(_EXTRACT_HEARTBEAT_SECONDS):
+                            active_preview = f"{pdb_id} ({int(time.monotonic() - item_started_at)}s)"
+                            _emit_progress_update(
+                                "heartbeat:",
+                                active_count=1,
+                                active_preview=active_preview,
+                            )
+
+                    heartbeat_thread = threading.Thread(
+                        target=_single_worker_heartbeat,
+                        name=f"extract-heartbeat-{pdb_id}",
+                        daemon=True,
+                    )
+                    heartbeat_thread.start()
                     try:
                         _, item_status = _extract_one(item)
                         if item_status == "cached":
@@ -2405,6 +2423,9 @@ def extract_cmd(
                         logger.warning("Failed to extract %s: %s", item[0].name, exc)
                         typer.echo(f"  ERROR {pdb_id}: {exc}")
                         failed += 1
+                    finally:
+                        item_done.set()
+                        heartbeat_thread.join(timeout=0.05)
                     processed_count += 1
                     active_preview = (
                         f"{pdb_id} ({'cached' if item_status == 'cached' else 'complete'})"

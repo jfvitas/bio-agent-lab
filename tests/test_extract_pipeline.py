@@ -1014,6 +1014,46 @@ def test_cli_extract_emits_plan_and_heartbeat_progress() -> None:
     assert "active sample:" in result.output
 
 
+def test_cli_extract_emits_heartbeat_progress_with_single_worker() -> None:
+    tmp_root = _tmp_dir("extract_single_worker_heartbeat")
+    raw_dir = tmp_root / "data" / "raw" / "rcsb"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "1ABC.json").write_text('{"rcsb_id":"1ABC","nonpolymer_entities":[]}', encoding="utf-8")
+
+    def _fake_extract_rcsb_entry(raw, **_kwargs):
+        time.sleep(0.05)
+        pdb_id = raw["rcsb_id"]
+        return {
+            "entry": EntryRecord(source_database="RCSB", source_record_id=pdb_id, pdb_id=pdb_id),
+            "chains": [],
+            "bound_objects": [],
+            "interfaces": [],
+            "assays": [],
+            "provenance": [],
+        }
+
+    runner = CliRunner()
+    original_cwd = Path.cwd()
+    os.chdir(tmp_root)
+    try:
+        with patch("pbdata.cli._load_external_assay_samples", return_value={}), patch(
+            "pbdata.pipeline.extract.extract_rcsb_entry", side_effect=_fake_extract_rcsb_entry
+        ), patch("pbdata.pipeline.extract.write_records_json", return_value=None), patch(
+            "pbdata.cli._EXTRACT_HEARTBEAT_SECONDS", 0.01
+        ):
+            result = runner.invoke(
+                app,
+                ["extract", "--no-download-structures", "--workers", "1"],
+                catch_exceptions=False,
+            )
+    finally:
+        os.chdir(original_cwd)
+
+    assert result.exit_code == 0
+    assert "heartbeat:" in result.output
+    assert "active=1" in result.output
+
+
 def test_gui_close_terminates_active_processes() -> None:
     proc = Mock()
     proc.poll.side_effect = [None, 0, 0]

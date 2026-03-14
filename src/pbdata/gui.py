@@ -16,6 +16,7 @@ so their stdout streams naturally to the log.
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import subprocess
@@ -30,6 +31,15 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import yaml
+try:
+    import cairosvg  # type: ignore
+except Exception:  # pragma: no cover - optional GUI dependency
+    cairosvg = None
+try:
+    from PIL import Image, ImageTk  # type: ignore
+except Exception:  # pragma: no cover - optional GUI dependency
+    Image = None
+    ImageTk = None
 from pbdata.config import AppConfig, load_config
 from pbdata.criteria import (
     EXPERIMENTAL_METHODS,
@@ -52,6 +62,28 @@ from pbdata.gui_overview import (
     load_csv_dict_rows as _load_csv_dict_rows_impl,
     load_json_dict as _load_json_dict_impl,
     review_export_paths as _review_export_paths_impl,
+)
+from pbdata.modeling.studio import (
+    build_dataset_profile,
+    build_starter_model_config,
+    export_starter_model_config,
+    recommend_model_architectures,
+    validate_model_studio_selection,
+    ModelStudioSelection,
+    ModelRecommendation,
+    DatasetProfile,
+)
+from pbdata.modeling.runtime import (
+    detect_runtime_capabilities,
+    export_training_package,
+)
+from pbdata.modeling.training_runs import (
+    build_training_run_report,
+    compare_training_runs,
+    execute_training_run,
+    import_training_run,
+    inspect_training_run,
+    run_saved_model_inference,
 )
 from pbdata.storage import (
     build_storage_layout,
@@ -615,7 +647,7 @@ class PbdataGUI:
         self._structure_mirror_var    = tk.StringVar(value="rcsb")
         self._download_structures_var = tk.BooleanVar(value=True)
         self._download_pdb_var        = tk.BooleanVar(value=False)
-        self._workers_var             = tk.StringVar(value="1")
+        self._workers_var             = tk.StringVar(value=str(min(max(os.cpu_count() or 1, 1), 4)))
         self._pipeline_execution_mode_var = tk.StringVar(value="hybrid")
         self._skip_experimental_stages_var = tk.BooleanVar(value=True)
         self._site_pipeline_degraded_mode_var = tk.BooleanVar(value=True)
@@ -649,6 +681,70 @@ class PbdataGUI:
         self._engineered_dataset_cluster_count_var = tk.StringVar(value="8")
         self._engineered_dataset_embedding_backend_var = tk.StringVar(value="auto")
         self._engineered_dataset_strict_family_var = tk.BooleanVar(value=False)
+        self._model_dataset_source_var = tk.StringVar(value="auto")
+        self._model_modality_var = tk.StringVar(value="auto")
+        self._model_task_var = tk.StringVar(value="auto")
+        self._model_family_var = tk.StringVar(value="auto")
+        self._model_compute_budget_var = tk.StringVar(value="balanced")
+        self._model_interpretability_var = tk.StringVar(value="balanced")
+        self._model_runtime_target_var = tk.StringVar(value="local_cpu")
+        self._model_profile_summary_var = tk.StringVar(value="No model profile generated yet.")
+        self._model_profile_detail_var = tk.StringVar(value="Select a dataset view and refresh recommendations.")
+        self._model_warnings_var = tk.StringVar(value="No compatibility warnings.")
+        self._model_next_action_var = tk.StringVar(value="Refresh Model Studio to profile the current workspace.")
+        self._model_profile_kpi_vars: dict[str, tk.StringVar] = {
+            "examples": tk.StringVar(value="0"),
+            "train": tk.StringVar(value="0"),
+            "val": tk.StringVar(value="0"),
+            "test": tk.StringVar(value="0"),
+            "modalities": tk.StringVar(value="--"),
+            "tasks": tk.StringVar(value="--"),
+        }
+        self._model_config_preview_var = tk.StringVar(value="No starter config generated yet.")
+        self._model_export_status_var = tk.StringVar(value="No starter config exported yet.")
+        self._model_runtime_summary_var = tk.StringVar(value="Runtime capabilities not checked yet.")
+        self._model_import_path_var = tk.StringVar(value="No imported run yet.")
+        self._model_selected_run_var = tk.StringVar(value="")
+        self._model_run_comparison_var = tk.StringVar(value="No saved-run comparison yet.")
+        self._model_run_detail_var = tk.StringVar(value="No experiment-inspection summary yet.")
+        self._model_inference_pdb_var = tk.StringVar(value="")
+        self._model_inference_result_var = tk.StringVar(value="No saved-model inference run yet.")
+        self._model_selected_run_preview_var = tk.StringVar(value="No selected run preview yet.")
+        self._model_chart_preview_status_var = tk.StringVar(value="Chart previews will appear here when a run is selected.")
+        self._model_run_kpi_vars: dict[str, tk.StringVar] = {
+            "runs": tk.StringVar(value="0"),
+            "curves": tk.StringVar(value="0"),
+            "plots": tk.StringVar(value="0"),
+            "native": tk.StringVar(value="0"),
+            "best": tk.StringVar(value="--"),
+        }
+        self._model_artifact_vars: dict[str, tk.StringVar] = {
+            "run_dir": tk.StringVar(value=""),
+            "training_curve": tk.StringVar(value=""),
+            "test_performance": tk.StringVar(value=""),
+            "metrics": tk.StringVar(value=""),
+            "test_predictions": tk.StringVar(value=""),
+        }
+        self._model_recent_run_vars: list[dict[str, tk.StringVar]] = [
+            {
+                "title": tk.StringVar(value=f"Recent run {idx}"),
+                "detail": tk.StringVar(value="--"),
+            }
+            for idx in range(1, 4)
+        ]
+        self._model_run_option_paths: dict[str, str] = {}
+        self._model_chart_preview_images: dict[str, object | None] = {"training": None, "test": None}
+        self._model_recommendation_vars: list[dict[str, tk.StringVar]] = [
+            {
+                "title": tk.StringVar(value=f"Recommendation {idx}"),
+                "summary": tk.StringVar(value="--"),
+                "why": tk.StringVar(value="--"),
+                "strengths": tk.StringVar(value="--"),
+                "drawbacks": tk.StringVar(value="--"),
+                "recipe": tk.StringVar(value="--"),
+            }
+            for idx in range(1, 4)
+        ]
 
         # --- Pipeline status vars ---
         self._status_vars: dict[str, tk.StringVar] = {
@@ -669,6 +765,7 @@ class PbdataGUI:
         self._run_active_label = ""
         self._run_current_stage_key: str | None = None
         self._demo_mode_var = tk.BooleanVar(value=False)
+        self._compact_overview_var = tk.BooleanVar(value=True)
         self._overview_sections: dict[str, tk.Widget] = {}
         self._overview_deferred_built = False
         self._overview_deferred_host: ttk.Frame | None = None
@@ -921,6 +1018,8 @@ class PbdataGUI:
         self._active_processes: set[subprocess.Popen[str]] = set()
         self._pipeline_scroll_canvas: tk.Canvas | None = None
         self._pipeline_scroll_frame: ttk.Frame | None = None
+        self._last_model_profile: DatasetProfile | None = None
+        self._last_model_recommendations: list[ModelRecommendation] = []
 
         self._build_ui()
         self._load_sources_into_ui()
@@ -1057,6 +1156,80 @@ class PbdataGUI:
         scrollbar.grid(row=0, column=1, sticky="ns")
         return canvas, scrollbar, frame
 
+    def _add_guidance_card(
+        self,
+        parent: ttk.Frame,
+        *,
+        row: int,
+        title: str,
+        summary: str,
+        bullets: list[str] | tuple[str, ...] = (),
+        columnspan: int = 1,
+        pady: tuple[int, int] = (0, 10),
+    ) -> int:
+        card = ttk.LabelFrame(parent, text=title, padding=8, style="Section.TLabelframe")
+        card.grid(row=row, column=0, columnspan=columnspan, sticky="ew", pady=pady)
+        card.columnconfigure(0, weight=1)
+        ttk.Label(
+            card,
+            text=summary,
+            wraplength=440,
+            justify="left",
+            font=("Helvetica", 8),
+            foreground="#4b5563",
+        ).grid(row=0, column=0, sticky="w")
+        if bullets:
+            ttk.Label(
+                card,
+                text="\n".join(f"- {item}" for item in bullets),
+                justify="left",
+                font=("Helvetica", 8),
+                foreground="#0f172a",
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        return row + 1
+
+    def _add_metric_cards(
+        self,
+        parent: ttk.Frame,
+        *,
+        row: int,
+        specs: list[tuple[str, str]],
+        value_vars: dict[str, tk.StringVar],
+        columns: int = 4,
+        value_wraplength: int = 160,
+        pady: tuple[int, int] = (0, 0),
+    ) -> int:
+        host = ttk.Frame(parent)
+        host.grid(row=row, column=0, columnspan=4, sticky="ew", pady=pady)
+        for column in range(columns):
+            host.columnconfigure(column, weight=1)
+        for index, (key, label) in enumerate(specs):
+            card = ttk.Frame(host, style="Card.TFrame", padding=8)
+            card.grid(
+                row=index // columns,
+                column=index % columns,
+                sticky="nsew",
+                padx=(0 if index % columns == 0 else 4, 4 if index % columns != columns - 1 else 0),
+                pady=(0, 6),
+            )
+            card.columnconfigure(0, weight=1)
+            ttk.Label(
+                card,
+                text=label,
+                style="Muted.TLabel",
+                justify="left",
+            ).grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=value_vars[key],
+                background=_CARD_BG,
+                foreground="#0f172a",
+                font=("Segoe UI Semibold", 11),
+                justify="left",
+                wraplength=value_wraplength,
+            ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        return row + ((len(specs) + columns - 1) // columns)
+
     def _bind_text_mousewheel(self, widget: Any) -> None:
         def _scroll(event: Any) -> str:
             widget.yview_scroll(_mousewheel_units(event), "units")
@@ -1135,6 +1308,19 @@ class PbdataGUI:
             highlightthickness=0,
             font=("Segoe UI Semibold", 8),
         ).pack(side="top", anchor="e", pady=(8, 0))
+        tk.Checkbutton(
+            right,
+            text="Compact Overview",
+            variable=self._compact_overview_var,
+            command=self._apply_demo_mode,
+            bg=_HEADER_BG,
+            fg=_HEADER_FG,
+            activebackground=_HEADER_BG,
+            activeforeground=_HEADER_FG,
+            selectcolor=_HEADER_BG,
+            highlightthickness=0,
+            font=("Segoe UI Semibold", 8),
+        ).pack(side="top", anchor="e", pady=(4, 0))
 
     def _build_left_panel(self) -> None:
         left = tk.Frame(self._root, bg=_APP_BG)
@@ -1149,11 +1335,13 @@ class PbdataGUI:
             "sources": self._build_sources_tab,
             "search": self._build_search_tab,
             "options": self._build_options_tab,
+            "model_studio": self._build_model_studio_tab,
         }
         for key, label in [
             ("sources", " Sources "),
             ("search", " Search Criteria "),
             ("options", " Options "),
+            ("model_studio", " Model Studio "),
         ]:
             frame = ttk.Frame(notebook, padding=8)
             self._left_tab_frames[key] = frame
@@ -1187,20 +1375,32 @@ class PbdataGUI:
         canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
 
         frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
         row = 0
 
-        ttk.Label(
+        row = self._add_guidance_card(
             frame,
-            text="Enable the data sources for your pipeline run.",
-            font=("Helvetica", 8),
-            foreground="#666666",
-        ).grid(row=row, column=0, sticky="w", pady=(0, 8))
-        row += 1
+            row=row,
+            title="Source Plan",
+            summary="Choose which upstream datasets the pipeline should ingest or use for extraction-time enrichment.",
+            bullets=[
+                "RCSB is the primary structure source for most runs.",
+                "BindingDB and ChEMBL enrich extraction; they are not bulk-mirrored by default.",
+                "Local dataset paths let you reuse downloaded caches instead of re-fetching data.",
+            ],
+            columnspan=2,
+        )
+
+        sources_card = ttk.LabelFrame(frame, text="Enabled Sources", padding=8, style="Section.TLabelframe")
+        sources_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        sources_card.columnconfigure(0, weight=1)
+        sources_card.columnconfigure(1, weight=1)
+        src_row = 0
 
         for src in _SOURCES:
             descriptor = _SOURCE_DESCRIPTOR_BY_NAME.get(src)
-            src_frame = ttk.Frame(frame)
-            src_frame.grid(row=row, column=0, sticky="ew", pady=2)
+            src_frame = ttk.Frame(sources_card)
+            src_frame.grid(row=src_row, column=0, columnspan=2, sticky="ew", pady=2)
             src_frame.columnconfigure(1, weight=1)
 
             ttk.Checkbutton(
@@ -1224,40 +1424,54 @@ class PbdataGUI:
                     font=("Helvetica", 7, "italic"),
                     foreground="#999999",
                 ).grid(row=1, column=0, columnspan=2, sticky="w", padx=(24, 0))
-            row += 1
+            src_row += 1
+        row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=row, column=0, sticky="ew", pady=8,
+            row=row, column=0, columnspan=2, sticky="ew", pady=8,
         )
         row += 1
 
+        mirror_card = ttk.LabelFrame(frame, text="Structure Mirror", padding=8, style="Section.TLabelframe")
+        mirror_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        mirror_card.columnconfigure(1, weight=1)
         ttk.Label(
-            frame, text="Experimental Structure Mirror:",
+            mirror_card, text="Experimental structure mirror:",
             font=("Helvetica", 9, "bold"),
-        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
         mirror_box = ttk.Combobox(
-            frame,
+            mirror_card,
             state="readonly",
             textvariable=self._structure_mirror_var,
             values=_STRUCTURE_MIRROR_OPTIONS,
             width=12,
         )
-        mirror_box.grid(row=row, column=1, sticky="w", padx=(6, 0), pady=(0, 4))
-        row += 1
+        mirror_box.grid(row=0, column=1, sticky="w", padx=(6, 0), pady=(0, 4))
 
         ttk.Label(
-            frame,
+            mirror_card,
             text="Used for experimental mmCIF/PDB downloads during Extract and downstream physics features.",
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 2))
         row += 1
 
-        # Path fields for local or cached enrichment sources
-        ttk.Label(
-            frame, text="Extract-Time Source Paths:",
-            font=("Helvetica", 9, "bold"),
-        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
+        row = self._add_guidance_card(
+            frame,
+            row=row,
+            title="Cache And Reuse",
+            summary="These optional paths let the app reuse local mirrors or cache directories when they already exist.",
+            bullets=[
+                "Use a shared BindingDB or PDBbind folder to avoid repeated downloads.",
+                "Point SKEMPI to a specific CSV if you want to override the default workspace copy.",
+            ],
+            columnspan=2,
+            pady=(8, 10),
+        )
+
+        path_card = ttk.LabelFrame(frame, text="Extract-Time Source Paths", padding=8, style="Section.TLabelframe")
+        path_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        path_card.columnconfigure(0, weight=1)
         row += 1
 
         path_labels = {
@@ -1266,9 +1480,10 @@ class PbdataGUI:
             "biolip":  "BioLiP local dataset directory",
             "skempi":  "SKEMPI CSV file (optional override)",
         }
+        path_row = 0
         for src, label in path_labels.items():
-            path_frame = ttk.Frame(frame)
-            path_frame.grid(row=row, column=0, sticky="ew", pady=2)
+            path_frame = ttk.Frame(path_card)
+            path_frame.grid(row=path_row, column=0, sticky="ew", pady=2)
             path_frame.columnconfigure(1, weight=1)
 
             ttk.Label(path_frame, text=f"{label}:").grid(
@@ -1282,17 +1497,20 @@ class PbdataGUI:
                 path_frame, text="...", width=3,
                 command=lambda s=src, d=is_dir: self._browse_path(s, d),
             ).grid(row=0, column=2)
-            row += 1
+            path_row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
-            row=row, column=0, sticky="ew", pady=8,
+            row=row, column=0, columnspan=2, sticky="ew", pady=8,
         )
         row += 1
 
+        actions = ttk.Frame(frame)
+        actions.grid(row=row, column=0, columnspan=2, sticky="ew")
+        actions.columnconfigure(0, weight=1)
         ttk.Button(
-            frame, text="Save Source Config",
+            actions, text="Save Source Config",
             command=self._save_sources,
-        ).grid(row=row, column=0, sticky="ew")
+        ).grid(row=0, column=0, sticky="ew")
         self._bind_canvas_mousewheel(canvas, frame)
 
     def _browse_path(self, src: str, is_dir: bool) -> None:
@@ -1320,51 +1538,54 @@ class PbdataGUI:
         frame.columnconfigure(1, weight=1)
         row = 0
 
-        ttk.Label(
+        row = self._add_guidance_card(
             frame,
-            text="RCSB search filters. Also used to scope Extract and Normalize.",
-            font=("Helvetica", 8),
-            foreground="#666666",
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        row += 1
+            row=row,
+            title="Search Strategy",
+            summary="Use this tab to define the RCSB subset you want to ingest and the review filters you want to apply after extraction.",
+            bullets=[
+                "Direct PDB IDs override the live RCSB search query.",
+                "Result limits can still aim for broad, representative coverage.",
+                "Review filters act on local exports after extraction, not on the upstream download query.",
+            ],
+            columnspan=2,
+        )
 
         # --- Direct PDB IDs ---
+        direct_card = ttk.LabelFrame(frame, text="Query Scope", padding=8, style="Section.TLabelframe")
+        direct_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        direct_card.columnconfigure(1, weight=1)
         ttk.Label(
-            frame, text="Direct PDB IDs:",
+            direct_card, text="Direct PDB IDs:",
             font=("Helvetica", 9, "bold"),
-        ).grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
-            frame,
+            direct_card,
             text="Comma-separated. If set, bypasses RCSB search.",
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
-        ttk.Entry(frame, textvariable=self._pdb_ids_var).grid(
-            row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0),
+        ).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Entry(direct_card, textvariable=self._pdb_ids_var).grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(2, 0),
         )
-        row += 1
 
-        ttk.Label(frame, text="Optional result limit:").grid(
-            row=row, column=0, sticky="w", pady=(6, 0),
+        ttk.Label(direct_card, text="Optional result limit:").grid(
+            row=3, column=0, sticky="w", pady=(6, 0),
         )
-        ttk.Entry(frame, textvariable=self._max_results_var, width=10).grid(
-            row=row, column=1, sticky="w", padx=(6, 0), pady=(6, 0),
+        ttk.Entry(direct_card, textvariable=self._max_results_var, width=10).grid(
+            row=3, column=1, sticky="w", padx=(6, 0), pady=(6, 0),
         )
-        row += 1
         ttk.Checkbutton(
-            frame,
+            direct_card,
             text="Use representative sampling when a result limit is set",
             variable=self._representative_sampling_var,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        row += 1
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
         ttk.Label(
-            frame,
+            direct_card,
             text="Best-effort diversity pass across task type, method, taxonomy, and resolution buckets before download.",
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        ).grid(row=5, column=0, columnspan=2, sticky="w")
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -1373,24 +1594,24 @@ class PbdataGUI:
         row += 1
 
         # --- Text search ---
-        ttk.Label(
-            frame, text="Text Filters:",
-            font=("Helvetica", 9, "bold"),
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        row += 1
+        text_card = ttk.LabelFrame(frame, text="Text And Taxonomy Filters", padding=8, style="Section.TLabelframe")
+        text_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        text_card.columnconfigure(1, weight=1)
 
+        text_row = 0
         for label, var in [
             ("Keywords / full-text:", self._keyword_query_var),
             ("Organism name:", self._organism_name_var),
             ("NCBI taxonomy ID:", self._taxonomy_id_var),
         ]:
-            ttk.Label(frame, text=label).grid(
-                row=row, column=0, sticky="w", pady=(4, 0),
+            ttk.Label(text_card, text=label).grid(
+                row=text_row, column=0, sticky="w", pady=(4, 0),
             )
-            ttk.Entry(frame, textvariable=var).grid(
-                row=row, column=1, sticky="ew", padx=(6, 0), pady=(4, 0),
+            ttk.Entry(text_card, textvariable=var).grid(
+                row=text_row, column=1, sticky="ew", padx=(6, 0), pady=(4, 0),
             )
-            row += 1
+            text_row += 1
+        row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=8,
@@ -1554,16 +1775,19 @@ class PbdataGUI:
         )
         row += 1
 
+        actions = ttk.Frame(frame)
+        actions.grid(row=row, column=0, columnspan=2, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
         ttk.Button(
-            frame, text="Save Search Criteria",
+            actions, text="Save Search Criteria",
             command=self._save_criteria,
-        ).grid(row=row, column=0, columnspan=2, sticky="ew")
-        row += 1
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         ttk.Button(
-            frame, text="Preview RCSB Search",
+            actions, text="Preview RCSB Search",
             command=self._preview_rcsb_search,
-        ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -1571,49 +1795,46 @@ class PbdataGUI:
         )
         row += 1
 
+        review_card = ttk.LabelFrame(frame, text="Local Review Filters", padding=8, style="Section.TLabelframe")
+        review_card.grid(row=row, column=0, columnspan=2, sticky="ew")
+        review_card.columnconfigure(1, weight=1)
         ttk.Label(
-            frame,
-            text="Local Review Filters",
-            font=("Helvetica", 9, "bold"),
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        row += 1
-        ttk.Label(
-            frame,
+            review_card,
             text="Applies to the root review CSVs after extraction. Writes master_pdb_review_filtered.csv in the repo root.",
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, columnspan=2, sticky="w")
-        row += 1
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
 
+        review_row = 1
         for label, var in [
             ("PDB ID contains:", self._review_pdb_query_var),
             ("Pair key contains:", self._review_pair_query_var),
         ]:
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
-            ttk.Entry(frame, textvariable=var).grid(
-                row=row, column=1, sticky="ew", padx=(6, 0), pady=(4, 0),
+            ttk.Label(review_card, text=label).grid(row=review_row, column=0, sticky="w", pady=(4, 0))
+            ttk.Entry(review_card, textvariable=var).grid(
+                row=review_row, column=1, sticky="ew", padx=(6, 0), pady=(4, 0),
             )
-            row += 1
+            review_row += 1
 
-        ttk.Label(frame, text="Issue type:").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(review_card, text="Issue type:").grid(row=review_row, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(
-            frame,
+            review_card,
             textvariable=self._review_issue_type_var,
             values=_REVIEW_ISSUE_OPTIONS,
             width=28,
             state="readonly",
-        ).grid(row=row, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
-        row += 1
+        ).grid(row=review_row, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        review_row += 1
 
-        ttk.Label(frame, text="Confidence filter:").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(review_card, text="Confidence filter:").grid(row=review_row, column=0, sticky="w", pady=(4, 0))
         ttk.Combobox(
-            frame,
+            review_card,
             textvariable=self._review_confidence_var,
             values=_REVIEW_CONFIDENCE_OPTIONS,
             width=18,
             state="readonly",
-        ).grid(row=row, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
-        row += 1
+        ).grid(row=review_row, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        review_row += 1
 
         for label, var in [
             ("Conflicted pairs only", self._review_conflict_only_var),
@@ -1622,20 +1843,20 @@ class PbdataGUI:
             ("Cofactor-containing entries only", self._review_cofactor_only_var),
             ("Glycan-containing entries only", self._review_glycan_only_var),
         ]:
-            ttk.Checkbutton(frame, text=label, variable=var).grid(
-                row=row, column=0, columnspan=2, sticky="w", pady=(2, 0),
+            ttk.Checkbutton(review_card, text=label, variable=var).grid(
+                row=review_row, column=0, columnspan=2, sticky="w", pady=(2, 0),
             )
-            row += 1
+            review_row += 1
 
         ttk.Label(
-            frame,
+            review_card,
             textvariable=self._review_filtered_count_var,
             font=("Helvetica", 8, "bold"),
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        row += 1
+        ).grid(row=review_row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        review_row += 1
 
-        review_btns = ttk.Frame(frame)
-        review_btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        review_btns = ttk.Frame(review_card)
+        review_btns.grid(row=review_row, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         review_btns.columnconfigure(0, weight=1)
         review_btns.columnconfigure(1, weight=1)
         review_btns.columnconfigure(2, weight=1)
@@ -1664,14 +1885,23 @@ class PbdataGUI:
 
         row = 0
 
-        ttk.Label(
-            frame, text="Storage Root",
-            font=("Helvetica", 10, "bold"),
-        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
-        row += 1
+        row = self._add_guidance_card(
+            frame,
+            row=row,
+            title="Pipeline Setup",
+            summary="This tab controls where data is stored, how the pipeline executes, and how downstream graphs, splits, datasets, and releases are built.",
+            bullets=[
+                "Storage root controls where all managed data lives under data/.",
+                "Execution mode changes which stage families Run Full Pipeline will launch.",
+                "Workers and split settings affect both throughput and leakage resistance.",
+            ],
+        )
 
-        root_frame = ttk.Frame(frame)
-        root_frame.grid(row=row, column=0, sticky="ew")
+        storage_card = ttk.LabelFrame(frame, text="Storage Root", padding=8, style="Section.TLabelframe")
+        storage_card.grid(row=row, column=0, sticky="ew")
+        storage_card.columnconfigure(0, weight=1)
+        root_frame = ttk.Frame(storage_card)
+        root_frame.grid(row=0, column=0, sticky="ew")
         root_frame.columnconfigure(0, weight=1)
         ttk.Entry(root_frame, textvariable=self._storage_root_var).grid(
             row=0, column=0, sticky="ew", padx=(0, 4),
@@ -1680,17 +1910,15 @@ class PbdataGUI:
             root_frame, text="Browse...",
             command=self._browse_storage_root,
         ).grid(row=0, column=1)
-        row += 1
-
         ttk.Label(
-            frame,
+            storage_card,
             text=(
                 "All generated files will be stored under <storage root>/data/\n"
                 "for raw, processed, extracted, structures, graph, features, reports, and splits."
             ),
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, sticky="w", pady=(2, 0))
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -1698,14 +1926,10 @@ class PbdataGUI:
         )
         row += 1
 
-        ttk.Label(
-            frame, text="Pipeline Mode",
-            font=("Helvetica", 10, "bold"),
-        ).grid(row=row, column=0, sticky="w", pady=(0, 6))
-        row += 1
-
-        pipeline_mode_frame = ttk.Frame(frame)
-        pipeline_mode_frame.grid(row=row, column=0, sticky="ew")
+        mode_card = ttk.LabelFrame(frame, text="Pipeline Mode", padding=8, style="Section.TLabelframe")
+        mode_card.grid(row=row, column=0, sticky="ew")
+        pipeline_mode_frame = ttk.Frame(mode_card)
+        pipeline_mode_frame.grid(row=0, column=0, sticky="ew")
         pipeline_mode_frame.columnconfigure(1, weight=1)
         ttk.Label(pipeline_mode_frame, text="Execution mode:").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Combobox(
@@ -1737,10 +1961,9 @@ class PbdataGUI:
             text="Skip Experimental/Preview stages during Run Full Pipeline",
             variable=self._skip_experimental_stages_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        row += 1
 
         ttk.Label(
-            frame,
+            mode_card,
             text=(
                 "legacy: current pipeline only\n"
                 "site-centric: new artifacts/ pipeline only\n"
@@ -1748,7 +1971,7 @@ class PbdataGUI:
             ),
             font=("Helvetica", 7),
             foreground="#888888",
-        ).grid(row=row, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
+        ).grid(row=1, column=0, sticky="w", padx=(24, 0), pady=(2, 0))
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -2078,6 +2301,770 @@ class PbdataGUI:
 
     # --- Pipeline panel (right side) ---
 
+    def _model_studio_selection(self) -> ModelStudioSelection:
+        return ModelStudioSelection(
+            dataset_source=self._model_dataset_source_var.get().strip() or "auto",
+            modality=self._model_modality_var.get().strip() or "auto",
+            task=self._model_task_var.get().strip() or "auto",
+            preferred_family=self._model_family_var.get().strip() or "auto",
+            compute_budget=self._model_compute_budget_var.get().strip() or "balanced",
+            interpretability_priority=self._model_interpretability_var.get().strip() or "balanced",
+        )
+
+    def _refresh_model_runtime(self) -> None:
+        runtime = detect_runtime_capabilities()
+        self._model_runtime_summary_var.set(runtime.summary)
+        if self._model_runtime_target_var.get() not in runtime.supported_targets:
+            self._model_runtime_target_var.set(runtime.supported_targets[0] if runtime.supported_targets else "local_cpu")
+
+    def _refresh_model_studio(self) -> None:
+        self._refresh_model_runtime()
+        profile = build_dataset_profile(
+            self._storage_layout(),
+            dataset_source=self._model_dataset_source_var.get().strip() or "auto",
+        )
+        selection = self._model_studio_selection()
+        compatibility = validate_model_studio_selection(profile, selection)
+        recommendations = recommend_model_architectures(profile, selection)
+        self._last_model_profile = profile
+        self._last_model_recommendations = recommendations
+
+        self._model_profile_summary_var.set(profile.summary)
+        self._model_profile_detail_var.set(
+            " | ".join([
+                f"dataset={profile.dataset_source}",
+                f"examples={profile.example_count:,}",
+                f"train/val/test={profile.train_count:,}/{profile.val_count:,}/{profile.test_count:,}",
+                f"labels={', '.join(profile.label_fields) if profile.label_fields else 'none'}",
+            ])
+        )
+        self._model_profile_kpi_vars["examples"].set(f"{profile.example_count:,}")
+        self._model_profile_kpi_vars["train"].set(f"{profile.train_count:,}")
+        self._model_profile_kpi_vars["val"].set(f"{profile.val_count:,}")
+        self._model_profile_kpi_vars["test"].set(f"{profile.test_count:,}")
+        self._model_profile_kpi_vars["modalities"].set(", ".join(profile.modalities_available) if profile.modalities_available else "--")
+        self._model_profile_kpi_vars["tasks"].set(", ".join(profile.tasks_available) if profile.tasks_available else "--")
+        self._model_next_action_var.set(profile.next_action)
+        if compatibility:
+            self._model_warnings_var.set(
+                " ".join(f"[{msg.priority.upper()}] {msg.title}: {msg.body}" for msg in compatibility)
+            )
+        else:
+            self._model_warnings_var.set("No compatibility warnings for the current setup.")
+
+        for payload, vars_for_card in zip(recommendations, self._model_recommendation_vars):
+            vars_for_card["title"].set(
+                f"#{payload.rank} {payload.label} ({payload.family}, {payload.compute_cost} compute)"
+            )
+            vars_for_card["summary"].set(
+                f"{payload.summary}\nFit score: {payload.fit_score:.2f} | "
+                f"Interpretability: {payload.interpretability} | "
+                f"Supervision: {payload.supervision}"
+            )
+            vars_for_card["why"].set(f"Why it fits\n{payload.why_it_fits}")
+            vars_for_card["strengths"].set(self._format_model_bullets("Strengths", payload.strengths))
+            vars_for_card["drawbacks"].set(self._format_model_bullets("Tradeoffs", payload.drawbacks))
+            recipe_parts = list(payload.starter_recipe)
+            if payload.warnings:
+                recipe_parts.extend(f"Warning: {warning}" for warning in payload.warnings)
+            vars_for_card["recipe"].set(self._format_model_bullets("Starter recipe", recipe_parts))
+        for vars_for_card in self._model_recommendation_vars[len(recommendations):]:
+            vars_for_card["title"].set("No recommendation available")
+            vars_for_card["summary"].set("The current workspace does not have enough compatible artifacts for an additional recommendation.")
+            vars_for_card["why"].set("Why it fits\n--")
+            vars_for_card["strengths"].set("Strengths\n- --")
+            vars_for_card["drawbacks"].set("Tradeoffs\n- --")
+            vars_for_card["recipe"].set("Starter recipe\n- --")
+        if recommendations:
+            starter = build_starter_model_config(profile, recommendations[0], selection)
+            self._model_config_preview_var.set(json.dumps(starter.config, indent=2))
+        else:
+            self._model_config_preview_var.set("No starter config available for the current workspace.")
+
+    def _export_model_starter_config(self, recommendation_index: int) -> None:
+        if self._last_model_profile is None or recommendation_index >= len(self._last_model_recommendations):
+            self._model_export_status_var.set("Refresh Model Studio before exporting a starter config.")
+            return
+        starter = build_starter_model_config(
+            self._last_model_profile,
+            self._last_model_recommendations[recommendation_index],
+            self._model_studio_selection(),
+        )
+        out_path = export_starter_model_config(self._storage_layout(), starter)
+        self._model_config_preview_var.set(json.dumps(starter.config, indent=2))
+        self._model_export_status_var.set(f"Starter config written to {out_path}")
+        self._log_line(f"Model Studio starter config written to {out_path}")
+
+    def _export_model_training_package(self, recommendation_index: int) -> None:
+        if self._last_model_profile is None or recommendation_index >= len(self._last_model_recommendations):
+            self._model_export_status_var.set("Refresh Model Studio before exporting a training package.")
+            return
+        starter = build_starter_model_config(
+            self._last_model_profile,
+            self._last_model_recommendations[recommendation_index],
+            self._model_studio_selection(),
+        )
+        target = self._model_runtime_target_var.get().strip() or "local_cpu"
+        package_name = f"{starter.model_id}_{target}"
+        out_dir = export_training_package(
+            self._storage_layout(),
+            starter_config=starter.config,
+            target=target,
+            package_name=package_name,
+        )
+        self._model_config_preview_var.set(json.dumps(starter.config, indent=2))
+        self._model_export_status_var.set(f"Training package written to {out_dir}")
+        self._log_line(f"Model Studio training package written to {out_dir}")
+
+    def _run_model_training(self, recommendation_index: int) -> None:
+        if self._last_model_profile is None or recommendation_index >= len(self._last_model_recommendations):
+            self._model_export_status_var.set("Refresh Model Studio before launching a local run.")
+            return
+        target = self._model_runtime_target_var.get().strip() or "local_cpu"
+        if target not in {"local_cpu", "local_gpu"}:
+            self._model_export_status_var.set("Local execution is available for local_cpu or local_gpu targets. Use Export Training Package for cluster/Kaggle/Colab.")
+            return
+        starter = build_starter_model_config(
+            self._last_model_profile,
+            self._last_model_recommendations[recommendation_index],
+            self._model_studio_selection(),
+        )
+        self._model_config_preview_var.set(json.dumps(starter.config, indent=2))
+        self._model_export_status_var.set(f"Launching local training run for {starter.label}...")
+        self._log_line(f"Model Studio launching local {target} training run for {starter.model_id}")
+
+        def _worker() -> None:
+            try:
+                result = execute_training_run(
+                    self._storage_layout(),
+                    starter_config=starter.config,
+                    runtime_target=target,
+                )
+            except Exception as exc:
+                def _fail() -> None:
+                    self._model_export_status_var.set(f"Local training failed: {exc}")
+                    self._log_line(f"Model Studio local training failed: {exc}")
+                self._root.after(0, _fail)
+                return
+
+            def _finish() -> None:
+                warning_text = f" Warnings: {' | '.join(result.warnings)}" if result.warnings else ""
+                self._model_export_status_var.set(f"{result.summary} Artifacts: {result.run_dir}{warning_text}")
+                self._model_import_path_var.set(str(result.run_dir))
+                self._model_config_preview_var.set(json.dumps({
+                    "run_name": result.run_name,
+                    "run_dir": str(result.run_dir),
+                    "family": result.family,
+                    "task": result.task,
+                    "metrics": result.metrics,
+                    "warnings": list(result.warnings),
+                }, indent=2))
+                self._log_line(f"Model Studio local training finished: {result.run_dir}")
+                self._refresh_selected_model_run(result.run_dir)
+                self._compare_model_runs()
+            self._root.after(0, _finish)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _import_model_training_run(self) -> None:
+        source_dir = filedialog.askdirectory(
+            title="Select completed training run directory",
+            initialdir=str(self._storage_layout().models_dir),
+        )
+        if not source_dir:
+            return
+        try:
+            imported_dir = import_training_run(self._storage_layout(), source_dir=source_dir)
+        except Exception as exc:
+            self._model_export_status_var.set(f"Run import failed: {exc}")
+            self._log_line(f"Model Studio run import failed: {exc}")
+            return
+        self._model_import_path_var.set(str(imported_dir))
+        self._model_export_status_var.set(f"Imported training run into {imported_dir}")
+        self._model_config_preview_var.set(json.dumps({
+            "imported_run_dir": str(imported_dir),
+            "source_dir": source_dir,
+        }, indent=2))
+        self._log_line(f"Model Studio imported completed run: {imported_dir}")
+        self._refresh_selected_model_run(imported_dir)
+        self._compare_model_runs()
+
+    def _compare_model_runs(self) -> None:
+        comparisons = compare_training_runs(self._storage_layout())
+        if not comparisons:
+            self._model_run_comparison_var.set("No saved or imported runs are available yet.")
+            self._model_run_detail_var.set("Run a local model or import a completed run to inspect experiment charts and metrics.")
+            self._model_config_preview_var.set("No run-comparison report available yet.")
+            self._model_run_option_paths = {}
+            self._model_selected_run_var.set("")
+            if hasattr(self, "_model_selected_run_combo"):
+                self._model_selected_run_combo.configure(values=())
+            for key, value in {
+                "runs": "0",
+                "curves": "0",
+                "plots": "0",
+                "native": "0",
+                "best": "--",
+            }.items():
+                self._model_run_kpi_vars[key].set(value)
+            for var in self._model_artifact_vars.values():
+                var.set("")
+            for index, vars_for_run in enumerate(self._model_recent_run_vars, start=1):
+                vars_for_run["title"].set(f"Recent run {index}")
+                vars_for_run["detail"].set("--")
+            return
+        report = build_training_run_report(self._storage_layout())
+        top = comparisons[:3]
+        option_pairs = [
+            (
+                f"{item.run_name} | {item.family} | {item.primary_metric_name}="
+                f"{item.primary_metric_value if item.primary_metric_value is not None else '--'}",
+                str(item.location),
+            )
+            for item in comparisons
+        ]
+        self._model_run_option_paths = {label: path for label, path in option_pairs}
+        option_labels = [label for label, _path in option_pairs]
+        if hasattr(self, "_model_selected_run_combo"):
+            self._model_selected_run_combo.configure(values=option_labels)
+        self._model_run_comparison_var.set(" | ".join(item.summary for item in top))
+        self._model_run_detail_var.set(
+            f"{report.get('run_count', 0)} runs tracked | "
+            f"{report.get('chart_ready_count', 0)} training curves | "
+            f"{report.get('test_plot_ready_count', 0)} test plots | "
+            f"{report.get('native_graph_run_count', 0)} native graph runs"
+        )
+        best = report.get("best_overall") if isinstance(report.get("best_overall"), dict) else {}
+        best_text = "--"
+        if isinstance(best, dict) and best:
+            best_text = str(best.get("run_name") or "--")
+        self._model_run_kpi_vars["runs"].set(str(report.get("run_count", 0)))
+        self._model_run_kpi_vars["curves"].set(str(report.get("chart_ready_count", 0)))
+        self._model_run_kpi_vars["plots"].set(str(report.get("test_plot_ready_count", 0)))
+        self._model_run_kpi_vars["native"].set(str(report.get("native_graph_run_count", 0)))
+        self._model_run_kpi_vars["best"].set(best_text)
+        latest = report.get("recent_runs", [])
+        if isinstance(latest, list) and latest and isinstance(latest[0], dict):
+            latest_run = latest[0]
+            artifacts = latest_run.get("artifacts") if isinstance(latest_run.get("artifacts"), dict) else {}
+        for vars_for_run, item in zip(self._model_recent_run_vars, top):
+            vars_for_run["title"].set(item.run_name)
+            vars_for_run["detail"].set(
+                f"{item.family} | {item.primary_metric_name}={item.primary_metric_value if item.primary_metric_value is not None else '--'}\n"
+                f"Source: {item.source}"
+            )
+        for vars_for_run in self._model_recent_run_vars[len(top):]:
+            vars_for_run["title"].set("No run")
+            vars_for_run["detail"].set("--")
+        selected_run_dir = self._model_import_path_var.get().strip()
+        if selected_run_dir and selected_run_dir != "No imported run yet.":
+            matching_label = next((label for label, path in option_pairs if path == selected_run_dir), "")
+            if matching_label:
+                self._model_selected_run_var.set(matching_label)
+            self._refresh_selected_model_run(selected_run_dir)
+        elif isinstance(latest, list) and latest and isinstance(latest[0], dict):
+            latest_dir = str(latest[0].get("location") or "")
+            matching_label = next((label for label, path in option_pairs if path == latest_dir), "")
+            if matching_label:
+                self._model_selected_run_var.set(matching_label)
+            self._refresh_selected_model_run(latest_dir)
+        else:
+            if option_labels:
+                self._model_selected_run_var.set(option_labels[0])
+                self._refresh_selected_model_run(option_pairs[0][1])
+            else:
+                self._model_selected_run_var.set("")
+                for var in self._model_artifact_vars.values():
+                    var.set("")
+        self._model_config_preview_var.set(self._format_model_report_preview(report))
+        self._log_line("Model Studio compared saved runs.")
+
+    def _run_saved_model_inference(self) -> None:
+        run_dir = self._model_import_path_var.get().strip()
+        pdb_id = self._model_inference_pdb_var.get().strip()
+        if not run_dir or run_dir == "No imported run yet.":
+            self._model_inference_result_var.set("Choose or create a saved run first.")
+            return
+        if not pdb_id:
+            self._model_inference_result_var.set("Enter a PDB ID to run saved-model inference.")
+            return
+        try:
+            result = run_saved_model_inference(
+                self._storage_layout(),
+                run_dir=run_dir,
+                pdb_id=pdb_id,
+            )
+        except Exception as exc:
+            self._model_inference_result_var.set(f"Inference failed: {exc}")
+            self._log_line(f"Model Studio saved-model inference failed: {exc}")
+            return
+        summary = f"{result['pdb_id']}: prediction={result['prediction']} truth={result.get('ground_truth')}"
+        self._model_inference_result_var.set(summary)
+        self._model_config_preview_var.set(json.dumps(result, indent=2))
+        self._log_line(f"Model Studio saved-model inference completed for {result['pdb_id']}")
+
+    def _open_model_artifact(self, key: str) -> None:
+        path_text = self._model_artifact_vars.get(key, tk.StringVar(value="")).get().strip()
+        if not path_text:
+            self._log_line(f"Model Studio artifact not available yet: {key}")
+            return
+        self._open_path(Path(path_text))
+
+    def _refresh_selected_model_run(self, run_dir: str | Path | None) -> None:
+        if run_dir is None:
+            return
+        run_path = Path(str(run_dir)).resolve()
+        if not run_path.exists():
+            return
+        try:
+            inspection = inspect_training_run(run_path, source="selected")
+        except Exception as exc:
+            self._log_line(f"Model Studio selected-run inspection failed: {exc}")
+            return
+        self._model_artifact_vars["run_dir"].set(str(inspection.location))
+        for key in ("training_curve", "test_performance", "metrics", "test_predictions"):
+            self._model_artifact_vars[key].set(str(inspection.artifacts.get(key) or ""))
+        artifact_count = inspection.artifacts.get("artifact_count", "0")
+        prediction_count = inspection.artifacts.get("test_prediction_count", "0")
+        self._model_run_detail_var.set(
+            f"Selected run: {inspection.run_name} | family={inspection.family} | "
+            f"{inspection.primary_metric_name}={inspection.primary_metric_value if inspection.primary_metric_value is not None else '--'} | "
+            f"artifacts={artifact_count} | test predictions={prediction_count}"
+        )
+        self._model_selected_run_preview_var.set(self._format_selected_run_preview(inspection))
+        self._update_model_chart_previews(
+            training_curve=str(inspection.artifacts.get("training_curve") or ""),
+            test_performance=str(inspection.artifacts.get("test_performance") or ""),
+        )
+
+    def _load_selected_model_run(self) -> None:
+        selected_label = self._model_selected_run_var.get().strip()
+        run_path = self._model_run_option_paths.get(selected_label, "")
+        if not run_path:
+            self._log_line("Model Studio selected-run load skipped: no run is selected.")
+            return
+        self._model_import_path_var.set(run_path)
+        self._refresh_selected_model_run(run_path)
+        self._log_line(f"Model Studio loaded selected run: {run_path}")
+
+    def _render_model_chart_preview(self, path: Path, *, key: str, label: ttk.Label) -> bool:
+        if cairosvg is None or Image is None or ImageTk is None:
+            return False
+        try:
+            png_bytes = cairosvg.svg2png(url=str(path))
+            image = Image.open(io.BytesIO(png_bytes))
+            image.thumbnail((360, 220))
+            photo = ImageTk.PhotoImage(image)
+        except Exception as exc:
+            self._log_line(f"Model Studio chart preview failed for {path.name}: {exc}")
+            return False
+        self._model_chart_preview_images[key] = photo
+        label.configure(image=photo, text=path.name, compound="top")
+        return True
+
+    def _update_model_chart_previews(self, *, training_curve: str, test_performance: str) -> None:
+        if not hasattr(self, "_model_chart_training_label") or not hasattr(self, "_model_chart_test_label"):
+            return
+        self._model_chart_preview_images["training"] = None
+        self._model_chart_preview_images["test"] = None
+        training_label: ttk.Label = self._model_chart_training_label
+        test_label: ttk.Label = self._model_chart_test_label
+        training_label.configure(image="", text="Training curve preview unavailable")
+        test_label.configure(image="", text="Test plot preview unavailable")
+        if not training_curve and not test_performance:
+            self._model_chart_preview_status_var.set("No chart artifacts are available for the selected run.")
+            return
+        preview_ready = False
+        if training_curve:
+            preview_ready = self._render_model_chart_preview(Path(training_curve), key="training", label=training_label) or preview_ready
+            if not preview_ready:
+                training_label.configure(text=f"Training curve: {Path(training_curve).name}")
+        if test_performance:
+            rendered = self._render_model_chart_preview(Path(test_performance), key="test", label=test_label)
+            preview_ready = rendered or preview_ready
+            if not rendered:
+                test_label.configure(text=f"Test plot: {Path(test_performance).name}")
+        if preview_ready:
+            self._model_chart_preview_status_var.set("Inline chart previews loaded for the selected run.")
+        elif cairosvg is None or Image is None or ImageTk is None:
+            self._model_chart_preview_status_var.set(
+                "Inline chart previews require Pillow and CairoSVG. Open the artifacts directly if previews are unavailable."
+            )
+        else:
+            self._model_chart_preview_status_var.set("Chart artifacts found, but inline preview rendering was not successful.")
+
+    @staticmethod
+    def _format_selected_run_preview(inspection: Any) -> str:
+        metrics = inspection.metrics if isinstance(getattr(inspection, "metrics", None), dict) else {}
+        split_counts = inspection.split_counts if isinstance(getattr(inspection, "split_counts", None), dict) else {}
+        history_summary = inspection.history_summary if isinstance(getattr(inspection, "history_summary", None), dict) else {}
+        test_metrics = None
+        for key in ("test", "test_metrics", "evaluation", "validation_metrics", "val"):
+            value = metrics.get(key)
+            if isinstance(value, dict) and value:
+                test_metrics = value
+                break
+        prediction_preview = "No prediction file loaded."
+        prediction_path = str(inspection.artifacts.get("test_predictions") or "")
+        if prediction_path:
+            try:
+                payload = json.loads(Path(prediction_path).read_text(encoding="utf-8"))
+                if isinstance(payload, list) and payload:
+                    sample = payload[0]
+                    prediction_preview = f"Sample prediction: {json.dumps(sample, indent=2)}"
+            except Exception:
+                prediction_preview = f"Predictions available at {prediction_path}"
+        return "\n".join([
+            f"Run: {inspection.run_name}",
+            f"Family: {inspection.family} | Task: {inspection.task} | Backend: {inspection.backend_id}",
+            f"Primary metric: {inspection.primary_metric_name}={inspection.primary_metric_value}",
+            f"Split counts: train={split_counts.get('train', 0)} val={split_counts.get('val', 0)} test={split_counts.get('test', 0)}",
+            f"History: epochs={history_summary.get('epoch_count', 0)} best_val={history_summary.get('best_val_metric', '--')}",
+            f"Training curve: {'ready' if inspection.chart_ready else 'not available'}",
+            f"Test plot: {'ready' if inspection.test_plot_ready else 'not available'}",
+            f"Metric snapshot: {json.dumps(test_metrics, indent=2) if isinstance(test_metrics, dict) else '--'}",
+            prediction_preview,
+        ])
+
+    @staticmethod
+    def _format_model_report_preview(report: dict[str, object]) -> str:
+        best = report.get("best_overall") if isinstance(report.get("best_overall"), dict) else {}
+        best_text = "No best run yet."
+        if isinstance(best, dict) and best:
+            metric_name = str(best.get("primary_metric_name") or "metric")
+            metric_value = best.get("primary_metric_value")
+            best_text = f"{best.get('run_name', '--')} | {best.get('family', '--')} | {metric_name}={metric_value}"
+        recent_lines: list[str] = []
+        for item in report.get("recent_runs", []) if isinstance(report.get("recent_runs"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            recent_lines.append(
+                f"- {item.get('run_name', '--')} | {item.get('family', '--')} | "
+                f"{item.get('primary_metric_name', 'metric')}={item.get('primary_metric_value', '--')} | "
+                f"charts={'yes' if item.get('chart_ready') else 'no'} | "
+                f"plots={'yes' if item.get('test_plot_ready') else 'no'}"
+            )
+        if not recent_lines:
+            recent_lines.append("- No recent runs tracked yet.")
+        return "\n".join([
+            "Run Snapshot",
+            f"Best overall: {best_text}",
+            f"Runs tracked: {report.get('run_count', 0)}",
+            f"Training curves: {report.get('chart_ready_count', 0)}",
+            f"Test plots: {report.get('test_plot_ready_count', 0)}",
+            f"Native graph runs: {report.get('native_graph_run_count', 0)}",
+            "",
+            "Recent runs:",
+            *recent_lines[:5],
+        ])
+
+    @staticmethod
+    def _format_model_bullets(prefix: str, items: list[str] | tuple[str, ...]) -> str:
+        clean = [str(item).strip() for item in items if str(item).strip()]
+        if not clean:
+            return f"{prefix}\n- --"
+        return "\n".join([prefix, *[f"- {item}" for item in clean]])
+
+    def _build_model_studio_tab(self, outer: ttk.Frame) -> None:
+        canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        row = 0
+
+        ttk.Label(
+            frame,
+            text="Model Studio",
+            font=("Helvetica", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
+        ttk.Button(
+            frame,
+            text="Refresh Recommendations",
+            command=self._refresh_model_studio,
+        ).grid(row=row, column=1, sticky="e")
+        row += 1
+
+        ttk.Label(
+            frame,
+            text="Profiles the current workspace, checks architecture compatibility, and recommends three model strategies.",
+            font=("Helvetica", 7),
+            foreground="#888888",
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        controls = ttk.LabelFrame(frame, text="Model Design Inputs", padding=8, style="Section.TLabelframe")
+        controls.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+        control_rows = [
+            ("Dataset source:", self._model_dataset_source_var, ["auto", "training_examples", "engineered_dataset", "custom_training_set"]),
+            ("Modality:", self._model_modality_var, ["auto", "attributes", "graphs", "graphs+attributes", "unsupervised"]),
+            ("Task:", self._model_task_var, ["auto", "regression", "classification", "ranking", "unsupervised"]),
+            ("Preferred family:", self._model_family_var, ["auto", "random_forest", "xgboost", "dense_nn", "gnn", "hybrid_fusion", "cnn", "unet", "autoencoder", "clustering"]),
+            ("Compute budget:", self._model_compute_budget_var, ["low", "balanced", "high"]),
+            ("Interpretability:", self._model_interpretability_var, ["high", "balanced", "low"]),
+            ("Runtime target:", self._model_runtime_target_var, ["local_cpu", "local_gpu", "cluster", "kaggle", "colab"]),
+        ]
+        for idx, (label, var, options) in enumerate(control_rows):
+            grid_row = idx // 2
+            grid_col = (idx % 2) * 2
+            ttk.Label(controls, text=label).grid(row=grid_row, column=grid_col, sticky="w", pady=2)
+            ttk.Combobox(
+                controls,
+                textvariable=var,
+                values=options,
+                state="readonly",
+                width=24,
+            ).grid(row=grid_row, column=grid_col + 1, sticky="ew", padx=(6, 12), pady=2)
+        row += 1
+
+        profile_frame = ttk.LabelFrame(frame, text="Workspace Profile", padding=8, style="Section.TLabelframe")
+        profile_frame.grid(row=row, column=0, sticky="nsew", pady=(8, 0), padx=(0, 4))
+        profile_frame.columnconfigure(1, weight=1)
+        for info_row, (label, var) in enumerate([
+            ("Runtime:", self._model_runtime_summary_var),
+            ("Summary:", self._model_profile_summary_var),
+            ("Detail:", self._model_profile_detail_var),
+            ("Compatibility:", self._model_warnings_var),
+            ("Next action:", self._model_next_action_var),
+            ("Last run/import:", self._model_import_path_var),
+            ("Run comparison:", self._model_run_comparison_var),
+            ("Experiment detail:", self._model_run_detail_var),
+            ("Inference:", self._model_inference_result_var),
+        ]):
+            ttk.Label(profile_frame, text=label, font=("Segoe UI Semibold", 8)).grid(
+                row=info_row, column=0, sticky="nw", padx=(0, 6), pady=1
+            )
+            ttk.Label(
+                profile_frame,
+                textvariable=var,
+                wraplength=700,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=info_row, column=1, sticky="w", pady=1)
+        profile_metrics = ttk.Frame(profile_frame)
+        profile_metrics.grid(row=len([
+            ("Runtime:", self._model_runtime_summary_var),
+            ("Summary:", self._model_profile_summary_var),
+            ("Detail:", self._model_profile_detail_var),
+            ("Compatibility:", self._model_warnings_var),
+            ("Next action:", self._model_next_action_var),
+            ("Last run/import:", self._model_import_path_var),
+            ("Run comparison:", self._model_run_comparison_var),
+            ("Experiment detail:", self._model_run_detail_var),
+            ("Inference:", self._model_inference_result_var),
+        ]), column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for index in range(6):
+            profile_metrics.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("examples", "Examples"),
+            ("train", "Train"),
+            ("val", "Val"),
+            ("test", "Test"),
+            ("modalities", "Modalities"),
+            ("tasks", "Tasks"),
+        ]):
+            card = ttk.Frame(profile_metrics, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._model_profile_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+                wraplength=140,
+                justify="left",
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        run_insights = ttk.LabelFrame(frame, text="Run Insights", padding=8, style="Section.TLabelframe")
+        run_insights.grid(row=row, column=1, sticky="nsew", pady=(8, 0), padx=(4, 0))
+        for index in range(5):
+            run_insights.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("runs", "Tracked runs"),
+            ("curves", "Curves"),
+            ("plots", "Test plots"),
+            ("native", "Native graph"),
+            ("best", "Best run"),
+        ]):
+            card = ttk.Frame(run_insights, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=self._model_run_kpi_vars[key],
+                font=("Segoe UI Semibold", 11),
+                wraplength=150 if key == "best" else 90,
+                justify="left",
+            ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        artifact_frame = ttk.Frame(run_insights)
+        artifact_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        for index in range(5):
+            artifact_frame.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("run_dir", "Open Run Dir"),
+            ("training_curve", "Open Curve"),
+            ("test_performance", "Open Test Plot"),
+            ("metrics", "Open Metrics"),
+            ("test_predictions", "Open Predictions"),
+        ]):
+            ttk.Button(
+                artifact_frame,
+                text=label,
+                command=lambda artifact_key=key: self._open_model_artifact(artifact_key),
+            ).grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+        selected_run_frame = ttk.Frame(run_insights)
+        selected_run_frame.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        selected_run_frame.columnconfigure(1, weight=1)
+        ttk.Label(selected_run_frame, text="Selected run:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        selected_run_combo = ttk.Combobox(
+            selected_run_frame,
+            textvariable=self._model_selected_run_var,
+            values=(),
+            state="readonly",
+            width=48,
+        )
+        selected_run_combo.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        self._model_selected_run_combo = selected_run_combo
+        ttk.Button(
+            selected_run_frame,
+            text="Load Selected Run",
+            command=self._load_selected_model_run,
+        ).grid(row=0, column=2, sticky="e")
+        ttk.Label(
+            run_insights,
+            textvariable=self._model_run_detail_var,
+            wraplength=760,
+            justify="left",
+            font=("Segoe UI", 8),
+        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        recent_runs_frame = ttk.Frame(run_insights)
+        recent_runs_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        for index in range(3):
+            recent_runs_frame.columnconfigure(index, weight=1)
+        for index, vars_for_run in enumerate(self._model_recent_run_vars):
+            card = ttk.Frame(recent_runs_frame, style="Card.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, textvariable=vars_for_run["title"], style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                card,
+                textvariable=vars_for_run["detail"],
+                wraplength=220,
+                justify="left",
+                font=("Segoe UI", 8),
+            ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        row += 1
+
+        for index, vars_for_card in enumerate(self._model_recommendation_vars):
+            card = ttk.LabelFrame(frame, textvariable=vars_for_card["title"], padding=8, style="Section.TLabelframe")
+            card.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            card.columnconfigure(0, weight=1)
+            for card_row, key in enumerate(["summary", "why", "strengths", "drawbacks", "recipe"]):
+                ttk.Label(
+                    card,
+                    textvariable=vars_for_card[key],
+                    wraplength=760,
+                    justify="left",
+                    font=("Segoe UI", 8),
+                ).grid(row=card_row, column=0, sticky="w", pady=1)
+            actions = ttk.Frame(card)
+            actions.grid(row=5, column=0, sticky="e", pady=(6, 0))
+            ttk.Button(
+                actions,
+                text="Export Starter Config",
+                command=lambda idx=index: self._export_model_starter_config(idx),
+            ).pack(side="right")
+            ttk.Button(
+                actions,
+                text="Export Training Package",
+                command=lambda idx=index: self._export_model_training_package(idx),
+            ).pack(side="right", padx=(0, 6))
+            ttk.Button(
+                actions,
+                text="Run Locally",
+                command=lambda idx=index: self._run_model_training(idx),
+            ).pack(side="right", padx=(0, 6))
+            row += 1
+
+        preview_frame = ttk.LabelFrame(frame, text="Selected Config And Run Snapshot", padding=8, style="Section.TLabelframe")
+        preview_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        preview_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            preview_frame,
+            textvariable=self._model_export_status_var,
+            wraplength=760,
+            justify="left",
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(
+            preview_frame,
+            textvariable=self._model_config_preview_var,
+            wraplength=760,
+            justify="left",
+            font=("Cascadia Code", 8),
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Label(
+            preview_frame,
+            textvariable=self._model_selected_run_preview_var,
+            wraplength=760,
+            justify="left",
+            font=("Segoe UI", 8),
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(
+            preview_frame,
+            textvariable=self._model_chart_preview_status_var,
+            wraplength=760,
+            justify="left",
+            font=("Segoe UI", 8),
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        chart_preview_frame = ttk.Frame(preview_frame)
+        chart_preview_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        chart_preview_frame.columnconfigure(0, weight=1)
+        chart_preview_frame.columnconfigure(1, weight=1)
+        training_chart = ttk.Label(chart_preview_frame, text="Training curve preview unavailable", justify="center")
+        training_chart.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        test_chart = ttk.Label(chart_preview_frame, text="Test plot preview unavailable", justify="center")
+        test_chart.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self._model_chart_training_label = training_chart
+        self._model_chart_test_label = test_chart
+        action_row = ttk.Frame(preview_frame)
+        action_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(1, weight=1)
+        action_row.columnconfigure(2, weight=1)
+        ttk.Button(
+            action_row,
+            text="Import Completed Run",
+            command=self._import_model_training_run,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(
+            action_row,
+            text="Compare Saved Runs",
+            command=self._compare_model_runs,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            action_row,
+            text="Refresh Recommendations",
+            command=self._refresh_model_studio,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        inference_controls = ttk.Frame(preview_frame)
+        inference_controls.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        inference_controls.columnconfigure(1, weight=1)
+        ttk.Label(inference_controls, text="PDB ID for saved-model inference:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(inference_controls, textvariable=self._model_inference_pdb_var, width=16).grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        ttk.Button(
+            inference_controls,
+            text="Run Saved-Model Inference",
+            command=self._run_saved_model_inference,
+        ).grid(row=0, column=2, sticky="e")
+        row += 1
+
+        ttk.Button(
+            frame,
+            text="Refresh Recommendations",
+            command=self._refresh_model_studio,
+            style="Accent.TButton",
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self._refresh_model_studio()
+        self._bind_canvas_mousewheel(canvas, frame)
+
     def _build_pipeline_panel(self) -> None:
         right = tk.Frame(self._root, bg=_APP_BG)
         right.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(10, 4))
@@ -2090,8 +3077,20 @@ class PbdataGUI:
         # Data overview at top
         self._build_overview(outer)
 
+        workflow_card_row = self._add_guidance_card(
+            outer,
+            row=1,
+            title="Run Workflow",
+            summary="Use the pipeline panel to run individual stages when you are iterating, or run the full workflow once your sources, search slice, and options look right.",
+            bullets=[
+                "Refresh Overview to re-scan current workspace artifacts without launching work.",
+                "Run Full Pipeline keeps the right-side status panel and live log synchronized as each stage advances.",
+            ],
+            pady=(6, 6),
+        )
+
         status_frame = ttk.LabelFrame(outer, text="Run Status", padding=10, style="Section.TLabelframe")
-        status_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        status_frame.grid(row=workflow_card_row, column=0, sticky="ew", pady=(0, 0))
         status_frame.columnconfigure(1, weight=1)
         status_items = [
             ("Workflow state:", self._run_state_var),
@@ -2117,19 +3116,25 @@ class PbdataGUI:
 
         # Pipeline stages
         pipeline_frame = ttk.LabelFrame(outer, text="Pipeline", padding=12, style="Section.TLabelframe")
-        pipeline_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        pipeline_frame.columnconfigure(1, weight=1)
+        pipeline_frame.grid(row=workflow_card_row + 1, column=0, sticky="nsew", pady=(6, 0))
+        pipeline_frame.columnconfigure(0, weight=1)
 
         prow = 0
         for group_name, stages in _PIPELINE_GROUPS:
-            # Group header
-            ttk.Label(
+            group_card = ttk.LabelFrame(
                 pipeline_frame,
                 text=group_name,
-                font=("Helvetica", 9, "bold"),
-                foreground=_SECTION_FG,
-            ).grid(row=prow, column=0, columnspan=3, sticky="w", pady=(8 if prow > 0 else 0, 4))
-            prow += 1
+                padding=8,
+                style="Section.TLabelframe",
+            )
+            group_card.grid(row=prow, column=0, sticky="ew", pady=(8 if prow > 0 else 0, 0))
+            group_card.columnconfigure(1, weight=1)
+            ttk.Label(
+                group_card,
+                text=f"{len(stages)} stage{'s' if len(stages) != 1 else ''} in this workflow group",
+                style="Muted.TLabel",
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+            grow = 1
 
             for stage_key, display_name in stages:
                 btn_text = f"  {display_name}"
@@ -2140,35 +3145,37 @@ class PbdataGUI:
                         self._spawn_stage(s)
 
                 button = ttk.Button(
-                    pipeline_frame,
+                    group_card,
                     text=btn_text,
                     width=28,
                     style="Accent.TButton" if stage_key in {"ingest", "extract", "build-release", "build-custom-training-set"} else "TButton",
                     command=cmd,
                 )
-                button.grid(row=prow, column=0, sticky="w", pady=3, padx=(8, 12))
+                button.grid(row=grow, column=0, sticky="ew", pady=3, padx=(0, 10))
                 self._action_buttons.append(button)
 
                 lbl = tk.Label(
-                    pipeline_frame,
+                    group_card,
                     textvariable=self._status_vars[stage_key],
                     width=10,
                     anchor="w",
                     fg=_STATUS_COLORS["idle"],
-                    font=("Helvetica", 9),
+                    bg=_CARD_BG,
+                    font=("Segoe UI", 9),
                 )
-                lbl.grid(row=prow, column=1, sticky="w")
+                lbl.grid(row=grow, column=1, sticky="w")
                 self._status_labels[stage_key] = lbl
-                prow += 1
+                grow += 1
+            prow += 1
 
         # Separator before Run All
         ttk.Separator(pipeline_frame, orient="horizontal").grid(
-            row=prow, column=0, columnspan=3, sticky="ew", pady=(10, 8),
+            row=prow, column=0, sticky="ew", pady=(10, 8),
         )
         prow += 1
 
         btn_frame = ttk.Frame(pipeline_frame)
-        btn_frame.grid(row=prow, column=0, columnspan=3, sticky="ew")
+        btn_frame.grid(row=prow, column=0, sticky="ew")
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
 
@@ -2193,8 +3200,8 @@ class PbdataGUI:
     def _build_overview(self, parent: tk.Frame) -> None:
         overview = ttk.LabelFrame(parent, text="Data Overview", padding=10, style="Section.TLabelframe")
         overview.grid(row=0, column=0, sticky="ew")
-        overview.columnconfigure(1, weight=1)
-        overview.columnconfigure(3, weight=1)
+        for column in range(4):
+            overview.columnconfigure(column, weight=1)
 
         ttk.Label(
             overview,
@@ -2204,38 +3211,34 @@ class PbdataGUI:
         ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
 
         items = [
-            ("raw_rcsb",     "Raw RCSB entries:"),
-            ("raw_skempi",   "SKEMPI CSV:"),
-            ("processed",    "Processed records:"),
-            ("processed_valid", "Processed valid:"),
-            ("extracted",    "Extracted entries:"),
-            ("chains",       "Chains:"),
-            ("bound_objects", "Bound objects:"),
-            ("assays",       "Assay records:"),
-            ("graph_nodes",  "Graph nodes:"),
-            ("graph_edges",  "Graph edges:"),
-            ("splits",       "Split files:"),
-            ("processed_issues", "Processed issues:"),
+            ("raw_rcsb", "Raw RCSB entries"),
+            ("raw_skempi", "SKEMPI CSV"),
+            ("processed", "Processed records"),
+            ("processed_valid", "Processed valid"),
+            ("extracted", "Extracted entries"),
+            ("chains", "Chains"),
+            ("bound_objects", "Bound objects"),
+            ("assays", "Assay records"),
+            ("graph_nodes", "Graph nodes"),
+            ("graph_edges", "Graph edges"),
+            ("splits", "Split files"),
+            ("processed_issues", "Processed issues"),
         ]
-
-        for i, (key, label) in enumerate(items):
-            col_offset = 0 if i < 5 else 2
-            r = (i if i < 5 else i - 5) + 1
+        for key, _label in items:
             self._overview_vars[key] = tk.StringVar(value="--")
 
-            ttk.Label(
-                overview, text=label,
-                font=("Helvetica", 8),
-            ).grid(row=r, column=col_offset, sticky="w", padx=(0, 4), pady=1)
-
-            ttk.Label(
-                overview,
-                textvariable=self._overview_vars[key],
-                font=("Helvetica", 8, "bold"),
-            ).grid(row=r, column=col_offset + 1, sticky="w", padx=(0, 16), pady=1)
+        card_row = self._add_metric_cards(
+            overview,
+            row=1,
+            specs=items,
+            value_vars=self._overview_vars,
+            columns=4,
+            value_wraplength=150,
+            pady=(0, 4),
+        )
 
         presenter_frame = ttk.LabelFrame(overview, text="Presenter Banner", padding=8, style="Section.TLabelframe")
-        presenter_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        presenter_frame.grid(row=card_row, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self._overview_sections["presenter_banner"] = presenter_frame
         presenter_frame.columnconfigure(1, weight=1)
         for row, (key, label) in enumerate([
@@ -2256,7 +3259,7 @@ class PbdataGUI:
             ).grid(row=row, column=1, sticky="w", pady=1)
 
         completion_frame = ttk.LabelFrame(overview, text="Completion Status", padding=8, style="Section.TLabelframe")
-        completion_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        completion_frame.grid(row=card_row + 1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self._overview_sections["completion"] = completion_frame
         for column in range(5):
             completion_frame.columnconfigure(column, weight=1 if column else 0)
@@ -3665,6 +4668,7 @@ class PbdataGUI:
         if not hasattr(self, "_overview_sections"):
             return
         demo_mode = bool(self._demo_mode_var.get())
+        compact_mode = bool(self._compact_overview_var.get()) if hasattr(self, "_compact_overview_var") else False
         demo_visible = {
             "presenter_banner",
             "completion",
@@ -3682,8 +4686,29 @@ class PbdataGUI:
             "artifact_freshness",
             "quick_actions",
         }
+        compact_visible = {
+            "presenter_banner",
+            "completion",
+            "training_builder",
+            "training_quality",
+            "model_comparison",
+            "split_diagnostics",
+            "search_preview",
+            "source_configuration",
+            "data_integrity",
+            "release_readiness",
+            "workflow_guidance",
+            "last_run",
+            "artifact_freshness",
+            "quick_actions",
+        }
+        visible = set(self._overview_sections.keys())
+        if compact_mode:
+            visible &= compact_visible
+        if demo_mode:
+            visible &= demo_visible
         for key, widget in self._overview_sections.items():
-            if not demo_mode or key in demo_visible:
+            if key in visible:
                 widget.grid()
             else:
                 widget.grid_remove()

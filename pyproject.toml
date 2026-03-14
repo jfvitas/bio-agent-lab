@@ -16,6 +16,8 @@ dependencies = [
   "gemmi",
   "pandas>=2.0",
   "requests>=2.31",
+  "Pillow>=11.0",
+  "CairoSVG>=2.7",
 ]
 
 [project.optional-dependencies]
