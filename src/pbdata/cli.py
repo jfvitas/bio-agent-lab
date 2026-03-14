@@ -78,6 +78,14 @@ def _coerce_workers(workers: int) -> int:
     return workers
 
 
+def _path_exists_safe(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError as exc:
+        logger.warning("Path availability check failed for %s: %s", path, exc)
+        return False
+
+
 def _resolve_latest_feature_pipeline_run_id(layout: StorageLayout, explicit_run_id: Optional[str]) -> str:
     if explicit_run_id:
         return explicit_run_id
@@ -350,12 +358,12 @@ def _setup(
     """Global setup: logging and config loading."""
     log_path: Optional[Path] = log_config
     if log_path is None:
-        log_path = _DEFAULT_LOG_CONFIG if _DEFAULT_LOG_CONFIG.exists() else None
+        log_path = _DEFAULT_LOG_CONFIG if _path_exists_safe(_DEFAULT_LOG_CONFIG) else None
     setup_logging(log_path)
 
     cfg_path: Optional[Path] = config
     if cfg_path is None:
-        if _DEFAULT_CONFIG.exists():
+        if _path_exists_safe(_DEFAULT_CONFIG):
             cfg_path = _DEFAULT_CONFIG
         else:
             logger.warning(

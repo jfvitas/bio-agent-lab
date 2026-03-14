@@ -90,6 +90,27 @@ def test_plan_precompute_writes_chunk_manifests() -> None:
     assert chunk0["input_count"] == 2
 
 
+def test_cli_bootstrap_tolerates_stale_default_log_config() -> None:
+    tmp_path = _tmp_dir("stale_log_config")
+    storage_root = tmp_path / "storage"
+    config_path = tmp_path / "sources.yaml"
+    _write_sources_config(config_path)
+    runner = CliRunner()
+    with patch("pbdata.cli._path_exists_safe", side_effect=lambda path: False if str(path).endswith("logging.yaml") else True):
+        result = runner.invoke(
+            app,
+            [
+                "--storage-root",
+                str(storage_root),
+                "--config",
+                str(config_path),
+                "status",
+            ],
+            catch_exceptions=False,
+        )
+    assert result.exit_code == 0
+
+
 def test_run_precompute_shard_executes_extract_into_shard_dir() -> None:
     tmp_path = _tmp_dir("precompute_shard")
     storage_root = tmp_path / "storage"
