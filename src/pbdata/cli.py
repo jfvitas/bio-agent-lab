@@ -40,6 +40,12 @@ from pbdata.workspace_state import (
     build_doctor_report as build_doctor_state_report,
     build_status_report as build_status_state_report,
 )
+from pbdata.precompute import (
+    build_precompute_run_status,
+    merge_precompute_shards,
+    plan_precompute_run,
+    run_precompute_shard,
+)
 
 app = typer.Typer(help="Protein binding dataset platform CLI.")
 
@@ -142,6 +148,24 @@ def _exit_with_dependency_error(exc: Exception) -> None:
     else:
         typer.echo(f"Error: {exc}")
     raise typer.Exit(code=1)
+
+
+def _render_precompute_status(status: dict[str, object]) -> None:
+    typer.echo(f"Run ID: {status.get('run_id')}")
+    typer.echo(f"Stage: {status.get('stage')}")
+    typer.echo(f"Status: {status.get('status')}")
+    typer.echo(f"Storage root: {status.get('storage_root')}")
+    typer.echo(f"Run dir: {status.get('run_dir')}")
+    typer.echo(
+        "Chunks: "
+        f"{status.get('completed_chunks')}/{status.get('chunk_count')} completed, "
+        f"{status.get('failed_chunks')} failed"
+    )
+    typer.echo(
+        "Work: "
+        f"inputs={status.get('total_inputs')} | processed={status.get('processed')} | "
+        f"ok={status.get('ok')} | cached={status.get('cached')} | failed={status.get('failed')}"
+    )
 
 
 def _fetch_bindingdb_samples_for_pdb(
@@ -707,6 +731,170 @@ def predict_ligand_screening_cmd(
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Ligand screening manifest written to {out_path}")
     typer.echo(f"Workflow status: {manifest['status']}")
+
+
+@app.command("plan-precompute")
+def plan_precompute_cmd(
+    ctx: typer.Context,
+    stage: Annotated[
+        str,
+        typer.Option("--stage", help="Shard-aware preprocessing stage to plan."),
+    ] = "extract",
+    chunk_size: Annotated[
+        int,
+        typer.Option("--chunk-size", min=1, help="Approximate number of inputs per chunk."),
+    ] = 500,
+    chunk_count: Annotated[
+        Optional[int],
+        typer.Option("--chunk-count", min=1, help="Optional explicit chunk count."),
+    ] = None,
+    run_id: Annotated[
+        Optional[str],
+        typer.Option("--run-id", help="Optional explicit run identifier."),
+    ] = None,
+) -> None:
+    """Plan a generic shard-aware preprocessing run."""
+    layout = _storage_layout(ctx)
+    try:
+        result = plan_precompute_run(
+            layout,
+            stage=stage,
+            chunk_size=chunk_size,
+            chunk_count=chunk_count,
+            run_id=run_id,
+        )
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Precompute plan created.")
+    typer.echo(f"Run ID: {result.run_id}")
+    typer.echo(f"Stage: {result.stage}")
+    typer.echo(f"Run dir: {result.run_dir}")
+    typer.echo(f"Run manifest: {result.manifest_path}")
+    typer.echo(f"Chunk dir: {result.chunk_dir}")
+    typer.echo(f"Chunks: {result.chunk_count}")
+    typer.echo(f"Inputs: {result.total_inputs}")
+
+
+@app.command("run-precompute-shard")
+def run_precompute_shard_cmd(
+    ctx: typer.Context,
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", help="Planned precompute run identifier."),
+    ],
+    chunk_index: Annotated[
+        int,
+        typer.Option("--chunk-index", min=0, help="Chunk index to execute."),
+    ],
+    workers: Annotated[
+        int,
+        typer.Option("--workers", min=0, help="Worker count (0 = CPU count)."),
+    ] = 1,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rebuild shard outputs even when cached outputs exist."),
+    ] = False,
+    download_pdb: Annotated[
+        bool,
+        typer.Option("--download-pdb", help="Also download PDB format files."),
+    ] = False,
+    download_structures: Annotated[
+        bool,
+        typer.Option("--download-structures/--no-download-structures",
+                     help="Download mmCIF structure files for extraction shards."),
+    ] = True,
+    graph_level: Annotated[
+        str,
+        typer.Option("--graph-level", help="Structural graph level for build-structural-graphs shards."),
+    ] = "residue",
+    scope: Annotated[
+        str,
+        typer.Option("--scope", help="Structural graph scope for build-structural-graphs shards."),
+    ] = "whole_protein",
+    shell_radius: Annotated[
+        float,
+        typer.Option("--shell-radius", help="Structural graph shell radius for build-structural-graphs shards."),
+    ] = 8.0,
+    export_formats: Annotated[
+        list[str] | None,
+        typer.Option("--export-format", help="Repeatable structural graph export format."),
+    ] = None,
+) -> None:
+    """Execute one planned preprocessing shard."""
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj.get("config", AppConfig())
+    try:
+        result = run_precompute_shard(
+            layout,
+            run_id=run_id,
+            chunk_index=chunk_index,
+            config=cfg,
+            workers=workers,
+            force=force,
+            download_structures=download_structures,
+            download_pdb=download_pdb,
+            graph_level=graph_level,
+            scope=scope,
+            shell_radius=shell_radius,
+            export_formats=tuple(export_formats or ["pyg", "networkx"]),
+            log_fn=typer.echo,
+        )
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Precompute shard complete.")
+    typer.echo(f"Run ID: {result.run_id}")
+    typer.echo(f"Chunk index: {result.chunk_index}")
+    typer.echo(f"Shard dir: {result.shard_dir}")
+    typer.echo(f"Status file: {result.status_path}")
+    typer.echo(
+        f"Processed={result.processed:,} | ok={result.ok:,} | cached={result.cached:,} | failed={result.failed:,}"
+    )
+
+
+@app.command("merge-precompute-shards")
+def merge_precompute_shards_cmd(
+    ctx: typer.Context,
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", help="Planned precompute run identifier."),
+    ],
+) -> None:
+    """Merge shard-local outputs into reusable workspace outputs."""
+    layout = _storage_layout(ctx)
+    try:
+        result = merge_precompute_shards(layout, run_id=run_id)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Precompute shard merge complete.")
+    typer.echo(f"Run ID: {result.run_id}")
+    typer.echo(f"Stage: {result.stage}")
+    typer.echo(f"Merged dir: {result.merged_dir}")
+    typer.echo(f"Merge manifest: {result.manifest_path}")
+    typer.echo(f"Copied files: {result.copied:,}")
+
+
+@app.command("report-precompute-run-status")
+def report_precompute_run_status_cmd(
+    ctx: typer.Context,
+    run_id: Annotated[
+        str,
+        typer.Option("--run-id", help="Planned precompute run identifier."),
+    ],
+) -> None:
+    """Report shard-level completion state for a planned precompute run."""
+    layout = _storage_layout(ctx)
+    try:
+        status = build_precompute_run_status(layout, run_id=run_id)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+    _render_precompute_status(status)
 
 
 @app.command("train-baseline-model")

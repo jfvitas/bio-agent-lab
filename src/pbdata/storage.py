@@ -255,6 +255,14 @@ class StorageLayout:
     def risk_dir(self) -> Path:
         return self.data_dir / "risk"
 
+    @property
+    def runs_dir(self) -> Path:
+        return self.root / "runs"
+
+    @property
+    def precompute_runs_dir(self) -> Path:
+        return self.runs_dir / "precompute"
+
 
 def resolve_storage_root(storage_root: str | Path | None) -> Path:
     """Resolve a user-supplied storage root to an absolute local path."""
