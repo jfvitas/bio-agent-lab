@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Page
+    x:Class="PbdataWinUI.Views.ModelStudioPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel
+            MaxWidth="{StaticResource PageWidth}"
+            Margin="24,20,24,32"
+            Spacing="20">
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="MODEL STUDIO" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Choose an architecture and review the training outputs" />
+                    <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SelectedModelPitch, Mode=OneWay}" />
+                    <CommandBar DefaultLabelPosition="Right">
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RecommendModelCommand}"
+                            Label="Recommend">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Like" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.TrainModelCommand}"
+                            Label="Train">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Play" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.CompareRunsCommand}"
+                            Label="Compare">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Switch" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                    </CommandBar>
+                </StackPanel>
+            </Border>
+
+            <Grid ColumnSpacing="20">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="0.95*" />
+                    <ColumnDefinition Width="1.05*" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Spacing="20">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="14">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Architecture design" />
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Objective" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.Objectives, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedObjectiveKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Model family" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.ModelFamilies, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedModelFamilyKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Modalities" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.Modalities, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedModalityKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Training profile" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.SpeedProfiles, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedSpeedKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Architecture preview" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SelectedModelHeadline, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.ArchitectureStages, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            BorderBrush="{Binding AccentBrush}"
+                                            BorderThickness="1"
+                                            CornerRadius="16"
+                                            Padding="16">
+                                            <StackPanel Spacing="6">
+                                                <TextBlock
+                                                    Foreground="{Binding AccentBrush}"
+                                                    FontSize="12"
+                                                    FontWeight="SemiBold"
+                                                    Text="{Binding StepLabel}" />
+                                                <TextBlock
+                                                    FontSize="18"
+                                                    FontWeight="SemiBold"
+                                                    Text="{Binding Title}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Summary}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Spacing="20">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="14">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Training scorecard" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.TrainingStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Performance snapshot" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.MetricBars, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Margin="0,0,0,12" Spacing="6">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Grid.Column="1" Style="{StaticResource MetricLabelStyle}" Text="{Binding DisplayValue}" />
+                                            </Grid>
+                                            <ProgressBar Maximum="1" Minimum="0" Value="{Binding Value}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </Grid>
+
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Training curves" />
+                    <Viewbox Stretch="Fill">
+                        <Grid
+                            Width="720"
+                            Height="240"
+                            Background="{ThemeResource LayerFillColorDefaultBrush}">
+                            <Canvas Width="720" Height="240">
+                                <Line
+                                    X1="24"
+                                    X2="680"
+                                    Y1="196"
+                                    Y2="196"
+                                    Stroke="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    StrokeThickness="1" />
+                                <Line
+                                    X1="24"
+                                    X2="680"
+                                    Y1="126"
+                                    Y2="126"
+                                    Stroke="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    StrokeThickness="1" />
+                                <Line
+                                    X1="24"
+                                    X2="680"
+                                    Y1="56"
+                                    Y2="56"
+                                    Stroke="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    StrokeThickness="1" />
+                                <Polyline
+                                    Points="{x:Bind ViewModel.TrainingCurvePoints, Mode=OneWay}"
+                                    Stroke="{StaticResource BrandAquaBrush}"
+                                    StrokeThickness="5" />
+                                <Polyline
+                                    Points="{x:Bind ViewModel.ValidationCurvePoints, Mode=OneWay}"
+                                    Stroke="{StaticResource BrandGoldBrush}"
+                                    StrokeThickness="5" />
+                            </Canvas>
+                        </Grid>
+                    </Viewbox>
+
+                    <StackPanel
+                        Orientation="Horizontal"
+                        Spacing="16">
+                        <TextBlock
+                            Foreground="{StaticResource BrandAquaBrush}"
+                            FontWeight="SemiBold"
+                            Text="Training" />
+                        <TextBlock
+                            Foreground="{StaticResource BrandGoldBrush}"
+                            FontWeight="SemiBold"
+                            Text="Validation" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Experiment comparison" />
+                    <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.RunSummary, Mode=OneWay}" />
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.ComparisonRuns, Mode=OneWay}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border
+                                    Margin="0,0,0,12"
+                                    BorderBrush="{Binding AccentBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="16"
+                                    Padding="16">
+                                    <StackPanel Spacing="4">
+                                        <TextBlock
+                                            FontSize="18"
+                                            FontWeight="SemiBold"
+                                            Text="{Binding Name}" />
+                                        <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Family}" />
+                                        <TextBlock
+                                            FontSize="16"
+                                            FontWeight="SemiBold"
+                                            Text="{Binding HeadlineMetric}" />
+                                        <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding SupportMetric}" />
+                                        <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Note}" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

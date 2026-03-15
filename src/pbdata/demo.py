@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from pbdata.config import AppConfig
+from pbdata.demo_tutorial import build_demo_tutorial_steps
 from pbdata.storage import StorageLayout
 from pbdata.workspace_state import build_demo_readiness_report
 
@@ -31,6 +32,11 @@ def _demo_markdown(report: dict[str, object]) -> str:
         f"- Core pipeline ready: `{'yes' if report.get('core_pipeline_ready', False) else 'no'}`",
         f"- Advanced outputs ready: `{'yes' if report.get('advanced_outputs_ready', False) else 'no'}`",
         "",
+        "## Demo Disclaimer",
+        "",
+        "- Demo Mode may seed simulated search results, extracted records, graph artifacts, model runs, charts, and predictions so the intended workflow can be presented instantly.",
+        "- Seeded outputs are illustrative only and must not be represented as scientific results or benchmark evidence.",
+        "",
         "## What Needs Attention Before The Demo",
     ]
     if blockers:
@@ -49,6 +55,26 @@ def _demo_markdown(report: dict[str, object]) -> str:
         lines.extend(f"{index}. {step}" for index, step in enumerate(steps, start=1))
     else:
         lines.append("1. Open the workspace overview and confirm the current dataset state.")
+
+    lines.extend(["", "## Guided Tutorial Notes"])
+    tutorial_steps = build_demo_tutorial_steps(
+        {
+            "custom_set_mode": "generalist",
+            "custom_set_target_size": "500",
+            "model_family": "hybrid_fusion",
+            "model_modality": "graphs+attributes",
+            "model_runtime_target": "local_gpu",
+        }
+    )
+    for index, step in enumerate(tutorial_steps, start=1):
+        lines.append(f"### Step {index}: {step.title}")
+        lines.append("")
+        lines.append(f"- What it is doing: {step.detail}")
+        lines.append(f"- Why it matters: {step.innovation}")
+        lines.append(f"- What to click: {step.instruction}")
+        if step.scroll_hint:
+            lines.append(f"- How to find it: {step.scroll_hint}")
+        lines.append("")
 
     lines.extend(["", "## Ground Rules"])
     if assumptions:

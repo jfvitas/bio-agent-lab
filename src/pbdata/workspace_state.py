@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from pbdata.config import AppConfig
+from pbdata.demo_workspace import demo_manifest_path
 from pbdata.file_health import JsonFileHealthSummary, load_or_scan_json_directory, write_health_summary_report
 from pbdata.schemas.canonical_sample import CanonicalBindingSample
 from pbdata.stage_state import list_stage_activity
@@ -314,6 +315,15 @@ def build_demo_readiness_report(
 ) -> DemoReadinessReport:
     status = status_snapshot or build_status_report(layout)
     doctor = doctor_report or build_doctor_report(layout, config, status_snapshot=status)
+    demo_manifest = {}
+    manifest_path = demo_manifest_path(layout)
+    if manifest_path.exists():
+        try:
+            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_manifest, dict):
+                demo_manifest = loaded_manifest
+        except Exception:
+            demo_manifest = {}
 
     blockers: list[str] = []
     if doctor.overall_status != "ready":
@@ -334,6 +344,8 @@ def build_demo_readiness_report(
         warnings.append("baseline_model_missing")
     if not status.release_snapshot_present:
         warnings.append("release_snapshot_missing")
+    if demo_manifest.get("simulated"):
+        warnings.append("demo_mode_simulated_outputs")
 
     if blockers:
         readiness = "not_demo_ready"
@@ -356,6 +368,11 @@ def build_demo_readiness_report(
         if readiness == "technically_reviewable_not_polished"
         else "Not yet suitable for a clean team walkthrough."
     )
+    if demo_manifest.get("simulated"):
+        summary = (
+            "Demo workspace is seeded with simulated artifacts that show the intended user experience. "
+            "Outputs are presentable but not scientific results."
+        )
 
     return DemoReadinessReport(
         storage_root=str(layout.root),
@@ -372,6 +389,7 @@ def build_demo_readiness_report(
         recommended_demo_flow=recommended_flow,
         summary=summary,
         assumptions=[
+            "If `demo_mode_simulated_outputs` is present, visible search, training, evaluation, and prediction outputs are seeded demo artifacts.",
             "Prediction and risk outputs remain baseline or placeholder unless a trained artifact is explicitly present.",
             "This report measures demo readiness of the local workspace, not scientific validity of downstream conclusions.",
         ],

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Page
+    x:Class="PbdataWinUI.Views.DatasetPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel
+            MaxWidth="{StaticResource PageWidth}"
+            Margin="24,20,24,32"
+            Spacing="20">
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="DATASET BUILDER" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Build a representative, graph-ready training set" />
+                    <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.DatasetNarrative, Mode=OneWay}" />
+                    <CommandBar DefaultLabelPosition="Right">
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.PreviewSearchCommand}"
+                            Label="Preview search">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Find" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.AssembleDatasetCommand}"
+                            Label="Assemble set">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Library" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.DesignSplitCommand}"
+                            Label="Design split">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Sort" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                    </CommandBar>
+                </StackPanel>
+            </Border>
+
+            <Grid ColumnSpacing="20">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="0.95*" />
+                    <ColumnDefinition Width="1.05*" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Spacing="20">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="14">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Scenario controls" />
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Dataset profile" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.DatasetProfiles, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedDatasetProfileKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Balancing strategy" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.BalanceStrategies, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedBalanceKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Embedding path" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.EmbeddingStrategies, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedEmbeddingKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Learning objective" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.Objectives, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedObjectiveKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Leakage-resistant split story" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SplitNarrative, Mode=OneWay}" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <Border Grid.Column="1" Style="{StaticResource CardBorderStyle}">
+                    <StackPanel Spacing="14">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Projected dataset" />
+                        <ItemsControl ItemsSource="{x:Bind ViewModel.DatasetStats, Mode=OneWay}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border
+                                        Margin="0,0,0,12"
+                                        Style="{StaticResource SubtleCardBorderStyle}">
+                                        <StackPanel Spacing="4">
+                                            <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                            <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

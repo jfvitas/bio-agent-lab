@@ -67,6 +67,21 @@ bottom.
 On Windows you can also double-click **Launch PBData GUI.bat** in the repo root
 — it finds the virtual environment automatically.
 
+There is also a separate WinUI 3 preview shell at **Launch PBData WinUI.bat**.
+That launcher opens the guided application under `apps/PbdataWinUI`.
+
+For a fresh Windows clone, the launcher now tries to do the right thing:
+
+- if `.NET 8` is already installed, it uses it
+- if `.NET 8` is missing, it installs a private local SDK into `.tools/dotnet`
+  for this repo
+- if **Windows App Runtime 1.8** is missing, it installs it automatically with
+  `winget`
+- it builds the WinUI app in `Release` mode and launches the built executable
+
+The older **Launch PBData WinUI Demo.bat** file still works and now forwards to
+the same launcher for compatibility.
+
 ---
 
 ## Installation

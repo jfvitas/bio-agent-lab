@@ -17,6 +17,7 @@ from pbdata.cli_reporting import (
     render_status_report,
 )
 from pbdata.config import AppConfig, load_config
+from pbdata.demo_workspace import seed_demo_workspace
 from pbdata.file_health import remove_problem_json_files, scan_json_directory
 from pbdata.logging_config import setup_logging
 from pbdata.pairing import parse_pair_identity_key
@@ -40,6 +41,12 @@ from pbdata.storage_packaging import (
     unpack_raw_rcsb_package,
 )
 from pbdata.storage_audit import build_storage_usage_report, render_storage_usage_report
+from pbdata.storage_prune import (
+    build_storage_prune_plan,
+    prune_storage,
+    render_storage_prune_plan,
+    render_storage_prune_result,
+)
 from pbdata.table_io import load_json_rows, load_table_json
 from pbdata.workspace_state import (
     build_demo_readiness_report as build_demo_readiness_state_report,
@@ -717,6 +724,27 @@ def export_demo_snapshot_cmd(ctx: typer.Context) -> None:
         ("Demo readiness", report["readiness"]),
         ("JSON snapshot", json_path),
         ("Markdown guide", md_path),
+    ])
+
+
+@app.command("seed-demo-workspace")
+def seed_demo_workspace_cmd(
+    ctx: typer.Context,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite and refresh an existing seeded demo workspace."),
+    ] = False,
+) -> None:
+    """Seed a convincing simulated workspace so Demo Mode can showcase the intended workflow instantly."""
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj["config"]
+    result = seed_demo_workspace(layout, cfg, repo_root=Path.cwd(), force=force)
+    emit_labeled_values([
+        ("Storage root", layout.root),
+        ("Seeded", "yes" if result.seeded else "already_present"),
+        ("Demo manifest", result.manifest_path),
+        ("Demo readiness", result.report_path),
+        ("Demo walkthrough", result.walkthrough_path),
     ])
 
 
@@ -2918,6 +2946,56 @@ def report_storage_cmd(ctx: typer.Context) -> None:
     report = build_storage_usage_report(layout)
     for line in render_storage_usage_report(report):
         typer.echo(line)
+
+
+@app.command("prune-storage")
+def prune_storage_cmd(
+    ctx: typer.Context,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Actually delete the safe prune targets instead of only previewing them."),
+    ] = False,
+    run_id: Annotated[
+        Optional[str],
+        typer.Option("--run-id", help="Limit pruning to one precompute run identifier."),
+    ] = None,
+    include_precompute_shards: Annotated[
+        bool,
+        typer.Option(
+            "--include-precompute-shards/--skip-precompute-shards",
+            help="Include redundant per-chunk shard outputs for merged precompute runs.",
+        ),
+    ] = True,
+    include_precompute_merged: Annotated[
+        bool,
+        typer.Option(
+            "--include-precompute-merged/--skip-precompute-merged",
+            help="Include redundant merged copies for merged precompute runs.",
+        ),
+    ] = True,
+) -> None:
+    """Preview or delete safe regenerable storage artifacts."""
+    layout = _storage_layout(ctx)
+    if apply:
+        result = prune_storage(
+            layout,
+            include_precompute_shards=include_precompute_shards,
+            include_precompute_merged=include_precompute_merged,
+            run_id=run_id,
+        )
+        for line in render_storage_prune_result(result):
+            typer.echo(line)
+        return
+
+    plan = build_storage_prune_plan(
+        layout,
+        include_precompute_shards=include_precompute_shards,
+        include_precompute_merged=include_precompute_merged,
+        run_id=run_id,
+    )
+    for line in render_storage_prune_plan(plan):
+        typer.echo(line)
+    typer.echo("Dry run only. Re-run with --apply to delete these paths.")
 
 
 if __name__ == "__main__":

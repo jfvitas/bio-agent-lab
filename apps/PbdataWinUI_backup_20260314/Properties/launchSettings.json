@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "PbdataWinUI (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "PbdataWinUI (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

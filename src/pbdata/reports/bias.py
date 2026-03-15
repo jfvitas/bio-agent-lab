@@ -2,28 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import json
 
-def _load_table_json(table_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not table_dir.exists():
-        return rows
-    for path in sorted(table_dir.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            rows.extend(item for item in raw if isinstance(item, dict))
-        elif isinstance(raw, dict):
-            rows.append(raw)
-    return rows
-
+from pbdata.table_io import load_table_json
 
 def build_bias_report(extracted_dir: Path, output_dir: Path) -> tuple[Path, dict[str, Any]]:
-    entries = _load_table_json(extracted_dir / "entry")
-    bound_objects = _load_table_json(extracted_dir / "bound_objects")
+    entries = load_table_json(extracted_dir / "entry")
+    bound_objects = load_table_json(extracted_dir / "bound_objects")
 
     family_counter: Counter[str] = Counter()
     scaffold_counter: Counter[str] = Counter()

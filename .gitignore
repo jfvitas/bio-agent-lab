@@ -18,6 +18,7 @@ build/
 # Tool-specific
 .claude/
 .codex/
+.tools/
 
 # Data directories (keep .gitkeep sentinels)
 data/raw/*
@@ -78,3 +79,7 @@ metadata/
 data/custom_training_sets/
 data/models/
 data/releases/
+
+# WinUI build outputs
+apps/PbdataWinUI/bin/
+apps/PbdataWinUI/obj/

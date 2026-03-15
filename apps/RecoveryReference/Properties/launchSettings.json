@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "RecoveryReference (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "RecoveryReference (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}

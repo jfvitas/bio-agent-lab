@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Page
+    x:Class="PbdataWinUI.Views.InferencePage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel
+            MaxWidth="{StaticResource PageWidth}"
+            Margin="24,20,24,32"
+            Spacing="20">
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="INFERENCE LAB" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Turn the saved model into ranked, explainable predictions" />
+                    <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.InferenceNarrative, Mode=OneWay}" />
+                    <CommandBar DefaultLabelPosition="Right">
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RunInferenceCommand}"
+                            Label="Run inference">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Play" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                    </CommandBar>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="8">
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Scenario" />
+                    <ComboBox
+                        DisplayMemberPath="Label"
+                        ItemsSource="{x:Bind ViewModel.InferenceScenarios, Mode=OneWay}"
+                        SelectedValue="{x:Bind ViewModel.SelectedInferenceScenarioKey, Mode=TwoWay}"
+                        SelectedValuePath="Key" />
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Ranked predictions" />
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.Predictions, Mode=OneWay}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border
+                                    Margin="0,0,0,12"
+                                    Background="{ThemeResource LayerFillColorDefaultBrush}"
+                                    CornerRadius="16"
+                                    Padding="16">
+                                    <StackPanel Spacing="6">
+                                        <TextBlock
+                                            FontSize="18"
+                                            FontWeight="SemiBold"
+                                            Text="{Binding PairLabel}" />
+                                        <StackPanel
+                                            Orientation="Horizontal"
+                                            Spacing="18">
+                                            <TextBlock
+                                                Style="{StaticResource MetricLabelStyle}"
+                                                Text="{Binding Score}" />
+                                            <TextBlock
+                                                Style="{StaticResource MetricLabelStyle}"
+                                                Text="{Binding Confidence}" />
+                                        </StackPanel>
+                                        <TextBlock Style="{StaticResource BodyTextStyle}" Text="{Binding Rationale}" />
+                                        <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding RiskNote}" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

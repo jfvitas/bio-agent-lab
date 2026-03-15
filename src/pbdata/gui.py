@@ -41,6 +41,11 @@ except Exception:  # pragma: no cover - optional GUI dependency
     Image = None
     ImageTk = None
 from pbdata.config import AppConfig, load_config
+from pbdata.demo_model_visuals import architecture_spec_for_selection
+from pbdata.demo_modeling import simulate_model_training_run, simulate_saved_model_inference
+from pbdata.demo_pipeline import simulate_demo_stage
+from pbdata.demo_tutorial import DemoTutorialStep, next_demo_tutorial_step
+from pbdata.demo_workspace import is_demo_workspace_seeded, seed_demo_workspace
 from pbdata.criteria import (
     EXPERIMENTAL_METHODS,
     RESOLUTION_OPTIONS,
@@ -262,7 +267,8 @@ def _load_sources_config() -> tuple[dict[str, bool], dict[str, str], str]:
         src: str((sources.get(src, {}).get("extra", {}) or {}).get(field, "") or "")
         for src, field in _SOURCE_PATH_FIELDS.items()
     }
-    storage_root = str(raw.get("storage_root") or Path.cwd())
+    configured_root = Path(str(raw.get("storage_root") or Path.cwd()))
+    storage_root = str(configured_root if configured_root.exists() else Path.cwd())
     return enabled, paths, storage_root
 
 
@@ -711,6 +717,15 @@ class PbdataGUI:
         self._model_inference_result_var = tk.StringVar(value="No saved-model inference run yet.")
         self._model_selected_run_preview_var = tk.StringVar(value="No selected run preview yet.")
         self._model_chart_preview_status_var = tk.StringVar(value="Chart previews will appear here when a run is selected.")
+        self._model_architecture_title_var = tk.StringVar(value="Auto-Selected Model Path")
+        self._model_architecture_subtitle_var = tk.StringVar(value="Model Studio will infer a suitable path from modality, task, and runtime choices.")
+        self._model_architecture_footer_var = tk.StringVar(value="Use this when you want the app to explain the tradeoffs before committing to a family.")
+        self._model_output_highlights_vars: dict[str, tk.StringVar] = {
+            "headline": tk.StringVar(value="No simulated run yet."),
+            "metric": tk.StringVar(value="--"),
+            "artifacts": tk.StringVar(value="--"),
+            "status": tk.StringVar(value="Run a demo model to populate charts and predictions."),
+        }
         self._model_run_kpi_vars: dict[str, tk.StringVar] = {
             "runs": tk.StringVar(value="0"),
             "curves": tk.StringVar(value="0"),
@@ -752,6 +767,8 @@ class PbdataGUI:
         }
         self._status_labels: dict[str, tk.Label] = {}
         self._action_buttons: list[tk.Widget] = []
+        self._action_targets: dict[str, dict[str, Any]] = {}
+        self._demo_highlighted_target_ids: tuple[str, ...] = tuple()
         self._run_state_var = tk.StringVar(value="Idle")
         self._run_current_stage_var = tk.StringVar(value="No active stage")
         self._run_progress_var = tk.StringVar(value="0 / 0 stages complete")
@@ -765,14 +782,27 @@ class PbdataGUI:
         self._run_active_label = ""
         self._run_current_stage_key: str | None = None
         self._demo_mode_var = tk.BooleanVar(value=False)
+        self._demo_completed_actions: set[str] = set()
+        self._demo_tutorial_vars: dict[str, tk.StringVar] = {
+            "step": tk.StringVar(value="Turn on Demo Mode to start the guided walkthrough."),
+            "detail": tk.StringVar(value="The tutorial will explain what each simulated stage is accomplishing and why it matters."),
+            "innovation": tk.StringVar(value="Guided Demo Mode will highlight controls and produce plausible branch-specific results."),
+            "instruction": tk.StringVar(value="Enable Demo Mode, then follow the highlighted action."),
+            "scroll_hint": tk.StringVar(value=""),
+            "progress": tk.StringVar(value="0 of 7 demo steps completed"),
+        }
         self._compact_overview_var = tk.BooleanVar(value=True)
         self._overview_sections: dict[str, tk.Widget] = {}
         self._overview_deferred_built = False
         self._overview_deferred_host: ttk.Frame | None = None
         self._left_notebook: ttk.Notebook | None = None
+        self._left_panel_host: tk.Frame | None = None
+        self._pipeline_panel_host: tk.Frame | None = None
         self._left_tab_frames: dict[str, ttk.Frame] = {}
         self._left_tab_builders: dict[str, Callable[[ttk.Frame], None]] = {}
         self._left_tabs_built: set[str] = set()
+        self._model_studio_notebook: ttk.Notebook | None = None
+        self._model_studio_pages: dict[str, ttk.Frame] = {}
 
         # --- Data overview labels ---
         self._overview_vars: dict[str, tk.StringVar] = {}
@@ -1021,7 +1051,18 @@ class PbdataGUI:
         self._last_model_profile: DatasetProfile | None = None
         self._last_model_recommendations: list[ModelRecommendation] = []
 
+        for watched_var in (
+            self._custom_set_mode_var,
+            self._custom_set_target_size_var,
+            self._model_family_var,
+            self._model_modality_var,
+            self._model_runtime_target_var,
+            self._model_task_var,
+        ):
+            watched_var.trace_add("write", lambda *_args: (self._update_demo_tutorial(), self._draw_model_architecture_preview()))
+
         self._build_ui()
+        self._update_demo_tutorial()
         self._load_sources_into_ui()
         self._load_criteria_into_ui()
         # Let the window paint before the first overview snapshot runs.
@@ -1029,6 +1070,194 @@ class PbdataGUI:
 
     def _storage_layout(self):
         return build_storage_layout(self._storage_root_var.get().strip() or Path.cwd())
+
+    def _register_action_target(
+        self,
+        action_id: str,
+        widget: tk.Widget,
+        *,
+        tab: str | None = None,
+        subtab: str | None = None,
+        scroll_hint: str = "",
+    ) -> tk.Widget:
+        style_name = ""
+        try:
+            style_name = str(widget.cget("style") or "")
+        except Exception:
+            style_name = ""
+        self._action_targets[action_id] = {
+            "widget": widget,
+            "style": style_name,
+            "tab": tab,
+            "subtab": subtab,
+            "scroll_hint": scroll_hint,
+        }
+        return widget
+
+    def _tutorial_selection_context(self) -> dict[str, str]:
+        return {
+            "custom_set_mode": self._custom_set_mode_var.get().strip(),
+            "custom_set_target_size": self._custom_set_target_size_var.get().strip(),
+            "model_family": self._model_family_var.get().strip(),
+            "model_modality": self._model_modality_var.get().strip(),
+            "model_runtime_target": self._model_runtime_target_var.get().strip(),
+        }
+
+    def _record_demo_action(self, action_id: str) -> None:
+        if not bool(self._demo_mode_var.get()):
+            return
+        self._demo_completed_actions.add(action_id)
+        if action_id.startswith("model.run_local"):
+            self._demo_completed_actions.add("model.run_local")
+        self._update_demo_tutorial()
+
+    def _clear_demo_highlights(self) -> None:
+        for action_id in self._demo_highlighted_target_ids:
+            target = self._action_targets.get(action_id)
+            if not target:
+                continue
+            widget = target.get("widget")
+            original_style = str(target.get("style") or "")
+            try:
+                if original_style:
+                    widget.configure(style=original_style)
+                else:
+                    widget.configure(style="TButton")
+            except Exception:
+                continue
+        self._demo_highlighted_target_ids = tuple()
+
+    def _highlight_demo_targets(self, target_ids: tuple[str, ...]) -> None:
+        self._clear_demo_highlights()
+        highlighted: list[str] = []
+        for action_id in target_ids:
+            target = self._action_targets.get(action_id)
+            if not target:
+                continue
+            widget = target.get("widget")
+            style_name = str(target.get("style") or "")
+            guide_style = "DemoGuide.Accent.TButton" if style_name == "Accent.TButton" else "DemoGuide.TButton"
+            try:
+                widget.configure(style=guide_style)
+                highlighted.append(action_id)
+            except Exception:
+                continue
+        self._demo_highlighted_target_ids = tuple(highlighted)
+
+    def _focus_demo_tutorial_target(self) -> None:
+        if not bool(self._demo_mode_var.get()):
+            return
+        target_ids = self._demo_highlighted_target_ids
+        if not target_ids:
+            return
+        target = self._action_targets.get(target_ids[0], {})
+        widget = target.get("widget")
+        tab = str(target.get("tab") or "")
+        subtab = str(target.get("subtab") or "")
+        if tab and tab in self._left_tab_frames and self._left_notebook is not None:
+            self._left_notebook.select(self._left_tab_frames[tab])
+        if subtab and self._model_studio_notebook is not None and subtab in self._model_studio_pages:
+            self._model_studio_notebook.select(self._model_studio_pages[subtab])
+        try:
+            widget.focus_set()
+        except Exception:
+            pass
+        if tab == "model_studio" and self._left_notebook is not None:
+            self._left_notebook.select(self._left_tab_frames["model_studio"])
+        if subtab and self._model_studio_notebook is not None and subtab in self._model_studio_pages:
+            self._model_studio_notebook.select(self._model_studio_pages[subtab])
+
+    def _update_demo_tutorial(self) -> None:
+        if not bool(self._demo_mode_var.get()):
+            self._clear_demo_highlights()
+            self._demo_tutorial_vars["step"].set("Turn on Demo Mode to start the guided walkthrough.")
+            self._demo_tutorial_vars["detail"].set("The tutorial will explain what each simulated stage is accomplishing and why it matters.")
+            self._demo_tutorial_vars["innovation"].set("Guided Demo Mode will highlight controls and produce plausible branch-specific results.")
+            self._demo_tutorial_vars["instruction"].set("Enable Demo Mode, then follow the highlighted action.")
+            self._demo_tutorial_vars["scroll_hint"].set("")
+            self._demo_tutorial_vars["progress"].set("0 of 7 demo steps completed")
+            return
+        step: DemoTutorialStep = next_demo_tutorial_step(self._tutorial_selection_context(), self._demo_completed_actions)
+        self._demo_tutorial_vars["step"].set(step.title)
+        self._demo_tutorial_vars["detail"].set(step.detail)
+        self._demo_tutorial_vars["innovation"].set(step.innovation)
+        self._demo_tutorial_vars["instruction"].set(step.instruction)
+        self._demo_tutorial_vars["scroll_hint"].set(step.scroll_hint)
+        completed = min(len(self._demo_completed_actions & {
+            "search.preview_rcsb",
+            "pipeline.run_full",
+            "training.build_custom_set",
+            "training.run_workflow",
+            "model.refresh",
+            "model.run_local",
+            "model.compare_runs",
+            "model.inference",
+        }), 7)
+        self._demo_tutorial_vars["progress"].set(f"{completed} of 7 demo steps completed")
+        self._highlight_demo_targets(step.target_ids)
+
+    def _draw_model_architecture_preview(self) -> None:
+        if not hasattr(self, "_model_architecture_canvas"):
+            return
+        spec = architecture_spec_for_selection(
+            self._model_family_var.get().strip() or "auto",
+            self._model_modality_var.get().strip() or "auto",
+            self._model_task_var.get().strip() or "auto",
+        )
+        self._model_architecture_title_var.set(spec.title)
+        self._model_architecture_subtitle_var.set(spec.subtitle)
+        self._model_architecture_footer_var.set(spec.footer)
+        canvas: tk.Canvas = self._model_architecture_canvas
+        canvas.delete("all")
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        bg = "#fffdf7"
+        canvas.create_rectangle(0, 0, width, height, fill=bg, outline="#f1f5f9")
+        boxes = [
+            (24, 48, 170, 118, spec.left_label, "#dbeafe", "#1d4ed8"),
+            (220, 48, 366, 118, spec.center_label, "#fef3c7", "#b45309"),
+            (416, 48, 562, 118, spec.right_label, "#dcfce7", "#15803d"),
+        ]
+        for x1, y1, x2, y2, label, fill, outline in boxes:
+            canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline, width=2)
+            canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=label, width=(x2 - x1 - 18), font=("Segoe UI", 9, "bold"))
+        canvas.create_line(170, 83, 220, 83, arrow=tk.LAST, fill="#64748b", width=2)
+        canvas.create_line(366, 83, 416, 83, arrow=tk.LAST, fill="#64748b", width=2)
+        if spec.family == "hybrid_fusion":
+            canvas.create_oval(110, 18, 146, 42, fill="#c4b5fd", outline="#7c3aed", width=2)
+            canvas.create_text(128, 30, text="Attr", font=("Segoe UI", 8, "bold"))
+            canvas.create_line(128, 42, 260, 48, arrow=tk.LAST, fill="#7c3aed", width=2, smooth=True)
+        elif spec.family == "gnn":
+            canvas.create_oval(62, 22, 82, 42, fill="#bfdbfe", outline="#2563eb")
+            canvas.create_oval(102, 22, 122, 42, fill="#bfdbfe", outline="#2563eb")
+            canvas.create_oval(142, 22, 162, 42, fill="#bfdbfe", outline="#2563eb")
+            canvas.create_line(82, 32, 102, 32, fill="#2563eb", width=2)
+            canvas.create_line(122, 32, 142, 32, fill="#2563eb", width=2)
+        elif spec.family in {"xgboost", "random_forest"}:
+            canvas.create_line(260, 22, 242, 48, fill="#92400e", width=2)
+            canvas.create_line(260, 22, 278, 48, fill="#92400e", width=2)
+            canvas.create_line(260, 22, 260, 48, fill="#92400e", width=2)
+        elif spec.family in {"clustering", "autoencoder"}:
+            canvas.create_oval(248, 18, 272, 42, fill="#fde68a", outline="#d97706")
+            canvas.create_oval(292, 18, 316, 42, fill="#fde68a", outline="#d97706")
+            canvas.create_oval(336, 18, 360, 42, fill="#fde68a", outline="#d97706")
+
+    def _update_model_output_highlights(self, inspection: Any) -> None:
+        metric_name = str(getattr(inspection, "primary_metric_name", None) or "metric").upper()
+        metric_value = getattr(inspection, "primary_metric_value", None)
+        artifact_count = inspection.artifacts.get("artifact_count", "0") if isinstance(getattr(inspection, "artifacts", None), dict) else "0"
+        prediction_count = inspection.artifacts.get("test_prediction_count", "0") if isinstance(getattr(inspection, "artifacts", None), dict) else "0"
+        self._model_output_highlights_vars["headline"].set(
+            f"Latest highlighted run: {inspection.run_name} ({inspection.family})"
+        )
+        self._model_output_highlights_vars["metric"].set(
+            f"{metric_name} = {metric_value if metric_value is not None else '--'}"
+        )
+        self._model_output_highlights_vars["artifacts"].set(
+            f"{artifact_count} artifacts | {prediction_count} saved predictions"
+        )
+        chart_text = "Charts are visible below." if getattr(inspection, "chart_ready", False) or getattr(inspection, "test_plot_ready", False) else "Charts are not available for this run yet."
+        self._model_output_highlights_vars["status"].set(chart_text)
 
     def _set_initial_geometry(self) -> None:
         screen_w = max(int(self._root.winfo_screenwidth()), 1024)
@@ -1096,6 +1325,36 @@ class PbdataGUI:
             background=[("active", "#f3f7fb"), ("pressed", "#e7eef6")],
             foreground=[("active", "#0f172a"), ("pressed", "#0f172a")],
         )
+        style.configure(
+            "DemoGuide.TButton",
+            padding=(10, 8),
+            background="#fde68a",
+            foreground="#7c2d12",
+            bordercolor="#f59e0b",
+            lightcolor="#f59e0b",
+            darkcolor="#f59e0b",
+            font=("Segoe UI Semibold", 9),
+        )
+        style.map(
+            "DemoGuide.TButton",
+            background=[("active", "#fcd34d"), ("pressed", "#f59e0b")],
+            foreground=[("active", "#7c2d12"), ("pressed", "#7c2d12")],
+        )
+        style.configure(
+            "DemoGuide.Accent.TButton",
+            padding=(10, 8),
+            background="#f59e0b",
+            foreground="#ffffff",
+            bordercolor="#d97706",
+            lightcolor="#d97706",
+            darkcolor="#d97706",
+            font=("Segoe UI Semibold", 9),
+        )
+        style.map(
+            "DemoGuide.Accent.TButton",
+            background=[("active", "#d97706"), ("pressed", "#b45309")],
+            foreground=[("active", "#ffffff"), ("pressed", "#ffffff")],
+        )
         style.configure("TEntry", fieldbackground="#ffffff", bordercolor=_CARD_BORDER, lightcolor=_CARD_BORDER, darkcolor=_CARD_BORDER)
         style.configure("TCombobox", fieldbackground="#ffffff", bordercolor=_CARD_BORDER, lightcolor=_CARD_BORDER, darkcolor=_CARD_BORDER)
 
@@ -1104,7 +1363,7 @@ class PbdataGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        self._root.columnconfigure(0, weight=0, minsize=360)
+        self._root.columnconfigure(0, weight=1, minsize=420)
         self._root.columnconfigure(1, weight=1)
         self._root.rowconfigure(1, weight=1)
         self._root.rowconfigure(2, weight=2, minsize=220)
@@ -1113,6 +1372,24 @@ class PbdataGUI:
         self._build_left_panel()
         self._build_pipeline_panel()
         self._build_log_panel()
+
+    def _apply_workspace_focus_layout(self, active_tab: str) -> None:
+        left = self._left_panel_host
+        right = self._pipeline_panel_host
+        if left is None or right is None:
+            return
+        model_focus = active_tab == "model_studio"
+        if model_focus:
+            right.grid_remove()
+            left.grid_configure(row=1, column=0, columnspan=2, sticky="nsew", padx=(10, 10), pady=(10, 4))
+            self._root.columnconfigure(0, weight=1, minsize=720)
+            self._root.columnconfigure(1, weight=0, minsize=0)
+        else:
+            right.grid()
+            left.grid_configure(row=1, column=0, columnspan=1, sticky="nsew", padx=(10, 4), pady=(10, 4))
+            right.grid_configure(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(10, 4))
+            self._root.columnconfigure(0, weight=1, minsize=420)
+            self._root.columnconfigure(1, weight=1, minsize=320)
 
     def _bind_canvas_mousewheel(self, canvas: tk.Canvas, frame: ttk.Frame) -> None:
         def _scroll(event: Any) -> str:
@@ -1299,7 +1576,7 @@ class PbdataGUI:
             right,
             text="Demo Mode",
             variable=self._demo_mode_var,
-            command=self._apply_demo_mode,
+            command=self._on_demo_mode_toggle,
             bg=_HEADER_BG,
             fg=_HEADER_FG,
             activebackground=_HEADER_BG,
@@ -1325,6 +1602,7 @@ class PbdataGUI:
     def _build_left_panel(self) -> None:
         left = tk.Frame(self._root, bg=_APP_BG)
         left.grid(row=1, column=0, sticky="nsew", padx=(10, 4), pady=(10, 4))
+        self._left_panel_host = left
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1)
 
@@ -1350,6 +1628,7 @@ class PbdataGUI:
         self._build_sources_tab(self._left_tab_frames["sources"])
         self._left_tabs_built.add("sources")
         notebook.bind("<<NotebookTabChanged>>", self._on_left_tab_changed, add="+")
+        self._apply_workspace_focus_layout("sources")
 
     def _on_left_tab_changed(self, _event: tk.Event) -> None:
         notebook = self._left_notebook
@@ -1359,15 +1638,19 @@ class PbdataGUI:
         if not current:
             return
         current_widget = str(notebook.nametowidget(current))
+        active_key = "sources"
         for key, frame in self._left_tab_frames.items():
+            if str(frame) == current_widget:
+                active_key = key
             if str(frame) != current_widget or key in self._left_tabs_built:
                 continue
             builder = self._left_tab_builders.get(key)
             if builder is None:
-                return
+                break
             builder(frame)
             self._left_tabs_built.add(key)
-            return
+            break
+        self._apply_workspace_focus_layout(active_key)
 
     # --- Tab 1: Data Sources ---
 
@@ -1784,10 +2067,17 @@ class PbdataGUI:
             command=self._save_criteria,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
-        ttk.Button(
+        preview_btn = ttk.Button(
             actions, text="Preview RCSB Search",
             command=self._preview_rcsb_search,
-        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        )
+        preview_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._register_action_target(
+            "search.preview_rcsb",
+            preview_btn,
+            tab="search",
+            scroll_hint="Scroll to the bottom of the Search Criteria tab.",
+        )
         row += 1
 
         ttk.Separator(frame, orient="horizontal").grid(
@@ -2317,7 +2607,9 @@ class PbdataGUI:
         if self._model_runtime_target_var.get() not in runtime.supported_targets:
             self._model_runtime_target_var.set(runtime.supported_targets[0] if runtime.supported_targets else "local_cpu")
 
-    def _refresh_model_studio(self) -> None:
+    def _refresh_model_studio(self, *, record_demo: bool = True) -> None:
+        if record_demo:
+            self._record_demo_action("model.refresh")
         self._refresh_model_runtime()
         profile = build_dataset_profile(
             self._storage_layout(),
@@ -2421,6 +2713,7 @@ class PbdataGUI:
             self._model_export_status_var.set("Refresh Model Studio before launching a local run.")
             return
         target = self._model_runtime_target_var.get().strip() or "local_cpu"
+        self._record_demo_action("model.run_local")
         if target not in {"local_cpu", "local_gpu"}:
             self._model_export_status_var.set("Local execution is available for local_cpu or local_gpu targets. Use Export Training Package for cluster/Kaggle/Colab.")
             return
@@ -2429,17 +2722,34 @@ class PbdataGUI:
             self._last_model_recommendations[recommendation_index],
             self._model_studio_selection(),
         )
+        starter.config.setdefault("compute_budget", self._model_compute_budget_var.get().strip() or "balanced")
+        starter.config.setdefault("interpretability", self._model_interpretability_var.get().strip() or "balanced")
+        starter.config.setdefault("modality", self._model_modality_var.get().strip() or "auto")
         self._model_config_preview_var.set(json.dumps(starter.config, indent=2))
         self._model_export_status_var.set(f"Launching local training run for {starter.label}...")
         self._log_line(f"Model Studio launching local {target} training run for {starter.model_id}")
 
         def _worker() -> None:
             try:
-                result = execute_training_run(
-                    self._storage_layout(),
-                    starter_config=starter.config,
-                    runtime_target=target,
-                )
+                if bool(self._demo_mode_var.get()):
+                    layout = self._storage_layout()
+                    try:
+                        cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+                    except Exception:
+                        cfg = AppConfig(storage_root=str(layout.root))
+                    result = simulate_model_training_run(
+                        layout,
+                        cfg,
+                        starter_config=starter.config,
+                        runtime_target=target,
+                        repo_root=Path.cwd(),
+                    )
+                else:
+                    result = execute_training_run(
+                        self._storage_layout(),
+                        starter_config=starter.config,
+                        runtime_target=target,
+                    )
             except Exception as exc:
                 def _fail() -> None:
                     self._model_export_status_var.set(f"Local training failed: {exc}")
@@ -2449,7 +2759,10 @@ class PbdataGUI:
 
             def _finish() -> None:
                 warning_text = f" Warnings: {' | '.join(result.warnings)}" if result.warnings else ""
-                self._model_export_status_var.set(f"{result.summary} Artifacts: {result.run_dir}{warning_text}")
+                self._model_export_status_var.set(
+                    f"{result.summary} Artifacts: {result.run_dir}{warning_text} "
+                    "Charts and saved-run details are shown in Latest Run Outputs below."
+                )
                 self._model_import_path_var.set(str(result.run_dir))
                 self._model_config_preview_var.set(json.dumps({
                     "run_name": result.run_name,
@@ -2461,7 +2774,9 @@ class PbdataGUI:
                 }, indent=2))
                 self._log_line(f"Model Studio local training finished: {result.run_dir}")
                 self._refresh_selected_model_run(result.run_dir)
-                self._compare_model_runs()
+                self._compare_model_runs(record_demo=False)
+                if self._left_notebook is not None and "model_studio" in self._left_tab_frames:
+                    self._left_notebook.select(self._left_tab_frames["model_studio"])
             self._root.after(0, _finish)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -2487,9 +2802,11 @@ class PbdataGUI:
         }, indent=2))
         self._log_line(f"Model Studio imported completed run: {imported_dir}")
         self._refresh_selected_model_run(imported_dir)
-        self._compare_model_runs()
+        self._compare_model_runs(record_demo=False)
 
-    def _compare_model_runs(self) -> None:
+    def _compare_model_runs(self, *, record_demo: bool = True) -> None:
+        if record_demo:
+            self._record_demo_action("model.compare_runs")
         comparisons = compare_training_runs(self._storage_layout())
         if not comparisons:
             self._model_run_comparison_var.set("No saved or imported runs are available yet.")
@@ -2588,12 +2905,27 @@ class PbdataGUI:
         if not pdb_id:
             self._model_inference_result_var.set("Enter a PDB ID to run saved-model inference.")
             return
+        self._record_demo_action("model.inference")
         try:
-            result = run_saved_model_inference(
-                self._storage_layout(),
-                run_dir=run_dir,
-                pdb_id=pdb_id,
-            )
+            if bool(self._demo_mode_var.get()):
+                layout = self._storage_layout()
+                try:
+                    cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+                except Exception:
+                    cfg = AppConfig(storage_root=str(layout.root))
+                result = simulate_saved_model_inference(
+                    layout,
+                    cfg,
+                    run_dir=run_dir,
+                    pdb_id=pdb_id,
+                    repo_root=Path.cwd(),
+                )
+            else:
+                result = run_saved_model_inference(
+                    self._storage_layout(),
+                    run_dir=run_dir,
+                    pdb_id=pdb_id,
+                )
         except Exception as exc:
             self._model_inference_result_var.set(f"Inference failed: {exc}")
             self._log_line(f"Model Studio saved-model inference failed: {exc}")
@@ -2632,6 +2964,7 @@ class PbdataGUI:
             f"artifacts={artifact_count} | test predictions={prediction_count}"
         )
         self._model_selected_run_preview_var.set(self._format_selected_run_preview(inspection))
+        self._update_model_output_highlights(inspection)
         self._update_model_chart_previews(
             training_curve=str(inspection.artifacts.get("training_curve") or ""),
             test_performance=str(inspection.artifacts.get("test_performance") or ""),
@@ -2653,7 +2986,7 @@ class PbdataGUI:
         try:
             png_bytes = cairosvg.svg2png(url=str(path))
             image = Image.open(io.BytesIO(png_bytes))
-            image.thumbnail((360, 220))
+            image.thumbnail((520, 300))
             photo = ImageTk.PhotoImage(image)
         except Exception as exc:
             self._log_line(f"Model Studio chart preview failed for {path.name}: {exc}")
@@ -2776,11 +3109,13 @@ class PbdataGUI:
             text="Model Studio",
             font=("Helvetica", 10, "bold"),
         ).grid(row=row, column=0, sticky="w", pady=(0, 4))
-        ttk.Button(
+        model_refresh_header_btn = ttk.Button(
             frame,
             text="Refresh Recommendations",
             command=self._refresh_model_studio,
-        ).grid(row=row, column=1, sticky="e")
+        )
+        model_refresh_header_btn.grid(row=row, column=1, sticky="e")
+        self._register_action_target("model.refresh", model_refresh_header_btn, tab="model_studio")
         row += 1
 
         ttk.Label(
@@ -2789,6 +3124,41 @@ class PbdataGUI:
             font=("Helvetica", 7),
             foreground="#888888",
         ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        demo_control = ttk.LabelFrame(frame, text="Demo Control Center", padding=8, style="Section.TLabelframe")
+        demo_control.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        demo_control.columnconfigure(1, weight=1)
+        for info_row, (label, key) in enumerate([
+            ("Next guided step:", "step"),
+            ("What this demonstrates:", "detail"),
+            ("Why this is innovative:", "innovation"),
+            ("What to click now:", "instruction"),
+            ("How to find it:", "scroll_hint"),
+        ]):
+            ttk.Label(demo_control, text=label, font=("Segoe UI Semibold", 8)).grid(row=info_row, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(demo_control, textvariable=self._demo_tutorial_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=info_row, column=1, sticky="w", pady=1)
+        demo_action_row = ttk.Frame(demo_control)
+        demo_action_row.grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        ttk.Button(demo_action_row, text="Focus Next Demo Control", command=self._focus_demo_tutorial_target, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
+        ttk.Label(demo_action_row, textvariable=self._demo_tutorial_vars["progress"], style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        row += 1
+
+        start_here = ttk.LabelFrame(frame, text="Start Here In Demo Mode", padding=8, style="Section.TLabelframe")
+        start_here.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        start_here.columnconfigure(0, weight=1)
+        ttk.Label(
+            start_here,
+            text=(
+                "1. Click the highlighted control.\n"
+                "2. Watch the live log and overview update.\n"
+                "3. Come back here for the next guided step.\n"
+                "4. In Model Studio, train a model and review the charts that appear below."
+            ),
+            justify="left",
+            wraplength=860,
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=0, sticky="w")
         row += 1
 
         controls = ttk.LabelFrame(frame, text="Model Design Inputs", padding=8, style="Section.TLabelframe")
@@ -2808,17 +3178,29 @@ class PbdataGUI:
             grid_row = idx // 2
             grid_col = (idx % 2) * 2
             ttk.Label(controls, text=label).grid(row=grid_row, column=grid_col, sticky="w", pady=2)
-            ttk.Combobox(
+            combo = ttk.Combobox(
                 controls,
                 textvariable=var,
                 values=options,
                 state="readonly",
                 width=24,
-            ).grid(row=grid_row, column=grid_col + 1, sticky="ew", padx=(6, 12), pady=2)
+            )
+            combo.grid(row=grid_row, column=grid_col + 1, sticky="ew", padx=(6, 12), pady=2)
+        row += 1
+
+        architecture_frame = ttk.LabelFrame(frame, text="Architecture Preview", padding=8, style="Section.TLabelframe")
+        architecture_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        architecture_frame.columnconfigure(0, weight=1)
+        ttk.Label(architecture_frame, textvariable=self._model_architecture_title_var, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w")
+        ttk.Label(architecture_frame, textvariable=self._model_architecture_subtitle_var, wraplength=820, justify="left", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
+        architecture_canvas = tk.Canvas(architecture_frame, width=586, height=138, bg="#fffdf7", highlightthickness=0)
+        architecture_canvas.grid(row=2, column=0, sticky="ew")
+        self._model_architecture_canvas = architecture_canvas
+        ttk.Label(architecture_frame, textvariable=self._model_architecture_footer_var, wraplength=820, justify="left", font=("Segoe UI", 8)).grid(row=3, column=0, sticky="w", pady=(6, 0))
         row += 1
 
         profile_frame = ttk.LabelFrame(frame, text="Workspace Profile", padding=8, style="Section.TLabelframe")
-        profile_frame.grid(row=row, column=0, sticky="nsew", pady=(8, 0), padx=(0, 4))
+        profile_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         profile_frame.columnconfigure(1, weight=1)
         for info_row, (label, var) in enumerate([
             ("Runtime:", self._model_runtime_summary_var),
@@ -2873,9 +3255,11 @@ class PbdataGUI:
                 wraplength=140,
                 justify="left",
             ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        row += 1
+
         run_insights = ttk.LabelFrame(frame, text="Run Insights", padding=8, style="Section.TLabelframe")
-        run_insights.grid(row=row, column=1, sticky="nsew", pady=(8, 0), padx=(4, 0))
-        for index in range(5):
+        run_insights.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        for index in range(3):
             run_insights.columnconfigure(index, weight=1)
         for index, (key, label) in enumerate([
             ("runs", "Tracked runs"),
@@ -2885,7 +3269,7 @@ class PbdataGUI:
             ("best", "Best run"),
         ]):
             card = ttk.Frame(run_insights, style="Card.TFrame", padding=8)
-            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            card.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0 if index % 3 == 0 else 4, 0), pady=(0 if index < 3 else 4, 0))
             ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 card,
@@ -2895,23 +3279,23 @@ class PbdataGUI:
                 justify="left",
             ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         artifact_frame = ttk.Frame(run_insights)
-        artifact_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
-        for index in range(5):
+        artifact_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        for index in range(3):
             artifact_frame.columnconfigure(index, weight=1)
         for index, (key, label) in enumerate([
-            ("run_dir", "Open Run Dir"),
-            ("training_curve", "Open Curve"),
-            ("test_performance", "Open Test Plot"),
-            ("metrics", "Open Metrics"),
-            ("test_predictions", "Open Predictions"),
+            ("run_dir", "Run Folder"),
+            ("training_curve", "Curve"),
+            ("test_performance", "Test Plot"),
+            ("metrics", "Metrics"),
+            ("test_predictions", "Predictions"),
         ]):
             ttk.Button(
                 artifact_frame,
                 text=label,
                 command=lambda artifact_key=key: self._open_model_artifact(artifact_key),
-            ).grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ).grid(row=index // 3, column=index % 3, sticky="ew", padx=(0 if index % 3 == 0 else 4, 0), pady=(0 if index < 3 else 4, 0))
         selected_run_frame = ttk.Frame(run_insights)
-        selected_run_frame.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        selected_run_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         selected_run_frame.columnconfigure(1, weight=1)
         ttk.Label(selected_run_frame, text="Selected run:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         selected_run_combo = ttk.Combobox(
@@ -2934,19 +3318,18 @@ class PbdataGUI:
             wraplength=760,
             justify="left",
             font=("Segoe UI", 8),
-        ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
         recent_runs_frame = ttk.Frame(run_insights)
-        recent_runs_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 0))
-        for index in range(3):
-            recent_runs_frame.columnconfigure(index, weight=1)
+        recent_runs_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        recent_runs_frame.columnconfigure(0, weight=1)
         for index, vars_for_run in enumerate(self._model_recent_run_vars):
             card = ttk.Frame(recent_runs_frame, style="Card.TFrame", padding=8)
-            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            card.grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 4, 0))
             ttk.Label(card, textvariable=vars_for_run["title"], style="Muted.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 card,
                 textvariable=vars_for_run["detail"],
-                wraplength=220,
+                wraplength=720,
                 justify="left",
                 font=("Segoe UI", 8),
             ).grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -2965,57 +3348,81 @@ class PbdataGUI:
                     font=("Segoe UI", 8),
                 ).grid(row=card_row, column=0, sticky="w", pady=1)
             actions = ttk.Frame(card)
-            actions.grid(row=5, column=0, sticky="e", pady=(6, 0))
+            actions.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+            for action_col in range(3):
+                actions.columnconfigure(action_col, weight=1)
             ttk.Button(
                 actions,
-                text="Export Starter Config",
+                text="Config",
                 command=lambda idx=index: self._export_model_starter_config(idx),
-            ).pack(side="right")
+            ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
             ttk.Button(
                 actions,
-                text="Export Training Package",
+                text="Package",
                 command=lambda idx=index: self._export_model_training_package(idx),
-            ).pack(side="right", padx=(0, 6))
-            ttk.Button(
+            ).grid(row=0, column=1, sticky="ew", padx=4)
+            run_locally_btn = ttk.Button(
                 actions,
-                text="Run Locally",
+                text="Train",
                 command=lambda idx=index: self._run_model_training(idx),
-            ).pack(side="right", padx=(0, 6))
+            )
+            run_locally_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+            if index == 0:
+                self._register_action_target(
+                    "model.run_local.primary",
+                    run_locally_btn,
+                    tab="model_studio",
+                    scroll_hint="Scroll to the first recommendation card in Model Studio.",
+                )
             row += 1
 
-        preview_frame = ttk.LabelFrame(frame, text="Selected Config And Run Snapshot", padding=8, style="Section.TLabelframe")
+        preview_frame = ttk.LabelFrame(frame, text="Latest Run Outputs", padding=8, style="Section.TLabelframe")
         preview_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         preview_frame.columnconfigure(0, weight=1)
+        highlights = ttk.Frame(preview_frame, style="Card.TFrame", padding=8)
+        highlights.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for index in range(4):
+            highlights.columnconfigure(index, weight=1)
+        for index, (label, key) in enumerate([
+            ("Run highlight", "headline"),
+            ("Primary metric", "metric"),
+            ("Artifacts", "artifacts"),
+            ("Output status", "status"),
+        ]):
+            card = ttk.Frame(highlights, style="AltCard.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._model_output_highlights_vars[key], wraplength=220, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=(3, 0))
         ttk.Label(
             preview_frame,
             textvariable=self._model_export_status_var,
             wraplength=760,
             justify="left",
             font=("Segoe UI", 8),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ).grid(row=1, column=0, sticky="w", pady=(0, 4))
         ttk.Label(
             preview_frame,
             textvariable=self._model_config_preview_var,
             wraplength=760,
             justify="left",
             font=("Cascadia Code", 8),
-        ).grid(row=1, column=0, sticky="w")
+        ).grid(row=2, column=0, sticky="w")
         ttk.Label(
             preview_frame,
             textvariable=self._model_selected_run_preview_var,
             wraplength=760,
             justify="left",
             font=("Segoe UI", 8),
-        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
         ttk.Label(
             preview_frame,
             textvariable=self._model_chart_preview_status_var,
             wraplength=760,
             justify="left",
             font=("Segoe UI", 8),
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
         chart_preview_frame = ttk.Frame(preview_frame)
-        chart_preview_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        chart_preview_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         chart_preview_frame.columnconfigure(0, weight=1)
         chart_preview_frame.columnconfigure(1, weight=1)
         training_chart = ttk.Label(chart_preview_frame, text="Training curve preview unavailable", justify="center")
@@ -3025,49 +3432,318 @@ class PbdataGUI:
         self._model_chart_training_label = training_chart
         self._model_chart_test_label = test_chart
         action_row = ttk.Frame(preview_frame)
-        action_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        action_row.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=1)
-        action_row.columnconfigure(2, weight=1)
         ttk.Button(
             action_row,
-            text="Import Completed Run",
+            text="Import Run",
             command=self._import_model_training_run,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(
+        compare_runs_btn = ttk.Button(
             action_row,
-            text="Compare Saved Runs",
+            text="Compare",
             command=self._compare_model_runs,
-        ).grid(row=0, column=1, sticky="ew", padx=4)
+        )
+        compare_runs_btn.grid(row=0, column=1, sticky="ew", padx=4)
+        self._register_action_target("model.compare_runs", compare_runs_btn, tab="model_studio")
         ttk.Button(
             action_row,
-            text="Refresh Recommendations",
+            text="Refresh",
             command=self._refresh_model_studio,
-        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         inference_controls = ttk.Frame(preview_frame)
-        inference_controls.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        inference_controls.grid(row=7, column=0, sticky="ew", pady=(8, 0))
         inference_controls.columnconfigure(1, weight=1)
-        ttk.Label(inference_controls, text="PDB ID for saved-model inference:").grid(row=0, column=0, sticky="w")
+        ttk.Label(inference_controls, text="Saved-model PDB ID:").grid(row=0, column=0, sticky="w")
         ttk.Entry(inference_controls, textvariable=self._model_inference_pdb_var, width=16).grid(row=0, column=1, sticky="ew", padx=(6, 6))
-        ttk.Button(
+        inference_btn = ttk.Button(
             inference_controls,
-            text="Run Saved-Model Inference",
+            text="Infer",
             command=self._run_saved_model_inference,
-        ).grid(row=0, column=2, sticky="e")
+        )
+        inference_btn.grid(row=0, column=2, sticky="e")
+        self._register_action_target(
+            "model.saved_inference",
+            inference_btn,
+            tab="model_studio",
+            scroll_hint="Look in the lower inference controls section of Model Studio.",
+        )
         row += 1
 
         ttk.Button(
             frame,
-            text="Refresh Recommendations",
+            text="Refresh Model Studio",
             command=self._refresh_model_studio,
             style="Accent.TButton",
         ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self._refresh_model_studio()
+        self._draw_model_architecture_preview()
+        self._refresh_model_studio(record_demo=False)
+        self._bind_canvas_mousewheel(canvas, frame)
+
+    def _build_model_studio_tab(self, outer: ttk.Frame) -> None:
+        canvas, _scrollbar, frame = self._make_scrollable_pane(outer)
+        frame.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Model Studio", font=("Helvetica", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="A staged workspace for designing a model, understanding the recommendation, and reviewing experiment outputs.",
+            font=("Segoe UI", 8),
+            foreground="#64748b",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        refresh_btn = ttk.Button(header, text="Refresh Studio", command=self._refresh_model_studio)
+        refresh_btn.grid(row=0, column=1, rowspan=2, sticky="e")
+        self._register_action_target("model.refresh", refresh_btn, tab="model_studio", subtab="guide")
+
+        hero = ttk.Frame(frame, style="Card.TFrame", padding=10)
+        hero.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for index in range(3):
+            hero.columnconfigure(index, weight=1)
+        for index, (title, text) in enumerate([
+            ("Guide", "Start with the guided next step so Demo Mode tells you exactly what to click."),
+            ("Design", "Choose modality, task, family, budget, and runtime in one clean place."),
+            ("Runs", "Train, compare, and inspect charts in a dedicated outputs view."),
+        ]):
+            card = ttk.Frame(hero, style="AltCard.TFrame", padding=8)
+            card.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 6, 0))
+            ttk.Label(card, text=title, font=("Segoe UI Semibold", 9)).grid(row=0, column=0, sticky="w")
+            ttk.Label(card, text=text, wraplength=240, justify="left", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        studio_nav = ttk.Notebook(frame)
+        studio_nav.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self._model_studio_notebook = studio_nav
+        self._model_studio_pages = {}
+        for key, label in [
+            ("guide", " Guide "),
+            ("design", " Design "),
+            ("recommendations", " Recommendations "),
+            ("runs", " Runs "),
+        ]:
+            page = ttk.Frame(studio_nav, padding=10)
+            page.columnconfigure(0, weight=1)
+            self._model_studio_pages[key] = page
+            studio_nav.add(page, text=label)
+
+        guide = self._model_studio_pages["guide"]
+        demo_control = ttk.LabelFrame(guide, text="Demo Control Center", padding=8, style="Section.TLabelframe")
+        demo_control.grid(row=0, column=0, sticky="ew")
+        demo_control.columnconfigure(1, weight=1)
+        for info_row, (label, key) in enumerate([
+            ("Next step:", "step"),
+            ("What it demonstrates:", "detail"),
+            ("Why it matters:", "innovation"),
+            ("Click now:", "instruction"),
+            ("Find it here:", "scroll_hint"),
+        ]):
+            ttk.Label(demo_control, text=label, font=("Segoe UI Semibold", 8)).grid(row=info_row, column=0, sticky="nw", padx=(0, 8), pady=2)
+            ttk.Label(demo_control, textvariable=self._demo_tutorial_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=info_row, column=1, sticky="w", pady=2)
+        guide_side = ttk.Frame(demo_control)
+        guide_side.grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        ttk.Button(guide_side, text="Focus Next Control", command=self._focus_demo_tutorial_target, style="Accent.TButton").grid(row=0, column=0, sticky="ew")
+        ttk.Label(guide_side, textvariable=self._demo_tutorial_vars["progress"], style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        start_here = ttk.LabelFrame(guide, text="Start Here", padding=8, style="Section.TLabelframe")
+        start_here.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(
+            start_here,
+            text=(
+                "1. Follow the highlighted control.\n"
+                "2. Watch the live log and the overview change.\n"
+                "3. Move to Design to pick a model path.\n"
+                "4. Move to Runs to inspect the training outputs and charts."
+            ),
+            wraplength=860,
+            justify="left",
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=0, sticky="w")
+        workspace = ttk.LabelFrame(guide, text="Workspace Snapshot", padding=8, style="Section.TLabelframe")
+        workspace.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        workspace.columnconfigure(1, weight=1)
+        for info_row, (label, var) in enumerate([
+            ("Summary:", self._model_profile_summary_var),
+            ("Detail:", self._model_profile_detail_var),
+            ("Compatibility:", self._model_warnings_var),
+            ("Next action:", self._model_next_action_var),
+        ]):
+            ttk.Label(workspace, text=label, font=("Segoe UI Semibold", 8)).grid(row=info_row, column=0, sticky="nw", padx=(0, 8), pady=2)
+            ttk.Label(workspace, textvariable=var, wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=info_row, column=1, sticky="w", pady=2)
+        workspace_cards = ttk.Frame(workspace)
+        workspace_cards.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for index in range(3):
+            workspace_cards.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("examples", "Examples"),
+            ("train", "Train"),
+            ("val", "Val"),
+            ("test", "Test"),
+            ("modalities", "Modalities"),
+            ("tasks", "Tasks"),
+        ]):
+            card = ttk.Frame(workspace_cards, style="Card.TFrame", padding=8)
+            card.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0 if index % 3 == 0 else 6, 0), pady=(0 if index < 3 else 6, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._model_profile_kpi_vars[key], font=("Segoe UI Semibold", 11), wraplength=220, justify="left").grid(row=1, column=0, sticky="w", pady=(3, 0))
+
+        design = self._model_studio_pages["design"]
+        controls = ttk.LabelFrame(design, text="Model Design Inputs", padding=8, style="Section.TLabelframe")
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(1, weight=1)
+        for row, (label, var, options) in enumerate([
+            ("Dataset source", self._model_dataset_source_var, ["auto", "training_examples", "engineered_dataset", "custom_training_set"]),
+            ("Modality", self._model_modality_var, ["auto", "attributes", "graphs", "graphs+attributes", "unsupervised"]),
+            ("Task", self._model_task_var, ["auto", "regression", "classification", "ranking", "unsupervised"]),
+            ("Preferred family", self._model_family_var, ["auto", "random_forest", "xgboost", "dense_nn", "gnn", "hybrid_fusion", "cnn", "unet", "autoencoder", "clustering"]),
+            ("Compute budget", self._model_compute_budget_var, ["low", "balanced", "high"]),
+            ("Interpretability", self._model_interpretability_var, ["high", "balanced", "low"]),
+            ("Runtime target", self._model_runtime_target_var, ["local_cpu", "local_gpu", "cluster", "kaggle", "colab"]),
+        ]):
+            ttk.Label(controls, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 8))
+            ttk.Combobox(controls, textvariable=var, values=options, state="readonly", width=28).grid(row=row, column=1, sticky="ew", pady=4)
+        architecture = ttk.LabelFrame(design, text="Architecture Preview", padding=8, style="Section.TLabelframe")
+        architecture.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        architecture.columnconfigure(0, weight=1)
+        ttk.Label(architecture, textvariable=self._model_architecture_title_var, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w")
+        ttk.Label(architecture, textvariable=self._model_architecture_subtitle_var, wraplength=860, justify="left", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 6))
+        architecture_canvas = tk.Canvas(architecture, width=760, height=150, bg="#fffdf7", highlightthickness=0)
+        architecture_canvas.grid(row=2, column=0, sticky="ew")
+        self._model_architecture_canvas = architecture_canvas
+        ttk.Label(architecture, textvariable=self._model_architecture_footer_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        summary = ttk.LabelFrame(design, text="Current Studio Summary", padding=8, style="Section.TLabelframe")
+        summary.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        summary.columnconfigure(1, weight=1)
+        for info_row, (label, var) in enumerate([
+            ("Runtime:", self._model_runtime_summary_var),
+            ("Compatibility:", self._model_warnings_var),
+            ("Next action:", self._model_next_action_var),
+        ]):
+            ttk.Label(summary, text=label, font=("Segoe UI Semibold", 8)).grid(row=info_row, column=0, sticky="nw", padx=(0, 8), pady=2)
+            ttk.Label(summary, textvariable=var, wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=info_row, column=1, sticky="w", pady=2)
+
+        recommendations = self._model_studio_pages["recommendations"]
+        ttk.Label(
+            recommendations,
+            text="These cards explain the current best-fit model paths. Start with the first one unless you want to demonstrate a specific tradeoff.",
+            wraplength=860,
+            justify="left",
+            style="Muted.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        for index, vars_for_card in enumerate(self._model_recommendation_vars):
+            card = ttk.LabelFrame(recommendations, textvariable=vars_for_card["title"], padding=8, style="Section.TLabelframe")
+            card.grid(row=index + 1, column=0, sticky="ew", pady=(10 if index == 0 else 8, 0))
+            card.columnconfigure(0, weight=1)
+            ttk.Label(card, textvariable=vars_for_card["summary"], wraplength=860, justify="left", font=("Segoe UI Semibold", 9)).grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=vars_for_card["why"], wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=(4, 0))
+            detail = ttk.Frame(card)
+            detail.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+            detail.columnconfigure(0, weight=1)
+            detail.columnconfigure(1, weight=1)
+            ttk.Label(detail, textvariable=vars_for_card["strengths"], wraplength=420, justify="left", font=("Segoe UI", 8)).grid(row=0, column=0, sticky="nw", padx=(0, 8))
+            ttk.Label(detail, textvariable=vars_for_card["drawbacks"], wraplength=420, justify="left", font=("Segoe UI", 8)).grid(row=0, column=1, sticky="nw")
+            ttk.Label(card, textvariable=vars_for_card["recipe"], wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=3, column=0, sticky="w", pady=(6, 0))
+            actions = ttk.Frame(card)
+            actions.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+            for action_col in range(3):
+                actions.columnconfigure(action_col, weight=1)
+            ttk.Button(actions, text="Config", command=lambda idx=index: self._export_model_starter_config(idx)).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            ttk.Button(actions, text="Package", command=lambda idx=index: self._export_model_training_package(idx)).grid(row=0, column=1, sticky="ew", padx=4)
+            train_btn = ttk.Button(actions, text="Train", command=lambda idx=index: self._run_model_training(idx))
+            train_btn.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+            if index == 0:
+                self._register_action_target("model.run_local.primary", train_btn, tab="model_studio", subtab="recommendations", scroll_hint="Open Recommendations and use the first Train button.")
+
+        runs = self._model_studio_pages["runs"]
+        insights = ttk.LabelFrame(runs, text="Run Insights", padding=8, style="Section.TLabelframe")
+        insights.grid(row=0, column=0, sticky="ew")
+        for index in range(3):
+            insights.columnconfigure(index, weight=1)
+        for index, (key, label) in enumerate([
+            ("runs", "Tracked runs"),
+            ("curves", "Curves"),
+            ("plots", "Test plots"),
+            ("native", "Native graph"),
+            ("best", "Best run"),
+        ]):
+            card = ttk.Frame(insights, style="Card.TFrame", padding=8)
+            card.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0 if index % 3 == 0 else 6, 0), pady=(0 if index < 3 else 6, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._model_run_kpi_vars[key], font=("Segoe UI Semibold", 11), wraplength=220, justify="left").grid(row=1, column=0, sticky="w", pady=(3, 0))
+        run_actions = ttk.LabelFrame(runs, text="Run Actions", padding=8, style="Section.TLabelframe")
+        run_actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        for index in range(3):
+            run_actions.columnconfigure(index, weight=1)
+        ttk.Button(run_actions, text="Import Run", command=self._import_model_training_run).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        compare_runs_btn = ttk.Button(run_actions, text="Compare Experiments", command=self._compare_model_runs)
+        compare_runs_btn.grid(row=0, column=1, sticky="ew", padx=4)
+        self._register_action_target("model.compare_runs", compare_runs_btn, tab="model_studio", subtab="runs")
+        ttk.Button(run_actions, text="Refresh Studio", command=self._refresh_model_studio).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        selected = ttk.LabelFrame(runs, text="Selected Run", padding=8, style="Section.TLabelframe")
+        selected.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        selected.columnconfigure(1, weight=1)
+        ttk.Label(selected, text="Saved run:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        selected_combo = ttk.Combobox(selected, textvariable=self._model_selected_run_var, values=(), state="readonly", width=48)
+        selected_combo.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        self._model_selected_run_combo = selected_combo
+        ttk.Button(selected, text="Load", command=self._load_selected_model_run).grid(row=0, column=2, sticky="e")
+        ttk.Label(selected, textvariable=self._model_run_detail_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        outputs = ttk.LabelFrame(runs, text="Latest Run Outputs", padding=8, style="Section.TLabelframe")
+        outputs.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        outputs.columnconfigure(0, weight=1)
+        highlight_host = ttk.Frame(outputs, style="Card.TFrame", padding=8)
+        highlight_host.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for index in range(2):
+            highlight_host.columnconfigure(index, weight=1)
+        for index, (label, key) in enumerate([
+            ("Run highlight", "headline"),
+            ("Primary metric", "metric"),
+            ("Artifacts", "artifacts"),
+            ("Output status", "status"),
+        ]):
+            card = ttk.Frame(highlight_host, style="AltCard.TFrame", padding=8)
+            card.grid(row=index // 2, column=index % 2, sticky="ew", padx=(0 if index % 2 == 0 else 6, 0), pady=(0 if index < 2 else 6, 0))
+            ttk.Label(card, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=self._model_output_highlights_vars[key], wraplength=380, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(outputs, textvariable=self._model_export_status_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w")
+        ttk.Label(outputs, textvariable=self._model_selected_run_preview_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(outputs, textvariable=self._model_chart_preview_status_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        chart_frame = ttk.Frame(outputs)
+        chart_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.columnconfigure(1, weight=1)
+        training_chart = ttk.Label(chart_frame, text="Training curve preview unavailable", justify="center")
+        training_chart.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        test_chart = ttk.Label(chart_frame, text="Test plot preview unavailable", justify="center")
+        test_chart.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self._model_chart_training_label = training_chart
+        self._model_chart_test_label = test_chart
+        artifact_actions = ttk.Frame(outputs)
+        artifact_actions.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        for index in range(3):
+            artifact_actions.columnconfigure(index, weight=1)
+        ttk.Button(artifact_actions, text="Run Folder", command=lambda: self._open_model_artifact("run_dir")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(artifact_actions, text="Metrics", command=lambda: self._open_model_artifact("metrics")).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(artifact_actions, text="Predictions", command=lambda: self._open_model_artifact("test_predictions")).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        inference = ttk.LabelFrame(runs, text="Saved-Model Inference", padding=8, style="Section.TLabelframe")
+        inference.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        inference.columnconfigure(1, weight=1)
+        ttk.Label(inference, text="PDB ID:", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(inference, textvariable=self._model_inference_pdb_var, width=18).grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        inference_btn = ttk.Button(inference, text="Run Inference", command=self._run_saved_model_inference)
+        inference_btn.grid(row=0, column=2, sticky="e")
+        self._register_action_target("model.saved_inference", inference_btn, tab="model_studio", subtab="runs", scroll_hint="Open Runs and use Run Inference.")
+        ttk.Label(inference, textvariable=self._model_inference_result_var, wraplength=860, justify="left", font=("Segoe UI", 8)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        self._model_studio_notebook.select(self._model_studio_pages["guide"])
+        self._draw_model_architecture_preview()
+        self._refresh_model_studio(record_demo=False)
         self._bind_canvas_mousewheel(canvas, frame)
 
     def _build_pipeline_panel(self) -> None:
         right = tk.Frame(self._root, bg=_APP_BG)
         right.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(10, 4))
+        self._pipeline_panel_host = right
         canvas, _scrollbar, outer = self._make_scrollable_pane(right)
         self._pipeline_scroll_canvas = canvas
         self._pipeline_scroll_frame = outer
@@ -3153,6 +3829,11 @@ class PbdataGUI:
                 )
                 button.grid(row=grow, column=0, sticky="ew", pady=3, padx=(0, 10))
                 self._action_buttons.append(button)
+                self._register_action_target(
+                    f"stage.{stage_key}",
+                    button,
+                    scroll_hint="Use the right-side pipeline panel.",
+                )
 
                 lbl = tk.Label(
                     group_card,
@@ -3187,6 +3868,7 @@ class PbdataGUI:
         )
         run_full_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self._action_buttons.append(run_full_btn)
+        self._register_action_target("pipeline.run_full", run_full_btn, scroll_hint="Use the right-side pipeline panel just above the stage groups.")
 
         refresh_btn = ttk.Button(
             btn_frame,
@@ -3469,6 +4151,11 @@ class PbdataGUI:
         )
         run_training_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self._action_buttons.append(run_training_btn)
+        self._register_action_target(
+            "training.run_workflow",
+            run_training_btn,
+            scroll_hint="Scroll through the right-side overview to the Training Set Builder actions.",
+        )
         custom_set_btn = ttk.Button(
             training_actions,
             text="Build Custom Set",
@@ -3476,6 +4163,11 @@ class PbdataGUI:
         )
         custom_set_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=2)
         self._action_buttons.append(custom_set_btn)
+        self._register_action_target(
+            "training.build_custom_set",
+            custom_set_btn,
+            scroll_hint="Scroll through the right-side overview to the Training Set Builder actions.",
+        )
         ttk.Button(
             training_actions,
             text="Open Benchmark",
@@ -4578,6 +5270,24 @@ class PbdataGUI:
             ttk.Label(demo_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
             ttk.Label(demo_frame, textvariable=self._demo_readiness_vars[key], wraplength=760, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
         ttk.Button(demo_frame, text="Open Demo Walkthrough", command=lambda: self._open_path(self._storage_layout().feature_reports_dir / "demo_walkthrough.md")).grid(row=0, column=2, rowspan=3, sticky="ns", padx=(8, 0))
+        tutorial_frame = ttk.Frame(demo_frame, style="Card.TFrame", padding=8)
+        tutorial_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        tutorial_frame.columnconfigure(1, weight=1)
+        for r, (key, label) in enumerate([
+            ("step", "Guided step:"),
+            ("detail", "What this is doing:"),
+            ("innovation", "Why it matters:"),
+            ("instruction", "What to click:"),
+            ("scroll_hint", "How to find it:"),
+            ("progress", "Progress:"),
+        ]):
+            ttk.Label(tutorial_frame, text=label, font=("Segoe UI Semibold", 8)).grid(row=r, column=0, sticky="nw", padx=(0, 6), pady=1)
+            ttk.Label(tutorial_frame, textvariable=self._demo_tutorial_vars[key], wraplength=880, justify="left", font=("Segoe UI", 8)).grid(row=r, column=1, sticky="w", pady=1)
+        ttk.Button(
+            tutorial_frame,
+            text="Focus Guided Control",
+            command=self._focus_demo_tutorial_target,
+        ).grid(row=0, column=2, rowspan=2, sticky="ns", padx=(8, 0))
         row += 1
 
         health_frame = ttk.LabelFrame(host, text="Review Health", padding=8, style="Section.TLabelframe")
@@ -4712,6 +5422,45 @@ class PbdataGUI:
                 widget.grid()
             else:
                 widget.grid_remove()
+
+    def _on_demo_mode_toggle(self) -> None:
+        if not bool(self._demo_mode_var.get()):
+            self._apply_demo_mode()
+            self._update_demo_tutorial()
+            return
+        layout = self._storage_layout()
+        if not is_demo_workspace_seeded(layout):
+            try:
+                cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+            except Exception:
+                cfg = AppConfig(storage_root=str(layout.root))
+            try:
+                result = seed_demo_workspace(layout, cfg, repo_root=Path.cwd())
+                if result.seeded:
+                    self._log_line(
+                        f"Demo workspace seeded at {result.manifest_path}. "
+                        "Search results, training artifacts, graphs, and model outputs are simulated."
+                    )
+            except Exception as exc:
+                self._demo_mode_var.set(False)
+                self._apply_demo_mode()
+                self._log_line(f"Demo workspace seeding failed: {exc}")
+                messagebox.showerror("Demo Mode", f"Could not seed the demo workspace.\n\n{exc}")
+                return
+        self._apply_demo_mode()
+        self._refresh_overview_async(prefer_cached_status=True)
+        self._refresh_model_studio(record_demo=False)
+        self._compare_model_runs(record_demo=False)
+        self._update_demo_tutorial()
+        if self._left_notebook is not None and "model_studio" in self._left_tab_frames:
+            self._left_notebook.select(self._left_tab_frames["model_studio"])
+        self._root.after(150, self._focus_demo_tutorial_target)
+        messagebox.showinfo(
+            "Demo Mode",
+            "Demo Mode is on.\n\n"
+            "Start in Model Studio: read the Demo Control Center, then click the highlighted control.\n\n"
+            "After you train a demo model, charts and run outputs will appear in Latest Run Outputs.",
+        )
 
     def _build_overview_snapshot(self, *, prefer_cached_status: bool = False) -> GUIOverviewSnapshot:
         layout = self._storage_layout()
@@ -4904,14 +5653,18 @@ class PbdataGUI:
                 self._curation_review_vars[key].set(value)
         self._demo_readiness_vars["readiness"].set(snapshot.demo_readiness.readiness or "--")
         self._demo_readiness_vars["summary"].set(snapshot.demo_readiness.summary or "--")
-        self._demo_readiness_vars["customer_message"].set(
-            self._demo_customer_message(snapshot.demo_readiness.readiness or "")
-        )
+        blockers = snapshot.demo_readiness.blockers
+        warnings = snapshot.demo_readiness.warnings
+        customer_message = self._demo_customer_message(snapshot.demo_readiness.readiness or "")
+        if "demo_mode_simulated_outputs" in blockers or "demo_mode_simulated_outputs" in warnings:
+            customer_message = (
+                "Demo Mode is showing simulated outputs so the intended workflow can be presented instantly. "
+                "Do not describe these artifacts as real scientific results."
+            )
+        self._demo_readiness_vars["customer_message"].set(customer_message)
         self._demo_readiness_vars["walkthrough"].set(
             self._format_demo_walkthrough(snapshot.demo_readiness.recommended_demo_flow)
         )
-        blockers = snapshot.demo_readiness.blockers
-        warnings = snapshot.demo_readiness.warnings
         self._demo_readiness_vars["blockers"].set(", ".join(str(item) for item in blockers) if blockers else "none")
         self._demo_readiness_vars["warnings"].set(", ".join(str(item) for item in warnings) if warnings else "none")
         self._apply_demo_mode()
@@ -5199,6 +5952,7 @@ class PbdataGUI:
 
     def _preview_rcsb_search(self) -> None:
         save_criteria(self._criteria_from_ui(), _CRITERIA_PATH)
+        self._record_demo_action("search.preview_rcsb")
         self._spawn_stage("preview-rcsb-search")
 
     # ------------------------------------------------------------------
@@ -5563,6 +6317,8 @@ class PbdataGUI:
         return stages
 
     def _stage_prerequisite_message(self, stage: str) -> str | None:
+        if bool(self._demo_mode_var.get()):
+            return None
         layout = self._storage_layout()
         checks: dict[str, list[tuple[Path, str]]] = {
             "engineer-dataset": [
@@ -5620,6 +6376,8 @@ class PbdataGUI:
         """
         if self._closing:
             return "cancelled"
+        if bool(self._demo_mode_var.get()):
+            return self._run_demo_stage(stage)
         self._root.after(0, self._mark_stage_started, stage)
         self._root.after(0, self._set_status, stage, "running")
         self._root.after(0, self._log_line, f"\n{'─' * 40}")
@@ -5665,7 +6423,52 @@ class PbdataGUI:
         self._root.after(0, self._refresh_overview)
         return status
 
+    def _run_demo_stage(self, stage: str) -> str:
+        if self._closing:
+            return "cancelled"
+        self._root.after(0, self._mark_stage_started, stage)
+        self._root.after(0, self._set_status, stage, "running")
+        self._root.after(0, self._log_line, f"\n{'─' * 40}")
+        self._root.after(0, self._log_line, f"  {self._display_stage_name(stage)} [Demo Mode]")
+        self._root.after(0, self._log_line, f"{'─' * 40}")
+        try:
+            layout = self._storage_layout()
+            try:
+                cfg = load_config(_SOURCES_CFG) if _SOURCES_CFG.exists() else AppConfig(storage_root=str(layout.root))
+            except Exception:
+                cfg = AppConfig(storage_root=str(layout.root))
+            simulation = simulate_demo_stage(
+                layout,
+                cfg,
+                stage=stage,
+                repo_root=Path.cwd(),
+                context=self._tutorial_selection_context(),
+            )
+            for line in simulation.lines:
+                self._root.after(0, self._log_line, line)
+                time.sleep(0.06)
+            if simulation.artifacts:
+                self._root.after(
+                    0,
+                    self._log_line,
+                    "Demo artifacts refreshed: " + ", ".join(simulation.artifacts),
+                )
+            status = simulation.status
+        except Exception as exc:
+            self._root.after(0, self._log_line, f"DEMO ERROR: {exc}")
+            status = "error"
+        self._root.after(0, self._set_status, stage, status)
+        self._root.after(0, self._mark_stage_finished, stage, status)
+        self._root.after(0, self._log_line, f"[{stage}] {status}.")
+        self._root.after(0, self._refresh_overview)
+        if stage in {"build-features", "build-training-examples", "build-splits", "train-baseline-model", "evaluate-baseline-model"}:
+            self._root.after(0, self._refresh_model_studio)
+            self._root.after(0, self._compare_model_runs)
+        return status
+
     def _spawn_stage(self, stage: str) -> None:
+        if stage == "build-custom-training-set":
+            self._record_demo_action("training.build_custom_set")
         if not self._try_begin_background_run(self._display_stage_name(stage), [stage]):
             return
 
@@ -5688,6 +6491,7 @@ class PbdataGUI:
 
     def _spawn_training_set_workflow(self) -> None:
         stages = ["build-splits", "build-custom-training-set", "build-release"]
+        self._record_demo_action("training.run_workflow")
         if not self._try_begin_background_run("Training set workflow", stages):
             return
         threading.Thread(target=self._run_training_set_workflow_thread, daemon=True).start()
@@ -5740,6 +6544,16 @@ class PbdataGUI:
         """
         if self._closing:
             return "cancelled"
+        if bool(self._demo_mode_var.get()):
+            status = self._run_demo_stage("ingest")
+            if finalize_background_run:
+                self._complete_background_run(
+                    status,
+                    "Ingest finished successfully." if status == "done"
+                    else "Ingest was cancelled." if status == "cancelled"
+                    else "Ingest finished with errors.",
+                )
+            return status
         self._root.after(0, self._mark_stage_started, "ingest")
         self._root.after(0, self._set_status, "ingest", "running")
         self._root.after(0, self._log_line, f"\n{'═' * 40}")
@@ -6044,6 +6858,7 @@ class PbdataGUI:
     def _spawn_all(self) -> None:
         mode = self._pipeline_execution_mode_var.get().strip() or "hybrid"
         planned_stages = ["ingest", *self._pipeline_stages_for_mode(mode)]
+        self._record_demo_action("pipeline.run_full")
         if not self._try_begin_background_run("Full pipeline", planned_stages):
             return
         threading.Thread(target=self._run_all_thread, daemon=True).start()

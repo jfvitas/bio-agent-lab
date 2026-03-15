@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Page
+    x:Class="PbdataWinUI.Views.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <NavigationView
+        x:Name="ShellNav"
+        IsBackButtonVisible="Collapsed"
+        IsSettingsVisible="False"
+        PaneDisplayMode="Left"
+        SelectionChanged="OnSelectionChanged">
+        <NavigationView.Header>
+            <Grid
+                MaxWidth="{StaticResource PageWidth}"
+                Margin="12,10,12,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Spacing="4">
+                    <TextBlock
+                        Style="{StaticResource PageTitleStyle}"
+                        Text="pbdata demo" />
+                    <TextBlock
+                        Style="{StaticResource SectionCaptionStyle}"
+                        Text="A WinUI-first, fully simulated walkthrough of the Protein Binding Data Platform." />
+                </StackPanel>
+
+                <Border
+                    Grid.Column="1"
+                    Style="{StaticResource CardBorderStyle}"
+                    Padding="16,12">
+                    <StackPanel Spacing="2">
+                        <TextBlock
+                            Foreground="{StaticResource BrandAquaBrush}"
+                            FontSize="12"
+                            FontWeight="SemiBold"
+                            Text="SIMULATED WORKFLOW" />
+                        <TextBlock
+                            FontSize="16"
+                            FontWeight="SemiBold"
+                            Text="{x:Bind ViewModel.ProgressLabel, Mode=OneWay}" />
+                        <TextBlock
+                            x:Name="SectionSummaryText"
+                            Style="{StaticResource SectionCaptionStyle}"
+                            Text="Shell validation in progress." />
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </NavigationView.Header>
+
+        <NavigationView.MenuItems>
+            <NavigationViewItem Tag="Guide" Content="Guided Demo">
+                <NavigationViewItem.Icon>
+                    <SymbolIcon Symbol="Map" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Tag="Dataset" Content="Dataset Builder">
+                <NavigationViewItem.Icon>
+                    <SymbolIcon Symbol="Library" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Tag="Model" Content="Model Studio">
+                <NavigationViewItem.Icon>
+                    <SymbolIcon Symbol="Edit" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Tag="Inference" Content="Inference Lab">
+                <NavigationViewItem.Icon>
+                    <SymbolIcon Symbol="Forward" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Tag="Outputs" Content="Run Outputs">
+                <NavigationViewItem.Icon>
+                    <SymbolIcon Symbol="Document" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+        </NavigationView.MenuItems>
+
+        <NavigationView.PaneFooter>
+            <StackPanel Margin="16,0,16,20" Spacing="6">
+                <TextBlock
+                    Foreground="{StaticResource BrandAquaBrush}"
+                    FontSize="12"
+                    FontWeight="SemiBold"
+                    Text="DEMO MODE" />
+                <TextBlock
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    TextWrapping="Wrap"
+                    Text="{x:Bind ViewModel.DemoDisclaimer, Mode=OneWay}" />
+            </StackPanel>
+        </NavigationView.PaneFooter>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel
+                MaxWidth="{StaticResource PageWidth}"
+                Margin="24,20,24,32"
+                HorizontalAlignment="Center"
+                Spacing="20">
+                <Border Style="{StaticResource CardBorderStyle}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Style="{StaticResource PageTitleStyle}" Text="Shell smoke test" />
+                        <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="If this builds, the remaining work is content and layout polish rather than platform/toolchain failure." />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </NavigationView>
+</Page>

@@ -1,0 +1,20 @@
+{
+  "seeded_at": "2026-03-14T16:30:00+00:00",
+  "simulated": true,
+  "disclaimer": "Demo Mode seeded this workspace with simulated artifacts intended to showcase the designed workflow. Outputs are illustrative and not scientific results.",
+  "raw_record_count": 64,
+  "training_example_count": 48,
+  "graph_node_count": 96,
+  "graph_edge_count": 48,
+  "model_studio_runs": [
+    {
+      "run_name": "demo_xgboost_affinity",
+      "metric": 0.612
+    },
+    {
+      "run_name": "demo_pyg_hybrid_affinity",
+      "metric": 0.471
+    }
+  ],
+  "repo_root": "C:\\Users\\jfvit\\Documents\\bio-agent-lab"
+}
