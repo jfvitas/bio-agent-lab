@@ -19,6 +19,15 @@ build/
 .claude/
 .codex/
 .tools/
+.vs/
+.idea/
+*.user
+*.suo
+*.tmp
+*.bak
+*.orig
+*.backup
+*.log
 
 # Data directories (keep .gitkeep sentinels)
 data/raw/*
@@ -47,9 +56,13 @@ data/training_examples/*
 
 # Runtime-generated data directories
 data/conformations/*
+data/demo/*
+data/identity/*
 data/prediction/*
 data/qa/*
 data/risk/*
+!data/demo/.gitkeep
+!data/identity/.gitkeep
 
 # Generated output files (root level)
 canonical_entries.csv
@@ -79,6 +92,8 @@ metadata/
 data/custom_training_sets/
 data/models/
 data/releases/
+data/packaged/*
+!data/packaged/.gitkeep
 data_sources/
 datasets/
 graphs/
@@ -93,3 +108,6 @@ mmseqs-linux-avx2.tar.gz
 # WinUI build outputs
 apps/PbdataWinUI/bin/
 apps/PbdataWinUI/obj/
+apps/RecoveryReference/bin/
+apps/RecoveryReference/obj/
+apps/PbdataWinUI_backup_20260314/
