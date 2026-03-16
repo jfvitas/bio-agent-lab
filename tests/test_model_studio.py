@@ -5,11 +5,15 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from typer.testing import CliRunner
 
+from pbdata.cli import app
 from pbdata.modeling.studio import (
     ModelStudioSelection,
     build_dataset_profile,
+    build_model_recommendation_report,
     build_starter_model_config,
+    export_model_recommendation_report,
     export_starter_model_config,
     recommend_model_architectures,
     validate_model_studio_selection,
@@ -69,6 +73,27 @@ def test_build_dataset_profile_detects_graph_and_attribute_modalities() -> None:
     assert "graphs+attributes" in profile.modalities_available
     assert "regression" in profile.tasks_available
     assert "classification" in profile.tasks_available
+
+
+def test_build_dataset_profile_reads_engineered_dataset_graph_coverage() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_graph_coverage"))
+    dataset_dir = layout.workspace_datasets_dir / "engineered_dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "graph_config.json").write_text(json.dumps({
+        "graph_level": "residue",
+        "graph_scope": "interface_only",
+        "graph_selection": "training_set",
+        "graph_export_formats": ["pyg", "networkx"],
+        "graph_covered_rows": 420,
+        "graph_covered_fraction": 0.84,
+    }), encoding="utf-8")
+
+    profile = build_dataset_profile(layout)
+
+    assert profile.graph_dataset_name == "engineered_dataset"
+    assert profile.graph_covered_rows == 420
+    assert profile.graph_covered_fraction == pytest.approx(0.84)
+    assert profile.graph_level == "residue"
 
 
 def test_validate_model_studio_selection_flags_missing_graph_inputs() -> None:
@@ -152,6 +177,143 @@ def test_build_and_export_starter_model_config() -> None:
     assert out_path.exists()
     exported = json.loads(out_path.read_text(encoding="utf-8"))
     assert exported["family"] == recommendation.family
+
+
+def test_build_and_export_model_recommendation_report() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_report"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.graph_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = layout.workspace_datasets_dir / "engineered_dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(json.dumps([
+        {"example_id": f"train:1ABC:{idx}", "labels": {"binding_affinity_log10": 1.0 + idx}}
+        for idx in range(300)
+    ]), encoding="utf-8")
+    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{"node_id": "n1"}]), encoding="utf-8")
+    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{"source_node_id": "n1", "target_node_id": "n1"}]), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("train:1ABC:0\n", encoding="utf-8")
+    (dataset_dir / "graph_config.json").write_text(json.dumps({
+        "graph_level": "residue",
+        "graph_scope": "interface_only",
+        "graph_selection": "training_set",
+        "graph_export_formats": ["pyg", "networkx"],
+        "graph_covered_rows": 252,
+        "graph_covered_fraction": 0.84,
+    }), encoding="utf-8")
+
+    report = build_model_recommendation_report(layout)
+    json_path, md_path, saved_report = export_model_recommendation_report(layout)
+
+    assert report["status"] in {"ready", "ready_with_warnings"}
+    assert report["top_recommendation"]["family"] in {"hybrid_fusion", "gnn", "xgboost"}
+    assert report["dataset_profile"]["graph_covered_fraction"] == pytest.approx(0.84)
+    assert json_path.exists()
+    assert md_path.exists()
+    assert saved_report["starter_config_ready"] is True
+    assert Path(saved_report["starter_config_path"]).exists()
+
+
+def test_report_model_recommendation_cli() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_cli"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(json.dumps([{
+        "example_id": "train:1ABC:0",
+        "labels": {"binding_affinity_log10": 1.2},
+    }]), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("train:1ABC:0\n", encoding="utf-8")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(layout.root), "report-model-recommendation"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Model recommendation JSON" in result.output
+    assert (layout.reports_dir / "model_studio_recommendation.json").exists()
+
+
+def test_train_recommended_model_cli() -> None:
+    pytest.importorskip("sklearn")
+    layout = build_storage_layout(_tmp_dir("model_studio_train_recommended"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    examples = []
+    for idx in range(12):
+        pdb_id = f"T{idx:03d}"
+        examples.append({
+            "example_id": f"train:{pdb_id}:0",
+            "structure": {"pdb_id": pdb_id, "resolution": 1.5 + idx * 0.1},
+            "protein": {"uniprot_id": f"PT{idx:05d}", "sequence_length": 95 + idx},
+            "ligand": {"ligand_id": f"LT{idx:03d}", "molecular_weight": 190.0 + idx},
+            "interaction": {"interface_residue_count": idx + 2},
+            "experiment": {"affinity_type": "Ki", "source_database": "ChEMBL", "reported_measurement_count": 1},
+            "graph_features": {"network_degree": idx % 3, "pathway_count": idx % 2},
+            "labels": {"binding_affinity_log10": 0.5 + idx * 0.15, "is_mutant": bool(idx % 2)},
+            "provenance": {"pdb_id": pdb_id, "pair_identity_key": f"pair:{pdb_id}"},
+        })
+    (layout.training_dir / "training_examples.json").write_text(json.dumps(examples), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("\n".join(f"RCSB_T{idx:03d}" for idx in range(8)), encoding="utf-8")
+    (layout.splits_dir / "val.txt").write_text("\n".join(f"RCSB_T{idx:03d}" for idx in range(8, 10)), encoding="utf-8")
+    (layout.splits_dir / "test.txt").write_text("\n".join(f"RCSB_T{idx:03d}" for idx in range(10, 12)), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(layout.root), "train-recommended-model"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Training run dir" in result.output
+    assert (layout.reports_dir / "model_studio_recommendation.json").exists()
+    assert (layout.stage_state_dir / "train-recommended-model.json").exists()
+    runs_root = layout.models_dir / "model_studio" / "runs"
+    assert any((run_dir / "run_manifest.json").exists() for run_dir in runs_root.iterdir())
+
+
+def test_train_recommended_model_cli_safe_baseline() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_train_safe_baseline"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    examples = []
+    for idx in range(12):
+        pdb_id = f"SB{idx:03d}"
+        examples.append({
+            "example_id": f"train:{pdb_id}:0",
+            "structure": {"pdb_id": pdb_id, "resolution": 1.5 + idx * 0.1},
+            "protein": {"uniprot_id": f"PSB{idx:05d}", "sequence_length": 95 + idx},
+            "ligand": {"ligand_id": f"LSB{idx:03d}", "molecular_weight": 190.0 + idx},
+            "interaction": {"interface_residue_count": idx + 2},
+            "experiment": {"affinity_type": "Ki", "source_database": "ChEMBL", "reported_measurement_count": 1},
+            "graph_features": {"network_degree": idx % 3, "pathway_count": idx % 2},
+            "labels": {"binding_affinity_log10": 0.5 + idx * 0.15, "is_mutant": bool(idx % 2)},
+            "provenance": {"pdb_id": pdb_id, "pair_identity_key": f"pair:{pdb_id}"},
+        })
+    (layout.training_dir / "training_examples.json").write_text(json.dumps(examples), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("\n".join(f"RCSB_SB{idx:03d}" for idx in range(8)), encoding="utf-8")
+    (layout.splits_dir / "val.txt").write_text("\n".join(f"RCSB_SB{idx:03d}" for idx in range(8, 10)), encoding="utf-8")
+    (layout.splits_dir / "test.txt").write_text("\n".join(f"RCSB_SB{idx:03d}" for idx in range(10, 12)), encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(layout.root), "train-recommended-model", "--execution-strategy", "safe_baseline"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Execution strategy    : safe_baseline" in result.output
+    runs_root = layout.models_dir / "model_studio" / "runs"
+    latest_run = max(runs_root.iterdir(), key=lambda path: path.stat().st_mtime)
+    manifest = json.loads((latest_run / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["execution_strategy"] == "safe_baseline"
+    assert manifest["recommended_family"]
+    assert manifest["selected_family"] in {"random_forest", "dense_nn"}
+    assert "runtime_adjustment" in manifest
 
 
 def test_detect_runtime_capabilities_reports_local_cpu() -> None:

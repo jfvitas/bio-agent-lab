@@ -51,6 +51,39 @@ def _safe_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _find_latest_graph_manifest(layout: StorageLayout) -> Path | None:
+    manifests = sorted(
+        layout.workspace_graphs_dir.glob("*/graph_manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return manifests[0] if manifests else None
+
+
+def _load_graph_manifest_index(layout: StorageLayout) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    manifest_path = _find_latest_graph_manifest(layout)
+    if manifest_path is None:
+        return {}, {}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+    rows = raw.get("graphs")
+    if not isinstance(rows, list):
+        return {}, {}
+    index: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pdb_id = _safe_text(row.get("pdb_id")).upper()
+        if pdb_id:
+            index[pdb_id] = row
+    raw["manifest_path"] = str(manifest_path)
+    return index, raw
+
+
 def _sequence_embedding(sequence: str, *, dims: int = 32) -> list[float]:
     if not sequence:
         return [0.0] * dims
@@ -249,11 +282,17 @@ def engineer_dataset(
         )
 
     backend = _embedding_backend_name(config.embedding_backend)
+    graph_index, graph_manifest = _load_graph_manifest_index(layout)
     vectors = [_row_embedding(row, backend=backend if backend != "esm_unavailable" else "fallback") for row in rows]
     cluster_ids = _kmeans(vectors, k=config.cluster_count, seed=config.seed)
 
     grouped: dict[str, dict[str, Any]] = {}
     for row, cluster_id in zip(rows, cluster_ids):
+        pdb_id = _safe_text(row.get("pdb_id")).upper()
+        graph_row = graph_index.get(pdb_id, {})
+        graph_available = bool(graph_row)
+        graph_row_count = int(graph_row.get("node_count") or 0) if graph_available else 0
+        graph_edge_count = int(graph_row.get("edge_count") or 0) if graph_available else 0
         group_key = _hard_group_key(row, strict_family_isolation=config.strict_family_isolation)
         bucket = _representation_bucket(row)
         group = grouped.setdefault(
@@ -266,7 +305,16 @@ def engineer_dataset(
                 "size": 0,
             },
         )
-        group["rows"].append(row)
+        group["rows"].append(
+            {
+                **row,
+                "graph_available": "true" if graph_available else "false",
+                "graph_node_count": str(graph_row_count),
+                "graph_edge_count": str(graph_edge_count),
+                "graph_manifest_scope": _safe_text(graph_manifest.get("scope")) if graph_available else "",
+                "graph_manifest_level": _safe_text(graph_manifest.get("graph_level")) if graph_available else "",
+            }
+        )
         group["size"] += 1
 
     assignments = _allocate_groups(list(grouped.values()), test_frac=config.test_frac, seed=config.seed)
@@ -279,11 +327,20 @@ def engineer_dataset(
         for row in group["rows"]:
             split_rows[split_name].append({**row, "cluster_id": str(group["cluster_id"]), "dataset_split": split_name})
 
+    split_fieldnames = sorted(
+        {
+            key
+            for rows_for_split in split_rows.values()
+            for row in rows_for_split
+            for key in row.keys()
+        }
+    ) or ["dataset_split"]
+
     artifacts: dict[str, str] = {}
     for split_name, rows_for_split in split_rows.items():
         path = out_dir / f"{split_name}.csv"
         with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows_for_split[0].keys()) if rows_for_split else ["dataset_split"])
+            writer = csv.DictWriter(handle, fieldnames=split_fieldnames)
             writer.writeheader()
             writer.writerows(rows_for_split)
         artifacts[f"{split_name}_csv"] = str(path)
@@ -300,7 +357,14 @@ def engineer_dataset(
             ]
             fold_path = cv_dir / f"fold_{fold}.csv"
             with fold_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(fold_rows[0].keys()) if fold_rows else ["cv_fold"])
+                fold_fieldnames = sorted(
+                    {
+                        key
+                        for row in fold_rows
+                        for key in row.keys()
+                    }
+                ) or ["cv_fold"]
+                writer = csv.DictWriter(handle, fieldnames=fold_fieldnames)
                 writer.writeheader()
                 writer.writerows(fold_rows)
         artifacts["cv_folds_dir"] = str(cv_dir)
@@ -311,6 +375,14 @@ def engineer_dataset(
         "row_count": len(rows),
         "train_count": len(split_rows["train"]),
         "test_count": len(split_rows["test"]),
+        "graph_manifest_path": _safe_text(graph_manifest.get("manifest_path")),
+        "graph_manifest_level": _safe_text(graph_manifest.get("graph_level")),
+        "graph_manifest_scope": _safe_text(graph_manifest.get("scope")),
+        "graph_covered_row_count": sum(1 for row in split_rows["train"] + split_rows["test"] if row.get("graph_available") == "true"),
+        "graph_covered_fraction": round(
+            (sum(1 for row in split_rows["train"] + split_rows["test"] if row.get("graph_available") == "true") / max(len(rows), 1)),
+            4,
+        ),
         "protein_family_diversity": len(set(_safe_text(row.get("protein_family")) for row in rows if _safe_text(row.get("protein_family")))),
         "organism_diversity": len(set(_safe_text(row.get("organism")) for row in rows if _safe_text(row.get("organism")))),
         "structure_diversity": len(set(_safe_text(row.get("structural_fold")) for row in rows if _safe_text(row.get("structural_fold")))),
@@ -339,6 +411,13 @@ def engineer_dataset(
         graph_config={
             "graph_inputs": ["structural_graphs", "canonical_graph_optional"],
             "cluster_assignment_strategy": "hard_group_then_kmeans",
+            "latest_graph_manifest": _safe_text(graph_manifest.get("manifest_path")),
+            "graph_level": _safe_text(graph_manifest.get("graph_level")),
+            "graph_scope": _safe_text(graph_manifest.get("scope")),
+            "graph_selection": _safe_text(graph_manifest.get("selection")),
+            "graph_export_formats": graph_manifest.get("export_formats") if isinstance(graph_manifest.get("export_formats"), list) else [],
+            "graph_covered_rows": diversity_report["graph_covered_row_count"],
+            "graph_covered_fraction": diversity_report["graph_covered_fraction"],
         },
     )
     artifacts.update(config_artifacts)

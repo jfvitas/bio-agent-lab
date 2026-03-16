@@ -9,6 +9,7 @@ $exePath = Join-Path $buildDir "PbdataWinUI.exe"
 $localDotnetDir = Join-Path $repoRoot ".tools\dotnet"
 $localDotnetExe = Join-Path $localDotnetDir "dotnet.exe"
 $dotnetInstallScript = Join-Path $repoRoot ".tools\dotnet-install.ps1"
+$buildLogPath = Join-Path $repoRoot "logs\winui_launcher_build.log"
 
 function Write-Step([string]$message) {
     Write-Host ""
@@ -86,6 +87,13 @@ function Get-LatestWriteUtc([string[]]$paths) {
     return $latest
 }
 
+function Ensure-ParentDirectory([string]$path) {
+    $parent = Split-Path -Parent $path
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+}
+
 function Test-BuildIsCurrent() {
     if (-not (Test-Path $exePath)) {
         return $false
@@ -102,15 +110,34 @@ function Test-BuildIsCurrent() {
     return $buildWrite -ge $sourceWrite
 }
 
+function Test-BuildLooksUsable() {
+    return (Test-Path $exePath) -and (Get-Item $exePath).Length -gt 0
+}
+
 function Build-App([string]$dotnetCmd) {
     Write-Step "Building pbdata WinUI"
-    & $dotnetCmd build $projectFile -c Release -p:Platform=x64
-    if ($LASTEXITCODE -ne 0) {
-        throw "dotnet build failed."
+    Ensure-ParentDirectory $buildLogPath
+    $attempts = 2
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        if (Test-Path $buildLogPath) {
+            Remove-Item $buildLogPath -Force -ErrorAction SilentlyContinue
+        }
+        & $dotnetCmd build $projectFile -c Release -p:Platform=x64 -p:UseSharedCompilation=false -nodeReuse:false *>&1 |
+            Tee-Object -FilePath $buildLogPath
+        if ($LASTEXITCODE -eq 0 -and (Test-BuildLooksUsable)) {
+            return
+        }
+
+        if ($attempt -lt $attempts) {
+            Start-Sleep -Seconds (2 * $attempt)
+        }
     }
-    if (-not (Test-Path $exePath)) {
-        throw "Build completed without producing $exePath"
+
+    if (Test-BuildLooksUsable) {
+        Write-Warning "Build hit a transient compiler/lock issue. Launching the most recent successful executable instead."
+        return
     }
+    throw "dotnet build failed."
 }
 
 function Start-App() {

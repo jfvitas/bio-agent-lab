@@ -89,12 +89,28 @@
                                     SelectedValue="{x:Bind ViewModel.SelectedSpeedKey, Mode=TwoWay}"
                                     SelectedValuePath="Key" />
                             </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Execution mode" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.TrainingExecutionModes, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedTrainingExecutionModeKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <Border Style="{StaticResource SubtleCardBorderStyle}">
+                                <StackPanel Spacing="6">
+                                    <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Graph pathway" />
+                                    <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.GraphDesignNarrative, Mode=OneWay}" />
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
                     </Border>
 
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="12">
-                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Architecture preview" />
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Model system" />
                             <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SelectedModelHeadline, Mode=OneWay}" />
                             <ItemsControl ItemsSource="{x:Bind ViewModel.ArchitectureStages, Mode=OneWay}">
                                 <ItemsControl.ItemTemplate>
@@ -144,6 +160,28 @@
                                     </DataTemplate>
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Execution plan" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.TrainingExecutionNarrative, Mode=OneWay}" />
+                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.EnvironmentGuidance, Mode=OneWay}" TextWrapping="WrapWholeWords" />
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Suggested install commands" />
+                                <TextBox
+                                    IsReadOnly="True"
+                                    MinHeight="78"
+                                    Text="{x:Bind ViewModel.EnvironmentFixCommands, Mode=OneWay}"
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                            <Button
+                                Command="{x:Bind ViewModel.RunSmokeCheckCommand}"
+                                Content="Run quick smoke check"
+                                HorizontalAlignment="Left"
+                                Style="{StaticResource SecondaryActionStyle}" />
+                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="Model Studio now shows whether the current recommendation will run natively, fall back to another backend, or stay blocked until dependencies are installed." />
                         </StackPanel>
                     </Border>
 

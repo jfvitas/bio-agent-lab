@@ -62,6 +62,16 @@ def test_build_structural_graphs_and_engineer_dataset() -> None:
     assert Path(dataset_artifacts["graph_config"]).exists()
     assert Path(dataset_artifacts["cv_folds_dir"]).exists()
 
+    graph_config = json.loads(Path(dataset_artifacts["graph_config"]).read_text(encoding="utf-8"))
+    diversity_report = json.loads(Path(dataset_artifacts["diversity_report"]).read_text(encoding="utf-8"))
+    train_rows = Path(dataset_artifacts["train_csv"]).read_text(encoding="utf-8")
+
+    assert graph_config["latest_graph_manifest"].endswith("graph_manifest.json")
+    assert graph_config["graph_level"] == "residue"
+    assert graph_config["graph_scope"] == "whole_protein"
+    assert diversity_report["graph_covered_row_count"] >= 1
+    assert "graph_available" in train_rows
+
 
 def test_build_atom_structural_graphs_includes_graph_summaries() -> None:
     tmp_root = _tmp_dir("workflow_atom_graphs")

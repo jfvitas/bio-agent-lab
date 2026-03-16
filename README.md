@@ -19,7 +19,8 @@ model training pipeline.
 3. [Launching the GUI](#launching-the-gui)
 4. [What the GUI does](#what-the-gui-does)
 5. [GUI layout](#gui-layout)
-6. [Walkthrough: building a dataset from scratch](#walkthrough-building-a-dataset-from-scratch)
+6. [Lightweight Bootstrap Summary Package](#lightweight-bootstrap-summary-package)
+7. [Walkthrough: building a dataset from scratch](#walkthrough-building-a-dataset-from-scratch)
    - [Step 1 — Pick your data sources](#step-1--pick-your-data-sources)
    - [Step 2 — Define search criteria](#step-2--define-search-criteria)
    - [Step 3 — Set pipeline options](#step-3--set-pipeline-options)
@@ -31,16 +32,16 @@ model training pipeline.
    - [Step 9 — Build a release snapshot](#step-9--build-a-release-snapshot)
    - [Step 10 — Advanced and experimental stages](#step-10--advanced-and-experimental-stages)
    - [Run Full Pipeline (one click)](#run-full-pipeline-one-click)
-7. [Demo Mode](#demo-mode)
-8. [Data overview panel](#data-overview-panel)
-9. [Review and curation dashboards](#review-and-curation-dashboards)
-10. [Log panel](#log-panel)
-11. [Supported data sources](#supported-data-sources)
-12. [CLI reference](#cli-reference)
-13. [Where files are stored](#where-files-are-stored)
-14. [Configuration files](#configuration-files)
-15. [Testing](#testing)
-16. [Troubleshooting](#troubleshooting)
+8. [Demo Mode](#demo-mode)
+9. [Data overview panel](#data-overview-panel)
+10. [Review and curation dashboards](#review-and-curation-dashboards)
+11. [Log panel](#log-panel)
+12. [Supported data sources](#supported-data-sources)
+13. [CLI reference](#cli-reference)
+14. [Where files are stored](#where-files-are-stored)
+15. [Configuration files](#configuration-files)
+16. [Testing](#testing)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -81,6 +82,15 @@ For a fresh Windows clone, the launcher now tries to do the right thing:
 
 The older **Launch PBData WinUI Demo.bat** file still works and now forwards to
 the same launcher for compatibility.
+
+There is also a repo health check at **Run PBData Smoke Check.bat**.
+That runs a local workspace smoke pass against the current clone, verifies the
+shared recommendation/training artifacts, and checks that the WinUI app still
+builds cleanly. If you prefer the terminal path, run:
+
+```bash
+python scripts/run_repo_smoke.py
+```
 
 ---
 
@@ -203,6 +213,45 @@ The GUI is a single window that lets you:
   pipeline stage buttons grouped by phase.
 - **Log panel** — dark themed, monospace, auto-scrolls to newest output.
 - **Header bar** — title, subtitle, and the Demo Mode checkbox (top-right).
+
+---
+
+## Lightweight Bootstrap Summary Package
+
+The platform now supports a lightweight bootstrap package that is small enough
+to keep in GitHub while the heavy raw source payloads stay local-only.
+
+Use it to share the planning substrate for:
+
+- candidate-pool design
+- training-set design
+- selected-PDB refresh planning
+- quick workspace bootstrap on a fresh clone
+
+Generate it with:
+
+```bash
+python -m pbdata --storage-root . export-bootstrap-summary
+```
+
+That command writes:
+
+- `metadata/bootstrap_catalog/bootstrap_summary.csv.gz`
+- `metadata/bootstrap_catalog/bootstrap_pair_summary.csv.gz`
+- `metadata/bootstrap_catalog/bootstrap_summary_manifest.json`
+
+The package is intentionally split into two compact layers:
+
+- `bootstrap_summary.csv.gz`
+  - one row per PDB ID
+  - source coverage, structure presence, receptor IDs, method/resolution, and broad planning counts
+- `bootstrap_pair_summary.csv.gz`
+  - one row per candidate pair
+  - pair identity key, source database, receptor IDs, ligand/interface types, affinity type, mutation strings, and current split/conflict annotations
+
+This is the intended GitHub-friendly summary bundle for getting a user started
+quickly. The full raw source dumps, structures, extracted tables, and graph
+artifacts should remain local and be refreshed on demand.
 
 ---
 

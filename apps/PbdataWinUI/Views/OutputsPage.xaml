@@ -15,7 +15,7 @@
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="10">
                     <TextBlock Style="{StaticResource EyebrowStyle}" Text="OUTPUTS" />
-                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="What the workflow would hand back to a real user" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Current workspace outputs and operational artifacts" />
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.RunSummary, Mode=OneWay}" />
                     <TextBlock
                         FontSize="18"
@@ -26,8 +26,8 @@
 
             <Grid ColumnSpacing="20">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="1.05*" />
                     <ColumnDefinition Width="0.95*" />
+                    <ColumnDefinition Width="1.05*" />
                 </Grid.ColumnDefinitions>
 
                 <Border Grid.Column="0" Style="{StaticResource CardBorderStyle}">
@@ -46,6 +46,7 @@
                                                 Text="{Binding Title}" />
                                             <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Status}" />
                                             <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Summary}" />
+                                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Path}" />
                                         </StackPanel>
                                     </Border>
                                 </DataTemplate>
@@ -56,8 +57,24 @@
 
                 <Border Grid.Column="1" Style="{StaticResource CardBorderStyle}">
                     <StackPanel Spacing="12">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Activity log" />
-                        <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityLog, Mode=OneWay}">
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Workflow engine" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <ProgressRing
+                                Width="28"
+                                Height="28"
+                                IsActive="{x:Bind ViewModel.IsWorkflowBusy, Mode=OneWay}" />
+                            <StackPanel Grid.Column="1" Spacing="2">
+                                <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.ActiveWorkflowLabel, Mode=OneWay}" />
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{x:Bind ViewModel.WorkflowStatus, Mode=OneWay}" />
+                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.LastWorkflowCommand, Mode=OneWay}" />
+                            </StackPanel>
+                        </Grid>
+                        <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Recent command output" />
+                        <ItemsControl ItemsSource="{x:Bind ViewModel.WorkflowConsoleLines, Mode=OneWay}">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
                                     <TextBlock
@@ -70,6 +87,22 @@
                     </StackPanel>
                 </Border>
             </Grid>
+
+            <Border Style="{StaticResource CardBorderStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Activity log" />
+                    <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityLog, Mode=OneWay}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock
+                                    Margin="0,0,0,8"
+                                    Style="{StaticResource SectionCaptionStyle}"
+                                    Text="{Binding}" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
         </StackPanel>
     </ScrollViewer>
 </Page>

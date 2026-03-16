@@ -1073,6 +1073,192 @@ def train_tabular_affinity_model_cmd(ctx: typer.Context) -> None:
     typer.echo(f"Workflow status: {manifest['status']}")
 
 
+@app.command("train-recommended-model")
+def train_recommended_model_cmd(
+    ctx: typer.Context,
+    runtime_target: Annotated[
+        str,
+        typer.Option("--runtime-target", help="local_cpu | local_gpu"),
+    ] = "local_cpu",
+    execution_strategy: Annotated[
+        str,
+        typer.Option("--execution-strategy", help="auto | prefer_native | safe_baseline"),
+    ] = "auto",
+    run_name: Annotated[
+        Optional[str],
+        typer.Option("--run-name", help="Optional explicit run name."),
+    ] = None,
+) -> None:
+    """Train the current workspace-backed recommended model using the exported starter config."""
+    from pbdata.modeling.runtime import detect_runtime_capabilities
+    from pbdata.modeling.studio import resolve_recommended_starter_config
+    from pbdata.modeling.training_runs import execute_training_run
+
+    layout = _storage_layout(ctx)
+    write_stage_state(
+        layout,
+        stage="train-recommended-model",
+        status="running",
+        input_dir=layout.reports_dir,
+        output_dir=layout.models_dir / "model_studio" / "runs",
+        workers=1,
+        counts={},
+        notes="Training the current recommended model from the exported Model Studio starter configuration.",
+    )
+    fallback_note = ""
+    try:
+        with stage_lock(layout, stage="train-recommended-model"):
+            starter_config_path, starter_config, recommendation_report = resolve_recommended_starter_config(layout)
+            runtime_capabilities = detect_runtime_capabilities()
+            original_family = str(starter_config.get("family") or "")
+            if execution_strategy not in {"auto", "prefer_native", "safe_baseline"}:
+                raise RuntimeError("execution-strategy must be one of: auto, prefer_native, safe_baseline")
+
+            if execution_strategy == "safe_baseline":
+                if "sklearn" in runtime_capabilities.installed_backends:
+                    starter_config = dict(starter_config)
+                    starter_config["recommended_family"] = original_family
+                    starter_config["family"] = "random_forest"
+                    starter_config["label"] = "Safe baseline (random forest)"
+                    starter_config["model_id"] = "safe_baseline_random_forest"
+                    starter_config["model"] = {
+                        "type": "random_forest",
+                        "n_estimators": 500,
+                        "max_depth": None,
+                        "min_samples_leaf": 1,
+                        "use_graph_summaries": True,
+                    }
+                    fallback_note = "Execution strategy requested a safe executable baseline, so training was routed to a random-forest starter."
+                elif "torch" in runtime_capabilities.installed_backends:
+                    starter_config = dict(starter_config)
+                    starter_config["recommended_family"] = original_family
+                    starter_config["family"] = "dense_nn"
+                    starter_config["label"] = "Safe baseline (dense neural net)"
+                    starter_config["model_id"] = "safe_baseline_dense_nn"
+                    starter_config["model"] = {
+                        "type": "residual_mlp",
+                        "hidden_dims": [256, 256, 128],
+                        "dropout": 0.2,
+                        "normalization": "layernorm",
+                        "activation": "gelu",
+                    }
+                    starter_config["training"] = {
+                        "seed": 42,
+                        "early_stopping": True,
+                        "monitor": "val_loss",
+                        "batch_size": 64,
+                        "epochs": 80,
+                        "optimizer": "adamw",
+                        "learning_rate": 1e-3,
+                    }
+                    fallback_note = "Execution strategy requested a safe executable baseline, so training was routed to a torch-backed dense neural net."
+                else:
+                    raise RuntimeError("safe_baseline requested, but neither sklearn nor torch is installed in the current runtime.")
+            elif original_family in {"random_forest", "xgboost"} and "sklearn" not in runtime_capabilities.installed_backends:
+                if execution_strategy == "prefer_native":
+                    raise RuntimeError(
+                        f"Recommended family '{original_family}' cannot run natively because scikit-learn is unavailable in this runtime."
+                    )
+                if "torch" in runtime_capabilities.installed_backends:
+                    starter_config = dict(starter_config)
+                    starter_config["recommended_family"] = original_family
+                    starter_config["family"] = "dense_nn"
+                    starter_config["label"] = f"{starter_config.get('label', 'Recommended model')} (runtime-adjusted)"
+                    starter_config["model_id"] = f"{starter_config.get('model_id', original_family)}_runtime_adjusted_dense_nn"
+                    starter_config["model"] = {
+                        "type": "residual_mlp",
+                        "hidden_dims": [256, 256, 128],
+                        "dropout": 0.2,
+                        "normalization": "layernorm",
+                        "activation": "gelu",
+                    }
+                    starter_config["training"] = {
+                        "seed": 42,
+                        "early_stopping": True,
+                        "monitor": "val_loss",
+                        "batch_size": 64,
+                        "epochs": 80,
+                        "optimizer": "adamw",
+                        "learning_rate": 1e-3,
+                    }
+                    fallback_note = (
+                        f"Recommended family '{original_family}' requires scikit-learn, which is unavailable in this runtime. "
+                        "Fell back to a torch-backed dense_nn starter so training could proceed."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Recommended family '{original_family}' requires scikit-learn, but sklearn is not installed and no torch fallback is available."
+                    )
+            result = execute_training_run(
+                layout,
+                starter_config=starter_config,
+                runtime_target=runtime_target,
+                run_name=run_name,
+            )
+            manifest_path = result.run_dir / "run_manifest.json"
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+            if isinstance(manifest_payload, dict):
+                manifest_payload["execution_strategy"] = execution_strategy
+                manifest_payload["recommended_family"] = original_family
+                manifest_payload["selected_family"] = str(starter_config.get("family") or original_family)
+                if fallback_note:
+                    manifest_payload["runtime_adjustment"] = fallback_note
+                manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+
+            config_path = result.run_dir / "config.json"
+            config_payload = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
+            if isinstance(config_payload, dict):
+                config_payload["execution_strategy"] = execution_strategy
+                config_payload["recommended_family"] = original_family
+                config_payload["selected_family"] = str(starter_config.get("family") or original_family)
+                if fallback_note:
+                    config_payload["runtime_adjustment"] = fallback_note
+                config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
+    except Exception as exc:
+        write_stage_state(
+            layout,
+            stage="train-recommended-model",
+            status="failed",
+            input_dir=layout.reports_dir,
+            output_dir=layout.models_dir / "model_studio" / "runs",
+            workers=1,
+            counts={},
+            notes=f"Recommended model training failed: {exc}",
+        )
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    test_metrics = result.metrics.get("test") or result.metrics.get("val") or result.metrics.get("train") or {}
+    write_stage_state(
+        layout,
+        stage="train-recommended-model",
+        status="completed",
+        input_dir=layout.reports_dir,
+        output_dir=result.run_dir,
+        workers=1,
+        counts={
+            "warning_count": len(result.warnings),
+            "metric_count": len(test_metrics),
+        },
+        notes=(
+            f"Completed recommended {starter_config.get('family', 'unknown')} run '{result.run_name}' from {starter_config_path.name}."
+            + (f" {fallback_note}" if fallback_note else "")
+        ),
+    )
+
+    typer.echo(f"Storage root          : {layout.root}")
+    typer.echo(f"Recommendation report : {layout.reports_dir / 'model_studio_recommendation.json'}")
+    typer.echo(f"Starter config        : {starter_config_path}")
+    typer.echo(f"Recommended label     : {(recommendation_report.get('top_recommendation') or {}).get('label', 'unknown')}")
+    typer.echo(f"Execution strategy    : {execution_strategy}")
+    typer.echo(f"Training run dir      : {result.run_dir}")
+    typer.echo(f"Training summary      : {result.summary}")
+    if fallback_note:
+        typer.echo(f"Runtime adjustment    : {fallback_note}")
+    if result.warnings:
+        typer.echo(f"Warnings              : {', '.join(result.warnings)}")
+
+
 @app.command("evaluate-tabular-affinity-model")
 def evaluate_tabular_affinity_model_cmd(ctx: typer.Context) -> None:
     """Evaluate the supervised tabular affinity model against the current split files."""
@@ -1108,6 +1294,21 @@ def report_model_comparison_cmd(ctx: typer.Context) -> None:
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Model comparison JSON: {json_path}")
     typer.echo(f"Model comparison Markdown: {md_path}")
+    typer.echo(f"Workflow status: {report['status']}")
+
+
+@app.command("report-model-recommendation")
+def report_model_recommendation_cmd(ctx: typer.Context) -> None:
+    """Write a model-studio recommendation report from the current workspace artifacts."""
+    from pbdata.modeling.studio import export_model_recommendation_report
+
+    layout = _storage_layout(ctx)
+    json_path, md_path, report = export_model_recommendation_report(layout)
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Model recommendation JSON: {json_path}")
+    typer.echo(f"Model recommendation Markdown: {md_path}")
+    if report.get("starter_config_path"):
+        typer.echo(f"Starter config: {report['starter_config_path']}")
     typer.echo(f"Workflow status: {report['status']}")
 
 
@@ -1876,31 +2077,393 @@ def harvest_metadata_cmd(
     typer.echo(f"Metadata manifest written to {artifacts['manifest']}")
 
 
+@app.command("build-bootstrap-catalog")
+def build_bootstrap_catalog_cmd(
+    ctx: typer.Context,
+    shard_size: Annotated[
+        int,
+        typer.Option("--shard-size", min=1, help="Approximate number of PDB records per shard."),
+    ] = 5000,
+    package_id: Annotated[
+        Optional[str],
+        typer.Option("--package-id", help="Optional explicit package identifier."),
+    ] = None,
+) -> None:
+    """Build a lightweight per-PDB startup catalog for fast local planning."""
+    from pbdata.bootstrap_catalog import build_bootstrap_catalog
+
+    layout = _storage_layout(ctx)
+    try:
+        result = build_bootstrap_catalog(
+            layout,
+            shard_size=shard_size,
+            package_id=package_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Bootstrap package : {result.package_dir}")
+    typer.echo(f"Manifest          : {result.manifest_path}")
+    typer.echo(f"Shards            : {result.shard_count}")
+    typer.echo(f"PDB records       : {result.record_count}")
+
+
+@app.command("materialize-bootstrap-store")
+def materialize_bootstrap_store_cmd(ctx: typer.Context) -> None:
+    """Build a persistent local bootstrap index for fast startup and dataset planning."""
+    from pbdata.bootstrap_store import materialize_bootstrap_store
+
+    layout = _storage_layout(ctx)
+    try:
+        result = materialize_bootstrap_store(layout)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Bootstrap store  : {result.database_path}")
+    typer.echo(f"Store manifest   : {result.manifest_path}")
+    typer.echo(f"PDB records      : {result.record_count}")
+
+
+@app.command("export-bootstrap-summary")
+def export_bootstrap_summary_cmd(ctx: typer.Context) -> None:
+    """Export a lightweight bootstrap summary package for GitHub-friendly planning."""
+    from pbdata.bootstrap_store import export_bootstrap_summary
+
+    layout = _storage_layout(ctx)
+    try:
+        result = export_bootstrap_summary(layout)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"PDB summary CSV : {result.csv_path}")
+    if result.pair_csv_path:
+        typer.echo(f"Pair summary CSV: {result.pair_csv_path}")
+    typer.echo(f"Summary manifest: {result.manifest_path}")
+    typer.echo(f"PDB records     : {result.record_count}")
+    if result.pair_csv_path:
+        typer.echo(f"Pair records    : {result.pair_record_count}")
+
+
+@app.command("report-source-lifecycle")
+def report_source_lifecycle_cmd(ctx: typer.Context) -> None:
+    """Report staged local source assets and their lifecycle policies."""
+    from pbdata.source_lifecycle import export_source_lifecycle_report
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    json_path, md_path, report = export_source_lifecycle_report(layout, config)
+
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"JSON report  : {json_path}")
+    typer.echo(f"Markdown     : {md_path}")
+    typer.echo(f"Ready sources: {report['summary']['ready_sources']}")
+    typer.echo(f"Missing      : {report['summary']['missing_sources']}")
+    typer.echo(f"Next action  : {report['next_action']}")
+
+
+@app.command("audit-screening-fields")
+def audit_screening_fields_cmd(ctx: typer.Context) -> None:
+    """Audit screening and dataset-selection field population in the workspace exports."""
+    from pbdata.screening_field_audit import export_screening_field_audit
+
+    layout = _storage_layout(ctx)
+    json_path, md_path, report = export_screening_field_audit(layout)
+
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"JSON report : {json_path}")
+    typer.echo(f"Markdown    : {md_path}")
+    typer.echo(f"Issue count : {report['issue_count']}")
+    typer.echo(f"Next action : {report['next_action']}")
+
+
+@app.command("index-uniprot-swissprot")
+def index_uniprot_swissprot_cmd(
+    ctx: typer.Context,
+    source_path: Annotated[
+        Optional[Path],
+        typer.Option("--source-path", help="Optional path to the staged UniProt Swiss-Prot .dat.gz file."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of Swiss-Prot records to index for smoke/preview runs."),
+    ] = None,
+) -> None:
+    """Build a lightweight local index from the staged UniProt Swiss-Prot flat file."""
+    from pbdata.source_indexes import index_uniprot_swissprot
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    resolved_source = source_path
+    if resolved_source is None:
+        configured = str(config.sources.uniprot.extra.get("local_swissprot") or "").strip()
+        resolved_source = Path(configured) if configured else (layout.root / "data_sources" / "uniprot" / "uniprot_sprot.dat.gz")
+
+    result = index_uniprot_swissprot(layout, source_path=resolved_source, limit=limit)
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Source path  : {resolved_source}")
+    typer.echo(f"Index path   : {result.index_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+
+
+@app.command("index-alphafold-archive")
+def index_alphafold_archive_cmd(
+    ctx: typer.Context,
+    archive_path: Annotated[
+        Optional[Path],
+        typer.Option("--archive-path", help="Optional path to the staged AlphaFold bulk archive."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of AlphaFold archive members to index for smoke/preview runs."),
+    ] = None,
+) -> None:
+    """Build a lightweight accession index from the staged AlphaFold bulk archive."""
+    from pbdata.source_indexes import index_alphafold_archive
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    resolved_archive = archive_path
+    if resolved_archive is None:
+        configured = str(config.sources.alphafold_db.extra.get("local_archive") or "").strip()
+        resolved_archive = Path(configured) if configured else (layout.root / "data_sources" / "alphafold" / "swissprot_pdb_v6.tar")
+
+    result = index_alphafold_archive(layout, archive_path=resolved_archive, limit=limit)
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Archive path : {resolved_archive}")
+    typer.echo(f"Index path   : {result.index_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+
+
+@app.command("plan-selected-pdb-refresh")
+def plan_selected_pdb_refresh_cmd(
+    ctx: typer.Context,
+    source_csv: Annotated[
+        Optional[Path],
+        typer.Option("--source-csv", help="Optional selected-PDB CSV. Defaults to custom_training_set.csv, then model_ready_pairs.csv."),
+    ] = None,
+    plan_name: Annotated[
+        str,
+        typer.Option("--plan-name", help="Output filename for the refresh manifest."),
+    ] = "selected_pdb_refresh_manifest.json",
+) -> None:
+    """Plan a targeted upstream refresh for the selected training-set or review PDB IDs."""
+    from pbdata.bootstrap_store import plan_selected_pdb_refresh
+
+    layout = _storage_layout(ctx)
+    try:
+        result = plan_selected_pdb_refresh(layout, source_csv=source_csv, plan_name=plan_name)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Storage root: {layout.root}")
+    typer.echo(f"Selected source : {result.selected_source}")
+    typer.echo(f"Refresh manifest: {result.manifest_path}")
+    typer.echo(f"PDB records     : {result.record_count}")
+
+
+@app.command("refresh-selected-pdbs")
+def refresh_selected_pdbs_cmd(
+    ctx: typer.Context,
+    manifest_path: Annotated[
+        Optional[Path],
+        typer.Option("--manifest-path", help="Optional refresh manifest path. Defaults to metadata/bootstrap_catalog/selected_pdb_refresh_manifest.json."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of selected PDB IDs to refresh from the manifest."),
+    ] = None,
+    all_selected: Annotated[
+        bool,
+        typer.Option("--all-selected", help="Refresh all selected PDB IDs instead of only those with missing local assets."),
+    ] = False,
+    with_live_enrichment: Annotated[
+        bool,
+        typer.Option("--with-live-enrichment/--skip-live-enrichment", help="Whether to re-run live BindingDB/ChEMBL enrichment during the targeted refresh."),
+    ] = False,
+) -> None:
+    """Refresh the selected PDB IDs described by the targeted refresh manifest."""
+    from pbdata.bootstrap_store import execute_selected_pdb_refresh
+
+    layout = _storage_layout(ctx)
+    cfg: AppConfig = ctx.obj.get("config", AppConfig())
+    manifest = manifest_path or (layout.bootstrap_store_dir / "selected_pdb_refresh_manifest.json")
+    selected_count = 0
+    try:
+        if manifest.exists():
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            selected_count = len(payload.get("records") or [])
+    except Exception:
+        selected_count = 0
+
+    write_stage_state(
+        layout,
+        stage="refresh-selected-pdbs",
+        status="running",
+        input_dir=manifest.parent,
+        output_dir=layout.extracted_dir,
+        workers=1,
+        counts={"inputs": selected_count},
+        notes="Refreshing the selected PDB IDs from the targeted bootstrap refresh manifest.",
+    )
+
+    try:
+        with stage_lock(layout, stage="refresh-selected-pdbs"):
+            result = execute_selected_pdb_refresh(
+                layout,
+                cfg,
+                manifest_path=manifest_path,
+                limit=limit,
+                only_missing_assets=not all_selected,
+                with_live_enrichment=with_live_enrichment,
+            )
+    except FileNotFoundError as exc:
+        write_stage_state(
+            layout,
+            stage="refresh-selected-pdbs",
+            status="failed",
+            input_dir=manifest.parent,
+            output_dir=layout.extracted_dir,
+            workers=1,
+            counts={"inputs": selected_count},
+            notes=str(exc),
+        )
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        write_stage_state(
+            layout,
+            stage="refresh-selected-pdbs",
+            status="failed",
+            input_dir=manifest.parent,
+            output_dir=layout.extracted_dir,
+            workers=1,
+            counts={"inputs": selected_count},
+            notes=f"Selected-PDB refresh failed: {exc}",
+        )
+        raise
+
+    write_stage_state(
+        layout,
+        stage="refresh-selected-pdbs",
+        status="completed" if result.failed_count == 0 else "completed_with_failures",
+        input_dir=result.manifest_path.parent,
+        output_dir=layout.extracted_dir,
+        workers=1,
+        counts={
+            "inputs": selected_count,
+            "refreshed": result.refreshed_count,
+            "skipped": result.skipped_count,
+            "failed": result.failed_count,
+        },
+        notes="Selected-PDB refresh updated raw, processed, extracted, and export artifacts for the targeted set.",
+    )
+
+    typer.echo(f"Storage root      : {layout.root}")
+    typer.echo(f"Refresh manifest  : {result.manifest_path}")
+    typer.echo(f"Execution report  : {result.execution_report_path}")
+    typer.echo(f"Refreshed PDBs    : {result.refreshed_count}")
+    typer.echo(f"Skipped PDBs      : {result.skipped_count}")
+    typer.echo(f"Failed PDBs       : {result.failed_count}")
+    if result.failed_pdb_ids:
+        typer.echo(f"Failed IDs        : {', '.join(result.failed_pdb_ids[:20])}")
+    if "master_csv" in result.export_status:
+        typer.echo(f"Master CSV        : {result.export_status['master_csv']}")
+    if "pair_csv" in result.export_status:
+        typer.echo(f"Pair CSV          : {result.export_status['pair_csv']}")
+    if "model_ready_pairs_csv" in result.export_status:
+        typer.echo(f"Model-ready CSV   : {result.export_status['model_ready_pairs_csv']}")
+    if "source_state_csv" in result.export_status:
+        typer.echo(f"Source State CSV  : {result.export_status['source_state_csv']}")
+
+
 @app.command("build-structural-graphs")
 def build_structural_graphs_cmd(
     ctx: typer.Context,
     graph_level: Annotated[str, typer.Option(help="residue | atom")] = "residue",
     scope: Annotated[str, typer.Option(help="whole_protein | interface_only | shell")] = "whole_protein",
     shell_radius: Annotated[float, typer.Option(help="Neighborhood shell radius in angstroms.")] = 8.0,
+    selection: Annotated[
+        str,
+        typer.Option(help="all | refresh_plan | training_set | preview"),
+    ] = "all",
     export_formats: Annotated[list[str] | None, typer.Option("--export-format", help="Repeatable: pyg | dgl | networkx")] = None,
+    pdb_ids: Annotated[list[str] | None, typer.Option("--pdb-id", help="Repeatable explicit PDB ID selection.")] = None,
+    manifest_path: Annotated[Optional[Path], typer.Option("--manifest-path", help="Optional manifest with records[].pdb_id entries.")] = None,
+    source_csv: Annotated[Optional[Path], typer.Option("--source-csv", help="Optional CSV with a pdb_id-style column.")] = None,
+    limit: Annotated[Optional[int], typer.Option("--limit", min=1, help="Optional cap on selected PDB IDs to graph.")] = None,
+    only_missing: Annotated[bool, typer.Option("--only-missing/--force-rebuild", help="Reuse current graph artifacts when the source structure has not changed.")] = True,
 ) -> None:
     """Build residue- or atom-level structural graphs for ML workflows."""
     from pbdata.graph.structural_graphs import build_structural_graphs
 
     layout = _storage_layout(ctx)
     formats = tuple(export_formats or ["pyg", "networkx"])
+    selected_hint = len(pdb_ids or []) if pdb_ids else (limit or 0)
+    write_stage_state(
+        layout,
+        stage="build-structural-graphs",
+        status="running",
+        input_dir=layout.extracted_dir,
+        output_dir=layout.workspace_graphs_dir / f"{graph_level}_{scope}",
+        workers=1,
+        counts={"inputs_hint": selected_hint},
+        notes=f"Building {graph_level}/{scope} structural graphs from selection '{selection}'.",
+    )
     try:
-        artifacts = build_structural_graphs(
-            layout,
-            graph_level=graph_level,
-            scope=scope,
-            shell_radius=shell_radius,
-            export_formats=formats,
-        )
+        with stage_lock(layout, stage="build-structural-graphs"):
+            artifacts = build_structural_graphs(
+                layout,
+                graph_level=graph_level,
+                scope=scope,
+                shell_radius=shell_radius,
+                export_formats=formats,
+                selection=selection,
+                pdb_ids=pdb_ids,
+                manifest_path=manifest_path,
+                source_csv=source_csv,
+                limit=limit,
+                only_missing=only_missing,
+            )
     except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        write_stage_state(
+            layout,
+            stage="build-structural-graphs",
+            status="failed",
+            input_dir=layout.extracted_dir,
+            output_dir=layout.workspace_graphs_dir / f"{graph_level}_{scope}",
+            workers=1,
+            counts={"inputs_hint": selected_hint},
+            notes=f"Structural graph build failed: {exc}",
+        )
         _exit_with_dependency_error(exc)
+    write_stage_state(
+        layout,
+        stage="build-structural-graphs",
+        status="completed",
+        input_dir=layout.extracted_dir,
+        output_dir=layout.workspace_graphs_dir / f"{graph_level}_{scope}",
+        workers=1,
+        counts={
+            "selected": int(artifacts.get("selected_count", "0") or 0),
+            "processed": int(artifacts.get("processed_count", "0") or 0),
+            "reused": int(artifacts.get("skipped_count", "0") or 0),
+        },
+        notes=f"Structural graph build completed for {graph_level}/{scope} using selection '{selection}'.",
+    )
     typer.echo(f"Storage root: {layout.root}")
     typer.echo(f"Structural graph manifest written to {artifacts['manifest']}")
+    typer.echo(f"Selected PDBs: {artifacts.get('selected_count', '0')}")
+    typer.echo(f"Built graphs : {artifacts.get('processed_count', '0')}")
+    typer.echo(f"Reused graphs: {artifacts.get('skipped_count', '0')}")
 
 
 @app.command("build-graph")
@@ -2207,21 +2770,57 @@ def engineer_dataset_cmd(
     from pbdata.dataset.engineering import DatasetEngineeringConfig, engineer_dataset
 
     layout = _storage_layout(ctx)
+    dataset_output_dir = layout.workspace_datasets_dir / dataset_name
+    write_stage_state(
+        layout,
+        stage="engineer-dataset",
+        status="running",
+        input_dir=layout.root,
+        output_dir=dataset_output_dir,
+        workers=1,
+        counts={},
+        notes=f"Engineering dataset '{dataset_name}' from the current curated workspace artifacts.",
+    )
     try:
-        artifacts = engineer_dataset(
-            layout,
-            config=DatasetEngineeringConfig(
-                dataset_name=dataset_name,
-                test_frac=test_frac,
-                cv_folds=cv_folds,
-                strict_family_isolation=strict_family_isolation,
-                embedding_backend=embedding_backend,
-                cluster_count=cluster_count,
-                seed=seed,
-            ),
-        )
+        with stage_lock(layout, stage="engineer-dataset"):
+            artifacts = engineer_dataset(
+                layout,
+                config=DatasetEngineeringConfig(
+                    dataset_name=dataset_name,
+                    test_frac=test_frac,
+                    cv_folds=cv_folds,
+                    strict_family_isolation=strict_family_isolation,
+                    embedding_backend=embedding_backend,
+                    cluster_count=cluster_count,
+                    seed=seed,
+                ),
+            )
     except (ModuleNotFoundError, ImportError, RuntimeError, ValueError) as exc:
+        write_stage_state(
+            layout,
+            stage="engineer-dataset",
+            status="failed",
+            input_dir=layout.root,
+            output_dir=dataset_output_dir,
+            workers=1,
+            counts={},
+            notes=f"Engineered dataset export failed: {exc}",
+        )
         _exit_with_dependency_error(exc)
+    write_stage_state(
+        layout,
+        stage="engineer-dataset",
+        status="completed",
+        input_dir=layout.root,
+        output_dir=dataset_output_dir,
+        workers=1,
+        counts={
+            "train_rows": _count_delimited_rows(Path(artifacts["train_csv"])) or 0 if "train_csv" in artifacts else 0,
+            "test_rows": _count_delimited_rows(Path(artifacts["test_csv"])) or 0 if "test_csv" in artifacts else 0,
+            "cv_folds": cv_folds,
+        },
+        notes=f"Engineered dataset '{dataset_name}' exported with diversity, feature, and graph coverage metadata.",
+    )
     typer.echo(f"Storage root: {layout.root}")
     if "train_csv" in artifacts:
         typer.echo(f"Train CSV        : {artifacts['train_csv']}")

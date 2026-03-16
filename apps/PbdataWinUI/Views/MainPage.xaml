@@ -27,12 +27,12 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Spacing="8">
-                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="PBDATA WORKFLOW PREVIEW" />
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="PBDATA WORKSPACE" />
                     <TextBlock Style="{StaticResource PageTitleStyle}" Text="Protein Binding Data Platform" />
                     <TextBlock
                         MaxWidth="680"
                         Style="{StaticResource SectionCaptionStyle}"
-                        Text="A clean WinUI shell for dataset design, model architecture selection, training outputs, and inference behavior. The current build uses representative generated content to show the product direction while the backend continues to mature." />
+                        Text="{x:Bind ViewModel.DemoDisclaimer, Mode=OneWay}" />
                     <StackPanel Orientation="Horizontal" Spacing="16">
                         <Border Style="{StaticResource SubtleCardBorderStyle}">
                             <StackPanel Spacing="4">
@@ -53,7 +53,7 @@
                     Grid.Column="1"
                     Style="{StaticResource CardBorderStyle}">
                     <StackPanel Spacing="10">
-                        <TextBlock Style="{StaticResource EyebrowStyle}" Text="NEXT GUIDED STEP" />
+                        <TextBlock Style="{StaticResource EyebrowStyle}" Text="NEXT WORKFLOW STEP" />
                         <TextBlock
                             FontSize="22"
                             FontWeight="SemiBold"

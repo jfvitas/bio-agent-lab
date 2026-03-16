@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -33,6 +33,13 @@ class DatasetProfile:
     available_artifacts: dict[str, bool]
     summary: str
     next_action: str
+    graph_dataset_name: str = ""
+    graph_level: str = ""
+    graph_scope: str = ""
+    graph_selection: str = ""
+    graph_export_formats: tuple[str, ...] = ()
+    graph_covered_rows: int = 0
+    graph_covered_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -344,6 +351,28 @@ def _available_dataset_source(layout: StorageLayout) -> str:
     return "workspace"
 
 
+def _read_latest_dataset_graph_config(layout: StorageLayout) -> dict[str, Any]:
+    if not layout.workspace_datasets_dir.exists():
+        return {}
+
+    matches = sorted(
+        layout.workspace_datasets_dir.glob("*/graph_config.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not matches:
+        return {}
+
+    graph_config = _read_json(matches[0])
+    if not isinstance(graph_config, dict):
+        return {}
+
+    graph_config = dict(graph_config)
+    graph_config["_dataset_name"] = matches[0].parent.name
+    graph_config["_path"] = str(matches[0])
+    return graph_config
+
+
 def _label_fields(training_examples: list[dict[str, Any]]) -> tuple[str, ...]:
     fields: dict[str, None] = {}
     for row in training_examples:
@@ -379,9 +408,24 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
     feature_records = _read_json(layout.features_dir / "feature_records.json")
     engineered_train = _read_csv_rows(layout.workspace_datasets_dir / "engineered_dataset" / "train.csv")
     custom_rows = _read_csv_rows(layout.root / "custom_training_set.csv")
+    graph_config = _read_latest_dataset_graph_config(layout)
 
     graph_ready = isinstance(graph_nodes, list) and bool(graph_nodes) and isinstance(graph_edges, list) and bool(graph_edges)
     attribute_ready = bool(training_rows or engineered_train or custom_rows or isinstance(feature_records, list) and feature_records)
+    graph_covered_rows = int(graph_config.get("graph_covered_rows") or 0)
+    try:
+        graph_covered_fraction = float(graph_config.get("graph_covered_fraction") or 0.0)
+    except (TypeError, ValueError):
+        graph_covered_fraction = 0.0
+    graph_dataset_name = str(graph_config.get("_dataset_name") or "")
+    graph_level = str(graph_config.get("graph_level") or "")
+    graph_scope = str(graph_config.get("graph_scope") or "")
+    graph_selection = str(graph_config.get("graph_selection") or "")
+    graph_export_formats = tuple(
+        str(item)
+        for item in (graph_config.get("graph_export_formats") or [])
+        if str(item).strip()
+    )
     modalities: list[str] = []
     if attribute_ready:
         modalities.append("attributes")
@@ -410,9 +454,15 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
     if not attribute_ready:
         quality_flags.append("attribute_artifacts_missing")
 
+    coverage_suffix = (
+        f"; graph_coverage={graph_covered_fraction:.0%} across {graph_covered_rows:,} rows"
+        if graph_dataset_name
+        else ""
+    )
     summary = (
         f"{example_count:,} examples available; modalities="
         f"{', '.join(modalities)}; tasks={', '.join(tasks_available)}"
+        f"{coverage_suffix}"
     )
     if training_rows:
         next_action = "Use the recommendations below to choose a baseline, then compare against a graph-native or hybrid model."
@@ -442,6 +492,13 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
         },
         summary=summary,
         next_action=next_action,
+        graph_dataset_name=graph_dataset_name,
+        graph_level=graph_level,
+        graph_scope=graph_scope,
+        graph_selection=graph_selection,
+        graph_export_formats=graph_export_formats,
+        graph_covered_rows=graph_covered_rows,
+        graph_covered_fraction=graph_covered_fraction,
     )
 
 
@@ -539,6 +596,10 @@ def validate_model_studio_selection(
 def _effective_modality(profile: DatasetProfile, selection: ModelStudioSelection) -> str:
     if selection.modality != "auto":
         return selection.modality
+    if profile.graph_ready and profile.attribute_ready and profile.graph_dataset_name:
+        if profile.graph_covered_fraction < 0.35:
+            return "attributes"
+        return "graphs+attributes"
     if "graphs+attributes" in profile.modalities_available:
         return "graphs+attributes"
     if "attributes" in profile.modalities_available:
@@ -604,6 +665,25 @@ def _score_candidate(candidate: _Candidate, profile: DatasetProfile, selection: 
         reasons.append("This architecture may be data-hungry for the current corpus size.")
     if profile.example_count >= 1000 and candidate.family in {"xgboost", "dense_nn", "gnn", "hybrid_fusion"}:
         score += 0.8
+
+    if profile.graph_dataset_name:
+        if candidate.family in {"gnn", "hybrid_fusion"}:
+            if profile.graph_covered_fraction >= 0.8:
+                score += 3.0
+                reasons.append("Graph coverage is strong enough to justify graph-heavy supervision.")
+            elif profile.graph_covered_fraction >= 0.4:
+                score += 0.8
+                reasons.append("Graph coverage is moderate, which keeps hybrid graph use viable.")
+            else:
+                score -= 2.5
+                reasons.append("Engineered dataset graph coverage is still light for a graph-heavy training path.")
+        elif candidate.family in {"xgboost", "random_forest"}:
+            if profile.graph_covered_fraction < 0.4:
+                score += 1.5
+                reasons.append("Tabular baselines are safer while graph-backed row coverage remains light.")
+            elif profile.graph_covered_fraction >= 0.8:
+                score -= 0.8
+                reasons.append("Pure tabular baselines leave too much graph signal on the table for this dataset.")
 
     if candidate.supervision == "unsupervised" and task == "unsupervised":
         score += 3.0
@@ -791,3 +871,156 @@ def export_starter_model_config(
     out_path = out_dir / f"{starter.model_id}_starter.json"
     out_path.write_text(json.dumps(starter.config, indent=2), encoding="utf-8")
     return out_path
+
+
+def build_model_recommendation_report(
+    layout: StorageLayout,
+    *,
+    selection: ModelStudioSelection | None = None,
+) -> dict[str, Any]:
+    active_selection = selection or ModelStudioSelection()
+    profile = build_dataset_profile(layout, dataset_source=active_selection.dataset_source)
+    compatibility_messages = validate_model_studio_selection(profile, active_selection)
+    recommendations = recommend_model_architectures(profile, active_selection)
+    top_recommendation = recommendations[0] if recommendations else None
+    starter_path = (
+        export_starter_model_config(layout, build_starter_model_config(profile, top_recommendation, active_selection))
+        if top_recommendation is not None
+        else None
+    )
+
+    blocking_errors = [message for message in compatibility_messages if message.priority == "error"]
+    warnings = [message for message in compatibility_messages if message.priority == "warning"]
+    if top_recommendation is None:
+        status = "blocked"
+    elif blocking_errors:
+        status = "ready_with_blockers"
+    elif warnings:
+        status = "ready_with_warnings"
+    else:
+        status = "ready"
+
+    if top_recommendation is None:
+        summary = "No trainable recommendation is available yet from the current workspace state."
+        next_action = profile.next_action
+    else:
+        graph_suffix = (
+            f" Graph coverage is {profile.graph_covered_fraction:.0%} across {profile.graph_covered_rows:,} engineered rows."
+            if profile.graph_dataset_name
+            else ""
+        )
+        summary = (
+            f"Top recommendation: {top_recommendation.label} ({top_recommendation.family}) for "
+            f"{top_recommendation.modality} {active_selection.task if active_selection.task != 'auto' else 'auto'} workflows."
+            f"{graph_suffix}"
+        )
+        next_action = (
+            "Address blocking compatibility issues before training."
+            if blocking_errors
+            else f"Use {top_recommendation.label} as the starting configuration, then compare it against the next ranked option."
+        )
+
+    return {
+        "generated_at": _utc_now(),
+        "status": status,
+        "summary": summary,
+        "next_action": next_action,
+        "dataset_profile": asdict(profile),
+        "selection": asdict(active_selection),
+        "compatibility_messages": [asdict(message) for message in compatibility_messages],
+        "recommendations": [asdict(item) for item in recommendations],
+        "top_recommendation": asdict(top_recommendation) if top_recommendation is not None else None,
+        "starter_config_path": str(starter_path) if starter_path is not None else "",
+        "starter_config_ready": starter_path is not None and starter_path.exists(),
+    }
+
+
+def export_model_recommendation_report(
+    layout: StorageLayout,
+    *,
+    selection: ModelStudioSelection | None = None,
+) -> tuple[Path, Path, dict[str, Any]]:
+    report = build_model_recommendation_report(layout, selection=selection)
+    layout.reports_dir.mkdir(parents=True, exist_ok=True)
+    json_path = layout.reports_dir / "model_studio_recommendation.json"
+    md_path = layout.reports_dir / "model_studio_recommendation.md"
+    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    dataset_profile = report.get("dataset_profile") or {}
+    top_recommendation = report.get("top_recommendation") or {}
+    compatibility_messages = report.get("compatibility_messages") or []
+    recommendation_rows = report.get("recommendations") or []
+    lines = [
+        "# Model Studio Recommendation",
+        "",
+        f"- Status: {report['status']}",
+        f"- Summary: {report['summary']}",
+        f"- Next action: {report['next_action']}",
+        f"- Dataset source: {dataset_profile.get('dataset_source', 'unknown')}",
+        f"- Examples: {dataset_profile.get('example_count', 0)}",
+        f"- Graph coverage: {dataset_profile.get('graph_covered_fraction', 0.0):.0%} across {dataset_profile.get('graph_covered_rows', 0)} rows",
+        "",
+        "## Top recommendation",
+    ]
+    if top_recommendation:
+        lines.extend(
+            [
+                f"- Label: {top_recommendation.get('label')}",
+                f"- Family: {top_recommendation.get('family')}",
+                f"- Modality: {top_recommendation.get('modality')}",
+                f"- Fit score: {top_recommendation.get('fit_score')}",
+                f"- Why it fits: {top_recommendation.get('why_it_fits')}",
+                f"- Starter config: {report.get('starter_config_path') or 'not exported'}",
+            ]
+        )
+    else:
+        lines.append("- No recommendation available yet.")
+
+    lines.extend(["", "## Ranked options"])
+    for row in recommendation_rows:
+        lines.append(
+            f"- #{row.get('rank')}: {row.get('label')} ({row.get('family')}) | modality={row.get('modality')} | fit_score={row.get('fit_score')}"
+        )
+
+    lines.extend(["", "## Compatibility checks"])
+    if compatibility_messages:
+        for message in compatibility_messages:
+            lines.append(f"- [{message.get('priority')}] {message.get('title')}: {message.get('body')}")
+    else:
+        lines.append("- No compatibility issues detected for the current default selection.")
+
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path, report
+
+
+def resolve_recommended_starter_config(
+    layout: StorageLayout,
+    *,
+    refresh_if_missing: bool = True,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    report_path = layout.reports_dir / "model_studio_recommendation.json"
+    report = _read_json(report_path)
+    if not isinstance(report, dict) and refresh_if_missing:
+        _, _, report = export_model_recommendation_report(layout)
+
+    if not isinstance(report, dict):
+        raise ValueError("Model recommendation report is unavailable.")
+
+    starter_config_path = Path(str(report.get("starter_config_path") or "")).expanduser()
+    if not starter_config_path.is_absolute():
+        starter_config_path = (layout.root / starter_config_path).resolve()
+
+    starter_config = _read_json(starter_config_path)
+    if not isinstance(starter_config, dict):
+        if not refresh_if_missing:
+            raise ValueError("Starter config path is unavailable in the current model recommendation report.")
+        _, _, report = export_model_recommendation_report(layout)
+        starter_config_path = Path(str(report.get("starter_config_path") or "")).expanduser()
+        if not starter_config_path.is_absolute():
+            starter_config_path = (layout.root / starter_config_path).resolve()
+        starter_config = _read_json(starter_config_path)
+
+    if not isinstance(starter_config, dict):
+        raise ValueError("Recommended starter config could not be loaded from the current workspace.")
+
+    return starter_config_path, starter_config, report

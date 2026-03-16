@@ -33,6 +33,25 @@ def test_load_pdbbind_index_parses_affinity_rows() -> None:
     assert row["affinity_value_standardized"] == 5.0
 
 
+def test_load_pdbbind_index_accepts_current_release_name() -> None:
+    root = _tmp_dir("pdbbind_current_release")
+    index_dir = root / "index"
+    index_dir.mkdir()
+    (index_dir / "INDEX_general_PL.2020R1.lst").write_text(
+        "# comment\n"
+        "2xyz 1.80 2020 8.10 Ki=2.5uM // current release naming\n",
+        encoding="utf-8",
+    )
+
+    rows = load_pdbbind_index(root)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["pdb_id"] == "2XYZ"
+    assert row["affinity_type"] == "Ki"
+    assert row["affinity_value_standardized"] == 2500.0
+
+
 def test_pdbbind_adapter_normalizes_local_index_row() -> None:
     root = _tmp_dir("pdbbind_adapter")
     index_dir = root / "index"
