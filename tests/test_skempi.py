@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
+from pbdata.storage import validate_skempi_csv
 from pbdata.sources.skempi import SKEMPIAdapter, _compute_ddg, _parse_row, load_skempi_csv
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
@@ -65,6 +66,17 @@ def test_load_skempi_csv_reads_local_file() -> None:
 
     assert len(rows) == 1
     assert rows[0].pdb_id == "1ABC"
+
+
+def test_validate_skempi_csv_accepts_current_header_variant() -> None:
+    path = _tmp_dir("skempi_validate") / "skempi.csv"
+    path.write_text(
+        "#Pdb;Mutation(s)_PDB;Mutation(s)_cleaned;ddG (kcal/mol)\n"
+        "1ABC;A42V;A42V;1.2\n",
+        encoding="utf-8",
+    )
+
+    assert validate_skempi_csv(path) is True
 
 
 def test_skempi_adapter_fetch_metadata_writes_local_cache() -> None:

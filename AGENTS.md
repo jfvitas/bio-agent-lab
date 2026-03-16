@@ -101,3 +101,51 @@ Avoid:
 - hidden identifier assumptions
 - giant unstructured downloads without normalization
 - designs that only work for toy datasets
+
+## Current execution plan
+
+The current mission is to move the repository from a mixed demo-plus-functional
+state into a fully usable local-first platform.
+
+The highest-priority execution rules are:
+
+- Treat demo/presentation artifacts and functional/live artifacts as separate
+  products. Do not allow simulated stage-state or seeded walkthrough data to be
+  mistaken for real functional outputs.
+- Make the bootstrap store the canonical fast local planning layer for source
+  coverage, training-set design, refresh planning, and graph targeting.
+- Build a real source prepopulation/update/delete policy for every source we
+  materially depend on. Every source should have explicit rules for:
+  - initial local packaging
+  - freshness checks
+  - targeted refresh
+  - stale-file retention
+  - deletion / garbage collection
+- Audit every screening and dataset-selection field before using it in policy.
+  Any field that is empty, poorly populated, scientifically ambiguous, or only
+  nominally present must either be populated properly, marked as advisory only,
+  or removed from decision-making.
+- Make training-set creation, split generation, engineered-dataset export,
+  graph coverage accounting, model recommendation, and training fully real in
+  functional mode. The platform should not rely on seeded scorecards, seeded
+  split files, or simulated stage-state for those paths.
+- Preserve and expand the full graph design space. Do not collapse the system
+  into one graph representation when the platform is intended to support
+  multiple graph scopes, granularities, and export targets.
+- Make Model Studio robust rather than aspirational. Expose only model-family
+  options that are truly supported in functional mode as first-class runnable
+  paths, and clearly mark roadmap architectures as planned when they are not yet
+  executable end to end.
+- Continue improving the WinUI shell as the polished presentation surface, but
+  ensure that functional mode is equally real and trustworthy.
+- Prefer validation that proves real usability:
+  - focused regression tests
+  - smoke checks
+  - GUI build and launch checks
+  - artifact verification
+  - explicit detection of simulated versus live workflow state
+
+For the fuller phased roadmap, acceptance criteria, and external acquisition
+checklist, see:
+
+- `docs/roadmap_to_fully_usable_platform.md`

@@ -19,6 +19,13 @@
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.DatasetNarrative, Mode=OneWay}" />
                     <CommandBar DefaultLabelPosition="Right">
                         <AppBarButton
+                            Command="{x:Bind ViewModel.BuildBootstrapStoreCommand}"
+                            Label="Build bootstrap">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Download" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
                             Command="{x:Bind ViewModel.PreviewSearchCommand}"
                             Label="Preview search">
                             <AppBarButton.Icon>
@@ -39,6 +46,41 @@
                                 <SymbolIcon Symbol="Sort" />
                             </AppBarButton.Icon>
                         </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.EngineerDatasetCommand}"
+                            Label="Engineer dataset">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="AllApps" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.BuildStructuralGraphsCommand}"
+                            Label="Build graphs">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Share" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.PlanSelectedPdbRefreshCommand}"
+                            Label="Plan refresh">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Sync" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RunSelectedPdbRefreshCommand}"
+                            Label="Run refresh">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Sync" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RefreshSelectedAndBuildGraphsCommand}"
+                            Label="Refresh + graphs">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Forward" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
                     </CommandBar>
                 </StackPanel>
             </Border>
@@ -50,6 +92,28 @@
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0" Spacing="20">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Local bootstrap foundation" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.BootstrapNarrative, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.BootstrapStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="14">
                             <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Scenario controls" />
@@ -93,6 +157,50 @@
                     </Border>
 
                     <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="14">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Structural graph design" />
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Graph level" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.GraphLevels, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedGraphLevelKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Graph scope" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.GraphScopes, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedGraphScopeKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Export bundle" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.GraphExportBundles, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedGraphExportKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Build target" />
+                                <ComboBox
+                                    DisplayMemberPath="Label"
+                                    ItemsSource="{x:Bind ViewModel.GraphBuildTargets, Mode=OneWay}"
+                                    SelectedValue="{x:Bind ViewModel.SelectedGraphTargetKey, Mode=TwoWay}"
+                                    SelectedValuePath="Key" />
+                            </StackPanel>
+
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.GraphDesignNarrative, Mode=OneWay}" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="10">
                             <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Leakage-resistant split story" />
                             <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SplitNarrative, Mode=OneWay}" />
@@ -100,26 +208,93 @@
                     </Border>
                 </StackPanel>
 
-                <Border Grid.Column="1" Style="{StaticResource CardBorderStyle}">
-                    <StackPanel Spacing="14">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Projected dataset" />
-                        <ItemsControl ItemsSource="{x:Bind ViewModel.DatasetStats, Mode=OneWay}">
-                            <ItemsControl.ItemTemplate>
-                                <DataTemplate>
-                                    <Border
-                                        Margin="0,0,0,12"
-                                        Style="{StaticResource SubtleCardBorderStyle}">
-                                        <StackPanel Spacing="4">
-                                            <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
-                                            <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
-                                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
-                                        </StackPanel>
-                                    </Border>
-                                </DataTemplate>
-                            </ItemsControl.ItemTemplate>
-                        </ItemsControl>
-                    </StackPanel>
-                </Border>
+                <StackPanel Grid.Column="1" Spacing="20">
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="14">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Current dataset state" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.DatasetStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Graph design readiness" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.GraphDesignStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Targeted refresh plan" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.RefreshPlanNarrative, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.RefreshPlanStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Latest graph package" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.GraphPackageNarrative, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.GraphPackageStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
             </Grid>
         </StackPanel>
     </ScrollViewer>

@@ -74,6 +74,10 @@ class WorkspaceStatusReport:
     release_snapshot_present: bool
     baseline_model_present: bool
     site_feature_runs: int
+    bootstrap_catalog_package_count: int
+    bootstrap_catalog_present: bool
+    bootstrap_store_present: bool
+    bootstrap_refresh_manifest_present: bool
     surrogate_checkpoint_present: bool
     active_stage_lock_count: int
     running_stage_state_count: int
@@ -168,6 +172,11 @@ def build_status_report(
     release_snapshot_present = latest_release.exists()
     baseline_model_present = model_path.exists()
     site_feature_runs = _count_glob(layout.artifact_manifests_dir, "*_input_manifest.json")
+    bootstrap_catalog_package_count = len(list(layout.bootstrap_catalog_packages_dir.glob("*/manifest.json")))
+    bootstrap_store_present = (layout.bootstrap_store_dir / "bootstrap_catalog.sqlite").exists()
+    bootstrap_refresh_manifest_present = any(
+        layout.bootstrap_store_dir.glob("*refresh*.json")
+    ) if layout.bootstrap_store_dir.exists() else False
     layout.reports_dir.mkdir(parents=True, exist_ok=True)
     processed_health_report_json = layout.reports_dir / "processed_json_health.json"
     processed_health_report_md = layout.reports_dir / "processed_json_health.md"
@@ -225,6 +234,10 @@ def build_status_report(
         release_snapshot_present=release_snapshot_present,
         baseline_model_present=baseline_model_present,
         site_feature_runs=site_feature_runs,
+        bootstrap_catalog_package_count=bootstrap_catalog_package_count,
+        bootstrap_catalog_present=bootstrap_catalog_package_count > 0,
+        bootstrap_store_present=bootstrap_store_present,
+        bootstrap_refresh_manifest_present=bootstrap_refresh_manifest_present,
         surrogate_checkpoint_present=(layout.surrogate_training_artifacts_dir / "latest_surrogate_checkpoint.json").exists(),
         active_stage_lock_count=active_stage_lock_count,
         running_stage_state_count=running_stage_state_count,

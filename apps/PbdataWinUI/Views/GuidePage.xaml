@@ -16,14 +16,72 @@
                 <StackPanel Spacing="14">
                     <TextBlock Style="{StaticResource EyebrowStyle}" Text="START HERE" />
                     <TextBlock Style="{StaticResource PageTitleStyle}" Text="{x:Bind ViewModel.DemoHeadline, Mode=OneWay}" />
+                    <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.WorkspaceSummary, Mode=OneWay}" />
+                    <StackPanel Spacing="6">
+                        <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Workspace root" />
+                        <TextBox Text="{x:Bind ViewModel.WorkspaceRootInput, Mode=TwoWay}" />
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <Button
+                                Command="{x:Bind ViewModel.ApplyWorkspaceRootCommand}"
+                                Content="Apply root"
+                                Style="{StaticResource SecondaryActionStyle}" />
+                            <Button
+                                Command="{x:Bind ViewModel.RefreshWorkspaceCommand}"
+                                Content="Refresh artifacts"
+                                Style="{StaticResource SecondaryActionStyle}" />
+                        </StackPanel>
+                    </StackPanel>
+                    <Grid ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <ProgressRing
+                            Width="28"
+                            Height="28"
+                            IsActive="{x:Bind ViewModel.IsWorkflowBusy, Mode=OneWay}" />
+                        <StackPanel Grid.Column="1" Spacing="2">
+                            <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Workflow engine" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.ActiveWorkflowLabel, Mode=OneWay}" />
+                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.WorkflowStatus, Mode=OneWay}" />
+                        </StackPanel>
+                    </Grid>
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.CurrentStepWhy, Mode=OneWay}" />
 
                     <CommandBar DefaultLabelPosition="Right">
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RunStatusCheckCommand}"
+                            Label="Status">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Sync" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RunDoctorCheckCommand}"
+                            Label="Doctor">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Repair" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.RunSmokeCheckCommand}"
+                            Label="Smoke check">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Accept" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.StartGuidedDemoCommand}"
                             Label="Begin workflow">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Play" />
+                            </AppBarButton.Icon>
+                        </AppBarButton>
+                        <AppBarButton
+                            Command="{x:Bind ViewModel.BuildBootstrapStoreCommand}"
+                            Label="Build bootstrap store">
+                            <AppBarButton.Icon>
+                                <SymbolIcon Symbol="Download" />
                             </AppBarButton.Icon>
                         </AppBarButton>
                         <AppBarButton
@@ -35,7 +93,7 @@
                         </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.ResetDemoCommand}"
-                            Label="Reset preview">
+                            Label="Reset workspace view">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Refresh" />
                             </AppBarButton.Icon>
@@ -102,8 +160,83 @@
 
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="12">
-                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="What this preview communicates" />
-                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="This shell shows the intended end-to-end product story: representative search coverage, leakage-aware dataset design, model-family tradeoffs, training curves, and saved-model inference." />
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Local-first foundation" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.BootstrapNarrative, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.BootstrapStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Selected-PDB refresh" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.RefreshPlanNarrative, Mode=OneWay}" />
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.RefreshPlanStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Machine readiness" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="This panel shows what this machine can execute right now before you launch a graph, training, export, or WinUI workflow step." />
+                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.EnvironmentGuidance, Mode=OneWay}" TextWrapping="WrapWholeWords" />
+                            <StackPanel Spacing="6">
+                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Suggested install commands" />
+                                <TextBox
+                                    IsReadOnly="True"
+                                    MinHeight="92"
+                                    Text="{x:Bind ViewModel.EnvironmentFixCommands, Mode=OneWay}"
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                            <ItemsControl ItemsSource="{x:Bind ViewModel.EnvironmentStats, Mode=OneWay}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border
+                                            Margin="0,0,0,12"
+                                            Style="{StaticResource SubtleCardBorderStyle}">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{Binding Label}" />
+                                                <TextBlock Style="{StaticResource MetricValueStyle}" Text="{Binding Value}" />
+                                                <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{Binding Caption}" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource CardBorderStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="What this workspace communicates" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="This shell shows the current product state for local bootstrap coverage, representative search breadth, leakage-aware dataset design, model-family tradeoffs, training curves, and saved-model inference." />
                             <ItemsControl ItemsSource="{x:Bind ViewModel.MetricBars, Mode=OneWay}">
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>

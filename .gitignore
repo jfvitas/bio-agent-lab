@@ -79,6 +79,16 @@ metadata/
 data/custom_training_sets/
 data/models/
 data/releases/
+data_sources/
+datasets/
+graphs/
+logs/
+structures/
+clean_structures/
+features/
+rosetta_outputs/
+mmseqs-linux-avx2/
+mmseqs-linux-avx2.tar.gz
 
 # WinUI build outputs
 apps/PbdataWinUI/bin/

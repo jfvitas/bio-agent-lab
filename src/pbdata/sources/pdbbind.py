@@ -10,7 +10,7 @@ This adapter supports the common local-file workflow:
 3. Point the adapter at that directory and parse the index file.
 
 The implementation here is intentionally conservative. It extracts only
-the fields that are stable across the published INDEX_general_PL_data
+the fields that are stable across the published protein-ligand index
 files: PDB ID, resolution, release year, and affinity label/value/unit.
 """
 
@@ -26,7 +26,7 @@ from pbdata.sources.base import BaseAdapter
 
 _ADAPTER_VERSION = "0.2.0"
 _AFFINITY_RE = re.compile(
-    r"(?P<kind>Kd|Ki|IC50)\s*=\s*(?P<value>[<>~]?\d+(?:\.\d+)?)\s*(?P<unit>fM|pM|nM|uM|mM|M)?",
+    r"(?P<kind>Kd|Ki|IC50)\s*(?P<relation><=|>=|=|<|>|~)?\s*(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>fM|pM|nM|uM|mM|M)?",
     re.IGNORECASE,
 )
 _TO_NM = {
@@ -67,7 +67,7 @@ def _parse_index_line(line: str) -> dict[str, Any] | None:
 
     head, sep, tail = stripped.partition("//")
     tokens = head.split()
-    if len(tokens) < 5:
+    if len(tokens) < 4:
         return None
 
     pdb_id = tokens[0].upper()
@@ -80,12 +80,16 @@ def _parse_index_line(line: str) -> dict[str, Any] | None:
     except ValueError:
         release_year = None
 
-    affinity_type, affinity_value, affinity_unit, standardized = _parse_affinity_token(tokens[4])
+    affinity_token = next((token for token in reversed(tokens) if _parse_affinity_token(token)[0]), "")
+    if not affinity_token:
+        return None
+
+    affinity_type, affinity_value, affinity_unit, standardized = _parse_affinity_token(affinity_token)
     return {
         "pdb_id": pdb_id,
         "resolution": resolution,
         "release_year": release_year,
-        "raw_affinity": tokens[4],
+        "raw_affinity": affinity_token,
         "affinity_type": affinity_type,
         "affinity_value": affinity_value,
         "affinity_unit": affinity_unit,
@@ -97,7 +101,10 @@ def _parse_index_line(line: str) -> dict[str, Any] | None:
 
 def load_pdbbind_index(local_dir: Path) -> list[dict[str, Any]]:
     index_dir = local_dir / "index"
-    index_files = sorted(index_dir.glob("INDEX_general_PL_data*"))
+    index_files: list[Path] = []
+    for pattern in ("INDEX_general_PL_data*", "INDEX_general_PL.*", "INDEX_general_PL*"):
+        index_files.extend(index_dir.glob(pattern))
+    index_files = sorted(dict.fromkeys(index_files))
     if not index_files:
         raise FileNotFoundError(f"No PDBbind index file found under {index_dir}")
 

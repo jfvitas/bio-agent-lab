@@ -10,13 +10,14 @@ Assumptions:
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import gemmi
 import pandas as pd
@@ -60,6 +61,166 @@ class StructuralGraphConfig:
     export_formats: tuple[str, ...] = ("pyg", "networkx")
 
 
+def _normalize_pdb_ids(values: Iterable[object]) -> list[str]:
+    seen: dict[str, None] = {}
+    for value in values:
+        text = str(value or "").strip().upper()
+        if text:
+            seen[text] = None
+    return list(seen)
+
+
+def _load_pdb_ids_from_manifest(path: Path) -> list[str]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    records = raw.get("records") if isinstance(raw, dict) else None
+    if isinstance(records, list):
+        return _normalize_pdb_ids(
+            record.get("pdb_id")
+            for record in records
+            if isinstance(record, dict)
+        )
+    return []
+
+
+def _load_pdb_ids_from_csv(path: Path) -> list[str]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        candidate_columns = ("pdb_id", "structure_id", "source_record_id", "pdb")
+        values: list[str] = []
+        for row in reader:
+            for column in candidate_columns:
+                if row.get(column):
+                    values.append(str(row[column]))
+                    break
+        return _normalize_pdb_ids(values)
+
+
+def _resolve_selected_pdb_ids(
+    layout: StorageLayout,
+    *,
+    selection: str,
+    pdb_ids: Iterable[str] | None,
+    manifest_path: Path | None,
+    source_csv: Path | None,
+    limit: int | None,
+) -> tuple[list[str] | None, str]:
+    if pdb_ids:
+        ordered = _normalize_pdb_ids(pdb_ids)
+        return (ordered[:limit] if limit else ordered), "explicit_pdb_ids"
+
+    resolved_manifest = manifest_path
+    resolved_csv = source_csv
+
+    if selection == "refresh_plan" and resolved_manifest is None:
+        candidate = layout.bootstrap_store_dir / "selected_pdb_refresh_manifest.json"
+        if candidate.exists():
+            resolved_manifest = candidate
+    elif selection == "training_set" and resolved_csv is None:
+        for candidate in (layout.root / "custom_training_set.csv", layout.root / "model_ready_pairs.csv"):
+            if candidate.exists():
+                resolved_csv = candidate
+                break
+    elif selection == "preview":
+        if resolved_manifest is None:
+            candidate_manifest = layout.bootstrap_store_dir / "selected_pdb_refresh_manifest.json"
+            if candidate_manifest.exists():
+                resolved_manifest = candidate_manifest
+        if resolved_manifest is None and resolved_csv is None:
+            for candidate in (layout.root / "custom_training_set.csv", layout.root / "model_ready_pairs.csv"):
+                if candidate.exists():
+                    resolved_csv = candidate
+                    break
+        if limit is None:
+            limit = 24
+
+    selected: list[str] | None = None
+    selection_label = selection
+    if resolved_manifest is not None:
+        selected = _load_pdb_ids_from_manifest(resolved_manifest)
+        selection_label = f"manifest:{resolved_manifest}"
+    elif resolved_csv is not None:
+        selected = _load_pdb_ids_from_csv(resolved_csv)
+        selection_label = f"csv:{resolved_csv}"
+
+    if selected is not None and limit is not None:
+        selected = selected[:limit]
+
+    return selected, selection_label
+
+
+def _expected_export_paths(out_dir: Path, pdb_id: str, export_formats: tuple[str, ...]) -> list[Path]:
+    expected = [out_dir / f"{pdb_id}.nodes.parquet", out_dir / f"{pdb_id}.edges.parquet", out_dir / f"{pdb_id}.summary.json"]
+    for export_format in export_formats:
+        if export_format == "networkx":
+            expected.append(out_dir / f"{pdb_id}.networkx.json")
+        elif _try_import_torch() is not None:
+            expected.append(out_dir / f"{pdb_id}.{export_format}.pt")
+        else:
+            expected.append(out_dir / f"{pdb_id}.{export_format}.json")
+    return expected
+
+
+def _load_existing_manifest_rows(manifest_path: Path) -> dict[str, dict[str, Any]]:
+    if not manifest_path.exists():
+        return {}
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    rows = raw.get("graphs") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    manifest_rows: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pdb_id = str(row.get("pdb_id") or "").upper()
+        if pdb_id:
+            manifest_rows[pdb_id] = row
+    return manifest_rows
+
+
+def _is_cached_graph_current(
+    manifest_row: dict[str, Any] | None,
+    *,
+    out_dir: Path,
+    pdb_id: str,
+    structure_path: Path,
+    graph_level: str,
+    scope: str,
+    shell_radius: float,
+    export_formats: tuple[str, ...],
+) -> bool:
+    if not manifest_row:
+        return False
+    if str(manifest_row.get("graph_level") or "") != graph_level:
+        return False
+    if str(manifest_row.get("scope") or "") != scope:
+        return False
+    try:
+        recorded_radius = float(manifest_row.get("shell_radius") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isclose(recorded_radius, shell_radius, rel_tol=0.0, abs_tol=1e-9):
+        return False
+
+    stat = structure_path.stat()
+    if int(manifest_row.get("structure_mtime_ns") or -1) != stat.st_mtime_ns:
+        return False
+    if int(manifest_row.get("structure_size_bytes") or -1) != stat.st_size:
+        return False
+
+    recorded_formats = {
+        str(value).strip().lower()
+        for value in manifest_row.get("export_formats") or []
+        if str(value).strip()
+    }
+    if recorded_formats != {value.lower() for value in export_formats}:
+        return False
+
+    return all(path.exists() for path in _expected_export_paths(out_dir, pdb_id, export_formats))
+
+
 def _try_import_torch() -> Any | None:
     try:
         import torch  # type: ignore
@@ -92,13 +253,20 @@ def _load_interface_rows(layout: StorageLayout) -> list[dict[str, Any]]:
     return rows
 
 
+def _index_interface_rows_by_pdb(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    indexed: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        pdb_id = str(row.get("pdb_id") or "").upper()
+        if pdb_id:
+            indexed[pdb_id].append(row)
+    return indexed
+
+
 def _scope_chain_ids(pdb_id: str, interfaces: list[dict[str, Any]], scope: str) -> set[str]:
     if scope == "whole_protein":
         return set()
     scoped: set[str] = set()
     for row in interfaces:
-        if str(row.get("pdb_id") or "").upper() != pdb_id.upper():
-            continue
         for field in ("chain_id_1", "chain_id_2", "chain_ids", "receptor_chain_ids"):
             raw = str(row.get(field) or "")
             for token in raw.replace(";", ",").split(","):
@@ -126,8 +294,6 @@ def _parse_residue_identifier(raw: object) -> tuple[str, int] | None:
 def _focus_residue_keys(pdb_id: str, interfaces: list[dict[str, Any]]) -> set[tuple[str, int]]:
     keys: set[tuple[str, int]] = set()
     for row in interfaces:
-        if str(row.get("pdb_id") or "").upper() != pdb_id.upper():
-            continue
         for residue_id in row.get("binding_site_residue_ids") or []:
             parsed = _parse_residue_identifier(residue_id)
             if parsed is not None:
@@ -517,29 +683,97 @@ def build_structural_graphs(
     scope: str = "whole_protein",
     shell_radius: float = 8.0,
     export_formats: tuple[str, ...] = ("pyg", "networkx"),
+    selection: str = "all",
+    pdb_ids: Iterable[str] | None = None,
+    manifest_path: Path | None = None,
+    source_csv: Path | None = None,
+    limit: int | None = None,
+    only_missing: bool = False,
 ) -> dict[str, str]:
     """Build structure-level ML graphs from extracted mmCIF/CIF paths."""
     if graph_level not in {"residue", "atom"}:
         raise ValueError("graph_level must be 'residue' or 'atom'")
     if scope not in {"whole_protein", "interface_only", "shell"}:
         raise ValueError("scope must be 'whole_protein', 'interface_only', or 'shell'")
+    if selection not in {"all", "refresh_plan", "training_set", "preview"}:
+        raise ValueError("selection must be 'all', 'refresh_plan', 'training_set', or 'preview'")
 
     entries = _load_entry_rows(layout)
-    interfaces = _load_interface_rows(layout)
+    interfaces_by_pdb = _index_interface_rows_by_pdb(_load_interface_rows(layout))
+    entries_by_pdb = {
+        str(entry.get("pdb_id") or "").upper(): entry
+        for entry in entries
+        if str(entry.get("pdb_id") or "").strip()
+    }
+    selected_pdb_ids, selection_label = _resolve_selected_pdb_ids(
+        layout,
+        selection=selection,
+        pdb_ids=pdb_ids,
+        manifest_path=manifest_path,
+        source_csv=source_csv,
+        limit=limit,
+    )
+    if selected_pdb_ids is None:
+        ordered_entries = [
+            entries_by_pdb[pdb_id]
+            for pdb_id in sorted(entries_by_pdb)
+        ]
+        if limit is not None:
+            ordered_entries = ordered_entries[:limit]
+    else:
+        ordered_entries = [
+            entries_by_pdb[pdb_id]
+            for pdb_id in selected_pdb_ids
+            if pdb_id in entries_by_pdb
+        ]
+
     out_dir = layout.workspace_graphs_dir / f"{graph_level}_{scope}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path_out = out_dir / "graph_manifest.json"
+    existing_manifest_rows = _load_existing_manifest_rows(manifest_path_out)
+    torch_available = _try_import_torch() is not None
 
     outputs: dict[str, str] = {}
-    manifest_rows: list[dict[str, Any]] = []
-    for entry in entries:
+    manifest_rows_by_pdb = dict(existing_manifest_rows)
+    processed_count = 0
+    skipped_count = 0
+
+    for entry in ordered_entries:
         pdb_id = str(entry.get("pdb_id") or "").upper()
         structure_path = Path(str(entry.get("structure_file_cif_path") or entry.get("structure_file_pdb_path") or ""))
         if not pdb_id or not structure_path.exists():
             continue
+        existing_row = existing_manifest_rows.get(pdb_id)
+        if only_missing and _is_cached_graph_current(
+            existing_row,
+            out_dir=out_dir,
+            pdb_id=pdb_id,
+            structure_path=structure_path,
+            graph_level=graph_level,
+            scope=scope,
+            shell_radius=shell_radius,
+            export_formats=export_formats,
+        ):
+            skipped_count += 1
+            outputs[f"{pdb_id}_summary"] = str(out_dir / f"{pdb_id}.summary.json")
+            for export_path in _expected_export_paths(out_dir, pdb_id, export_formats):
+                if export_path.name.endswith(".networkx.json"):
+                    outputs[f"{pdb_id}_networkx"] = str(export_path)
+            if "pyg" in export_formats:
+                outputs[f"{pdb_id}_pyg"] = str((out_dir / f"{pdb_id}.pyg.pt") if (out_dir / f"{pdb_id}.pyg.pt").exists() else (out_dir / f"{pdb_id}.pyg.json"))
+            if "dgl" in export_formats:
+                outputs[f"{pdb_id}_dgl"] = str((out_dir / f"{pdb_id}.dgl.pt") if (out_dir / f"{pdb_id}.dgl.pt").exists() else (out_dir / f"{pdb_id}.dgl.json"))
+            manifest_rows_by_pdb[pdb_id] = {
+                **existing_row,
+                "cached": True,
+            }
+            continue
+
         structure = gemmi.read_structure(str(structure_path))
         secondary_structure_index = _secondary_structure_index(structure_path)
-        scoped_chain_ids = _scope_chain_ids(pdb_id, interfaces, scope)
-        focus_residue_keys = _focus_residue_keys(pdb_id, interfaces)
+        interface_rows = interfaces_by_pdb.get(pdb_id, [])
+        scoped_chain_ids = _scope_chain_ids(pdb_id, interface_rows, scope)
+        focus_residue_keys = _focus_residue_keys(pdb_id, interface_rows)
         all_nodes: list[dict[str, Any]] = []
         focus_node_ids: set[str] = set()
         for model in structure:
@@ -606,7 +840,7 @@ def build_structural_graphs(
                 pdb_id=pdb_id,
                 export_name="pyg",
                 payload={
-                    "format_note": "torch_tensor_bundle" if _try_import_torch() is not None else "json_feature_bundle_no_torch",
+                    "format_note": "torch_tensor_bundle" if torch_available else "json_feature_bundle_no_torch",
                     "x": node_features,
                     "edge_index": edge_index,
                     "edge_attr": edge_features,
@@ -641,19 +875,46 @@ def build_structural_graphs(
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         outputs[f"{pdb_id}_summary"] = str(summary_path)
 
-        manifest_rows.append(
+        structure_stat = structure_path.stat()
+        manifest_rows_by_pdb[pdb_id] = {
+            "pdb_id": pdb_id,
+            "graph_level": graph_level,
+            "scope": scope,
+            "shell_radius": shell_radius,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "structure_path": str(structure_path),
+            "structure_mtime_ns": structure_stat.st_mtime_ns,
+            "structure_size_bytes": structure_stat.st_size,
+            "summary_path": str(summary_path),
+            "export_formats": list(export_formats),
+            "cached": False,
+        }
+        processed_count += 1
+
+    manifest_rows = [
+        manifest_rows_by_pdb[pdb_id]
+        for pdb_id in sorted(manifest_rows_by_pdb)
+    ]
+    manifest_path_out.write_text(
+        json.dumps(
             {
-                "pdb_id": pdb_id,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "graph_level": graph_level,
                 "scope": scope,
-                "shell_radius": shell_radius,
-                "node_count": len(nodes),
-                "edge_count": len(edges),
-                "structure_path": str(structure_path),
-                "summary_path": str(summary_path),
-            }
-        )
-    manifest_path = out_dir / "graph_manifest.json"
-    manifest_path.write_text(json.dumps({"generated_at": datetime.now(timezone.utc).isoformat(), "graph_level": graph_level, "scope": scope, "export_formats": list(export_formats), "graphs": manifest_rows}, indent=2), encoding="utf-8")
-    outputs["manifest"] = str(manifest_path)
+                "export_formats": list(export_formats),
+                "selection": selection_label,
+                "selected_count": len(ordered_entries),
+                "processed_count": processed_count,
+                "skipped_count": skipped_count,
+                "graphs": manifest_rows,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    outputs["manifest"] = str(manifest_path_out)
+    outputs["processed_count"] = str(processed_count)
+    outputs["skipped_count"] = str(skipped_count)
+    outputs["selected_count"] = str(len(ordered_entries))
     return outputs

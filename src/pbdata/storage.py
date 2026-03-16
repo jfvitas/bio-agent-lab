@@ -60,6 +60,14 @@ class StorageLayout:
         return self.root / "metadata"
 
     @property
+    def bootstrap_store_dir(self) -> Path:
+        return self.workspace_metadata_dir / "bootstrap_catalog"
+
+    @property
+    def source_indexes_dir(self) -> Path:
+        return self.workspace_metadata_dir / "source_indexes"
+
+    @property
     def workspace_logs_dir(self) -> Path:
         return self.root / "logs"
 
@@ -86,6 +94,10 @@ class StorageLayout:
     @property
     def raw_rcsb_packages_dir(self) -> Path:
         return self.packaged_dir / "raw_rcsb"
+
+    @property
+    def bootstrap_catalog_packages_dir(self) -> Path:
+        return self.packaged_dir / "bootstrap_catalog"
 
     @property
     def extracted_consolidated_dir(self) -> Path:
@@ -317,8 +329,10 @@ def validate_skempi_csv(path: Path) -> bool:
             headers = reader.fieldnames or []
     except Exception:
         return False
-    required = {"#Pdb", "#Mutation(s)_cleaned"}
-    return required.issubset(set(headers))
+    header_set = set(headers)
+    has_pdb = "#Pdb" in header_set or "Pdb" in header_set
+    has_mutation = "#Mutation(s)_cleaned" in header_set or "Mutation(s)_cleaned" in header_set
+    return has_pdb and has_mutation
 
 
 def validate_bindingdb_raw_json(path: Path, *, expected_pdb_id: str | None = None) -> bool:

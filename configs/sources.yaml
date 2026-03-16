@@ -1,14 +1,19 @@
 sources:
   alphafold_db:
-    enabled: false
+    enabled: true
+    extra:
+      local_archive: data_sources/alphafold/swissprot_pdb_v6.tar
   bindingdb:
     enabled: true
-    extra: {}
+    extra:
+      local_dir: data/raw/bindingdb
+      bulk_zip: data_sources/bindingdb/BDB-mySQL_All_202603_dmp.zip
   biogrid:
     enabled: false
   biolip:
-    enabled: false
-    extra: {}
+    enabled: true
+    extra:
+      local_dir: data_sources/biolip
   cath:
     enabled: false
   chembl:
@@ -20,8 +25,9 @@ sources:
   interpro:
     enabled: false
   pdbbind:
-    enabled: false
-    extra: {}
+    enabled: true
+    extra:
+      local_dir: data_sources/pdbbind
   pfam:
     enabled: false
   prosite:
@@ -37,10 +43,13 @@ sources:
   scop:
     enabled: false
   skempi:
-    enabled: false
-    extra: {}
+    enabled: true
+    extra:
+      local_path: data/raw/skempi/skempi_v2.csv
   string:
     enabled: false
   uniprot:
-    enabled: false
+    enabled: true
+    extra:
+      local_swissprot: data_sources/uniprot/uniprot_sprot.dat.gz
 storage_root: C:\Users\jfvit\documents\bio-agent-lab
