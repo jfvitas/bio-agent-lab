@@ -1,5 +1,7 @@
 import csv
 import json
+import gzip
+import tarfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +16,13 @@ from pbdata.sources.pfam import PfamAdapter
 from pbdata.sources.reactome import ReactomeAdapter
 from pbdata.sources.scop import SCOPAdapter
 from pbdata.sources.uniprot import UniProtAdapter
+from pbdata.source_indexes import (
+    index_alphafold_archive,
+    index_cath_domains,
+    index_reactome_pathways,
+    index_scop_domains,
+    index_uniprot_swissprot,
+)
 from pbdata.storage import build_storage_layout
 from tests.test_feature_execution import _tmp_dir, _write_extracted_fixture
 
@@ -279,6 +288,231 @@ def test_harvest_unified_metadata_with_external_annotations() -> None:
     assert manifest["annotation_summary"]["reactome_ready"] == 1
     assert manifest["annotation_summary"]["interpro_ready"] == 1
     assert manifest["annotation_summary"]["cath_ready"] == 1
+
+
+@patch("pbdata.sources.uniprot.requests.get")
+def test_uniprot_adapter_prefers_local_index_when_available(mock_get: MagicMock) -> None:
+    layout = build_storage_layout(_tmp_dir("uniprot_local_index"))
+    source_path = layout.root / "data_sources" / "uniprot" / "uniprot_sprot.dat.gz"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(source_path, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "ID   TEST_HUMAN Reviewed; 123 AA.\n"
+            "AC   P12345;\n"
+            "DE   RecName: Full=Indexed protein;\n"
+            "GN   Name=KIN1;\n"
+            "OS   Homo sapiens.\n"
+            "OX   NCBI_TaxID=9606;\n"
+            "DR   InterPro; IPR000001; Example.\n"
+            "DR   Pfam; PF00001; Example.\n"
+            "DR   GO; GO:0004672; Example.\n"
+            "KW   Kinase.\n"
+            "SQ   SEQUENCE   4 AA;\n"
+            "     MAAA\n"
+            "//\n"
+        )
+    index_uniprot_swissprot(layout, source_path=source_path)
+
+    record = UniProtAdapter(storage_root=layout.root).fetch_annotation("P12345")
+
+    assert record.protein_name == "Indexed protein"
+    assert record.sequence_length == 4
+    assert record.interpro_ids == ["IPR000001"]
+    mock_get.assert_not_called()
+
+
+@patch("pbdata.sources.alphafold.requests.get")
+def test_alphafold_adapter_prefers_local_index_when_available(mock_get: MagicMock) -> None:
+    layout = build_storage_layout(_tmp_dir("alphafold_local_index"))
+    archive_path = layout.root / "data_sources" / "alphafold" / "swissprot_pdb_v6.tar"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    member_path = layout.root / "AF-P12345-F1-model_v6.pdb.gz"
+    with gzip.open(member_path, "wt", encoding="utf-8") as handle:
+        handle.write("MODEL")
+    with tarfile.open(archive_path, "w") as archive:
+        archive.add(member_path, arcname=member_path.name)
+    index_alphafold_archive(layout, archive_path=archive_path)
+
+    record = AlphaFoldAdapter(storage_root=layout.root).fetch_prediction("P12345")
+
+    assert record.entry_id == "AF-P12345-F1-model_v6"
+    assert record.model_version == "v6"
+    mock_get.assert_not_called()
+
+
+@patch("pbdata.sources.reactome.requests.get")
+def test_reactome_adapter_prefers_local_index_when_available(mock_get: MagicMock) -> None:
+    layout = build_storage_layout(_tmp_dir("reactome_local_index"))
+    reactome_dir = layout.root / "data_sources" / "reactome"
+    reactome_dir.mkdir(parents=True, exist_ok=True)
+    mapping_path = reactome_dir / "UniProt2Reactome_All_Levels.txt"
+    pathways_path = reactome_dir / "ReactomePathways.txt"
+    mapping_path.write_text(
+        "\n".join(
+            [
+                "P12345\tR-HSA-12345\thttps://reactome.org/PathwayBrowser/#/R-HSA-12345\tSignal transduction\tTAS\tHomo sapiens",
+                "P12345\tR-HSA-67890\thttps://reactome.org/PathwayBrowser/#/R-HSA-67890\tImmune system\tIEA\tHomo sapiens",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pathways_path.write_text(
+        "\n".join(
+            [
+                "R-HSA-12345\tSignal transduction\tHomo sapiens",
+                "R-HSA-67890\tImmune system\tHomo sapiens",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    index_reactome_pathways(layout, mapping_path=mapping_path, pathways_path=pathways_path)
+
+    record = ReactomeAdapter(storage_root=layout.root).fetch_annotation("P12345")
+
+    assert record.pathway_count == 2
+    assert record.pathway_ids == ["R-HSA-12345", "R-HSA-67890"]
+    mock_get.assert_not_called()
+
+
+def test_harvest_unified_metadata_uses_local_reactome_index() -> None:
+    layout = build_storage_layout(_tmp_dir("workflow_metadata_reactome_local"))
+    _write_extracted_fixture(layout)
+    reactome_dir = layout.root / "data_sources" / "reactome"
+    reactome_dir.mkdir(parents=True, exist_ok=True)
+    mapping_path = reactome_dir / "UniProt2Reactome_All_Levels.txt"
+    pathways_path = reactome_dir / "ReactomePathways.txt"
+    mapping_path.write_text(
+        "P12345\tR-HSA-12345\thttps://reactome.org/PathwayBrowser/#/R-HSA-12345\tSignal transduction\tTAS\tHomo sapiens\n",
+        encoding="utf-8",
+    )
+    pathways_path.write_text(
+        "R-HSA-12345\tSignal transduction\tHomo sapiens\n",
+        encoding="utf-8",
+    )
+    index_reactome_pathways(layout, mapping_path=mapping_path, pathways_path=pathways_path)
+
+    artifacts = harvest_unified_metadata(layout, enrich_reactome=True)
+    with Path(artifacts["metadata_csv"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows[0]["reactome_pathway_count"] == "1"
+    assert rows[0]["reactome_pathway_ids"] == "R-HSA-12345"
+    assert rows[0]["reactome_pathway_names"] == "Signal transduction"
+
+
+@patch("pbdata.sources.pdbe_mappings.requests.get")
+def test_cath_adapter_prefers_local_index_when_available(mock_get: MagicMock) -> None:
+    layout = build_storage_layout(_tmp_dir("cath_local_index"))
+    cath_dir = layout.root / "data_sources" / "cath"
+    cath_dir.mkdir(parents=True, exist_ok=True)
+    domain_list_path = cath_dir / "cath-domain-list.txt"
+    boundaries_path = cath_dir / "cath-domain-boundaries.txt"
+    names_path = cath_dir / "cath-names.txt"
+    domain_list_path.write_text(
+        "1abcA00     1    10     8    10     1     1     1     1     1    59 1.000\n",
+        encoding="utf-8",
+    )
+    boundaries_path.write_text(
+        "1abcA D01 F00  1  A    1 - A  100 -\n",
+        encoding="utf-8",
+    )
+    names_path.write_text(
+        "1.10.8.10    1abcA00    :Example cath fold\n",
+        encoding="utf-8",
+    )
+    index_cath_domains(
+        layout,
+        domain_list_path=domain_list_path,
+        boundaries_path=boundaries_path,
+        names_path=names_path,
+    )
+
+    record = CATHAdapter(storage_root=layout.root).fetch_annotation("1ABC")
+
+    assert record.domain_ids == ["1.10.8.10"]
+    assert record.chain_to_domain_ids["A"] == ["1.10.8.10"]
+    mock_get.assert_not_called()
+
+
+@patch("pbdata.sources.pdbe_mappings.requests.get")
+def test_scop_adapter_prefers_local_index_when_available(mock_get: MagicMock) -> None:
+    layout = build_storage_layout(_tmp_dir("scop_local_index"))
+    scop_dir = layout.root / "data_sources" / "scope"
+    scop_dir.mkdir(parents=True, exist_ok=True)
+    classification_path = scop_dir / "dir.cla.scope.2.08-stable.txt"
+    descriptions_path = scop_dir / "dir.des.scope.txt"
+    classification_path.write_text(
+        "d1abca_\t1abc\tA:\ta.1.1.1\t113449\tcl=46456,cf=46457,sf=46458,fa=46459,dm=46460,sp=116748,px=113449\n",
+        encoding="utf-8",
+    )
+    descriptions_path.write_text(
+        "46459\tfa\ta.1.1.1\t-\tExample scop fold\n",
+        encoding="utf-8",
+    )
+    index_scop_domains(
+        layout,
+        classification_path=classification_path,
+        descriptions_path=descriptions_path,
+    )
+
+    record = SCOPAdapter(storage_root=layout.root).fetch_annotation("1ABC")
+
+    assert record.domain_ids == ["a.1.1.1"]
+    assert record.chain_to_domain_ids["A"] == ["a.1.1.1"]
+    mock_get.assert_not_called()
+
+
+def test_harvest_unified_metadata_uses_local_cath_and_scop_indexes() -> None:
+    layout = build_storage_layout(_tmp_dir("workflow_metadata_fold_local"))
+    _write_extracted_fixture(layout)
+    cath_dir = layout.root / "data_sources" / "cath"
+    cath_dir.mkdir(parents=True, exist_ok=True)
+    scop_dir = layout.root / "data_sources" / "scope"
+    scop_dir.mkdir(parents=True, exist_ok=True)
+    (cath_dir / "cath-domain-list.txt").write_text(
+        "1abcA00     1    10     8    10     1     1     1     1     1    59 1.000\n",
+        encoding="utf-8",
+    )
+    (cath_dir / "cath-domain-boundaries.txt").write_text(
+        "1abcA D01 F00  1  A    1 - A  100 -\n",
+        encoding="utf-8",
+    )
+    (cath_dir / "cath-names.txt").write_text(
+        "1.10.8.10    1abcA00    :Example cath fold\n",
+        encoding="utf-8",
+    )
+    (scop_dir / "dir.cla.scope.2.08-stable.txt").write_text(
+        "d1abca_\t1abc\tA:\ta.1.1.1\t113449\tcl=46456,cf=46457,sf=46458,fa=46459,dm=46460,sp=116748,px=113449\n",
+        encoding="utf-8",
+    )
+    (scop_dir / "dir.des.scope.txt").write_text(
+        "46459\tfa\ta.1.1.1\t-\tExample scop fold\n",
+        encoding="utf-8",
+    )
+    index_cath_domains(
+        layout,
+        domain_list_path=(cath_dir / "cath-domain-list.txt"),
+        boundaries_path=(cath_dir / "cath-domain-boundaries.txt"),
+        names_path=(cath_dir / "cath-names.txt"),
+        force=True,
+    )
+    index_scop_domains(
+        layout,
+        classification_path=(scop_dir / "dir.cla.scope.2.08-stable.txt"),
+        descriptions_path=(scop_dir / "dir.des.scope.txt"),
+        force=True,
+    )
+
+    artifacts = harvest_unified_metadata(layout, enrich_cath=True, enrich_scop=True)
+    with Path(artifacts["metadata_csv"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows[0]["cath_ids"] == "1.10.8.10"
+    assert rows[0]["scop_ids"] == "a.1.1.1"
+    assert rows[0]["cath_names"] == "Example cath fold"
+    assert rows[0]["scop_names"] == "Example scop fold"
 
 
 def test_harvest_metadata_cli_with_external_annotations() -> None:

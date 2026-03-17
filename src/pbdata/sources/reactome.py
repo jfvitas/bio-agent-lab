@@ -9,6 +9,8 @@ from typing import Any
 
 import requests
 
+from pbdata.source_indexes import query_reactome_pathway_index
+from pbdata.storage import build_storage_layout
 from pbdata.storage import reuse_existing_file
 
 _REACTOME_CONTENT_SERVICE = "https://reactome.org/ContentService"
@@ -40,10 +42,12 @@ class ReactomeAdapter:
         *,
         species: str = "Homo sapiens",
         cache_dir: Path | None = None,
+        storage_root: Path | None = None,
         timeout: int = _TIMEOUT,
     ) -> None:
         self.species = species
         self.cache_dir = cache_dir
+        self.storage_root = Path(storage_root) if storage_root is not None else None
         self.timeout = timeout
 
     def fetch_metadata(self, uniprot_id: str) -> list[dict[str, Any]]:
@@ -89,5 +93,24 @@ class ReactomeAdapter:
         )
 
     def fetch_annotation(self, uniprot_id: str) -> ReactomePathwayRecord:
+        local_record = self._fetch_local_index_record(uniprot_id)
+        if local_record is not None:
+            return local_record
         raw = self.fetch_metadata(uniprot_id)
         return self.normalize_record(uniprot_id, raw)
+
+    def _fetch_local_index_record(self, uniprot_id: str) -> ReactomePathwayRecord | None:
+        if self.storage_root is None:
+            return None
+        payload = query_reactome_pathway_index(
+            build_storage_layout(self.storage_root),
+            uniprot_id,
+        )
+        if payload is None:
+            return None
+        return ReactomePathwayRecord(
+            uniprot_id=str(payload.get("uniprot_id") or uniprot_id).strip().upper(),
+            pathway_ids=[str(value) for value in payload.get("pathway_ids") or [] if str(value).strip()],
+            pathway_names=[str(value) for value in payload.get("pathway_names") or [] if str(value).strip()],
+            pathway_count=int(payload.get("pathway_count") or 0),
+        )

@@ -190,7 +190,10 @@ def _collect_annotation_maps(
     if enrich_uniprot and unique_ids:
         from pbdata.sources.uniprot import UniProtAdapter
 
-        adapter = UniProtAdapter(cache_dir=_annotation_cache_dir(layout, "uniprot"))
+        adapter = UniProtAdapter(
+            cache_dir=_annotation_cache_dir(layout, "uniprot"),
+            storage_root=layout.root,
+        )
         for accession in unique_ids:
             try:
                 uniprot_map[accession] = adapter.fetch_annotation(accession)
@@ -201,7 +204,10 @@ def _collect_annotation_maps(
     if enrich_alphafold and unique_ids:
         from pbdata.sources.alphafold import AlphaFoldAdapter
 
-        adapter = AlphaFoldAdapter(cache_dir=_annotation_cache_dir(layout, "alphafold_db"))
+        adapter = AlphaFoldAdapter(
+            cache_dir=_annotation_cache_dir(layout, "alphafold_db"),
+            storage_root=layout.root,
+        )
         for accession in unique_ids:
             try:
                 alphafold_map[accession] = adapter.fetch_prediction(accession)
@@ -212,7 +218,10 @@ def _collect_annotation_maps(
     if enrich_reactome and unique_ids:
         from pbdata.sources.reactome import ReactomeAdapter
 
-        adapter = ReactomeAdapter(cache_dir=_annotation_cache_dir(layout, "reactome"))
+        adapter = ReactomeAdapter(
+            cache_dir=_annotation_cache_dir(layout, "reactome"),
+            storage_root=layout.root,
+        )
         for accession in unique_ids:
             try:
                 reactome_map[accession] = adapter.fetch_annotation(accession)
@@ -245,7 +254,10 @@ def _collect_annotation_maps(
     if enrich_cath and unique_pdb_ids:
         from pbdata.sources.cath import CATHAdapter
 
-        adapter = CATHAdapter(cache_dir=_annotation_cache_dir(layout, "cath"))
+        adapter = CATHAdapter(
+            cache_dir=_annotation_cache_dir(layout, "cath"),
+            storage_root=layout.root,
+        )
         for pdb_id in unique_pdb_ids:
             try:
                 cath_map[pdb_id] = adapter.fetch_annotation(pdb_id)
@@ -256,7 +268,10 @@ def _collect_annotation_maps(
     if enrich_scop and unique_pdb_ids:
         from pbdata.sources.scop import SCOPAdapter
 
-        adapter = SCOPAdapter(cache_dir=_annotation_cache_dir(layout, "scop"))
+        adapter = SCOPAdapter(
+            cache_dir=_annotation_cache_dir(layout, "scop"),
+            storage_root=layout.root,
+        )
         for pdb_id in unique_pdb_ids:
             try:
                 scop_map[pdb_id] = adapter.fetch_annotation(pdb_id)

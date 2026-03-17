@@ -69,9 +69,16 @@ def _validate_alphafold_json(path: Path, *, expected_accession: str | None = Non
 class AlphaFoldAdapter:
     """Fetch AlphaFold DB prediction metadata by UniProt accession."""
 
-    def __init__(self, *, cache_dir: Path | None = None, timeout: int = _TIMEOUT) -> None:
+    def __init__(
+        self,
+        *,
+        cache_dir: Path | None = None,
+        timeout: int = _TIMEOUT,
+        storage_root: Path | None = None,
+    ) -> None:
         self.cache_dir = cache_dir
         self.timeout = timeout
+        self.storage_root = storage_root
 
     def fetch_metadata(self, accession: str) -> list[dict[str, Any]]:
         accession = accession.strip().upper()
@@ -117,6 +124,9 @@ class AlphaFoldAdapter:
         )
 
     def fetch_prediction(self, accession: str) -> AlphaFoldStructureRecord:
+        local_record = self._fetch_local_index_record(accession)
+        if local_record is not None:
+            return local_record
         raw = self.fetch_metadata(accession)
         if not raw:
             raise ValueError(f"No AlphaFold prediction records returned for {accession}.")
@@ -124,6 +134,33 @@ class AlphaFoldAdapter:
         if not isinstance(first, dict):
             raise ValueError(f"Unexpected AlphaFold payload for {accession}.")
         return self.normalize_record(first)
+
+    def _fetch_local_index_record(self, accession: str) -> AlphaFoldStructureRecord | None:
+        if self.storage_root is None:
+            return None
+        try:
+            from pbdata.source_indexes import query_alphafold_archive_index
+            from pbdata.storage import build_storage_layout
+
+            payload = query_alphafold_archive_index(
+                build_storage_layout(self.storage_root),
+                accession,
+            )
+        except Exception:
+            return None
+        if not payload:
+            return None
+        return AlphaFoldStructureRecord(
+            accession=str(payload.get("accession") or "").strip().upper(),
+            entry_id=str(payload.get("entry_id") or "").strip(),
+            model_created_date="",
+            model_version=str(payload.get("model_version") or "").strip(),
+            uniprot_start=None,
+            uniprot_end=None,
+            cif_url="",
+            pae_url="",
+            plddt_url="",
+        )
 
 
 def _safe_int(value: Any) -> int | None:

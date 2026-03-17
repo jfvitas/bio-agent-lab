@@ -55,9 +55,16 @@ def _validate_uniprot_json(path: Path, *, expected_accession: str | None = None)
 class UniProtAdapter:
     """Fetch and normalize UniProtKB entry metadata."""
 
-    def __init__(self, *, cache_dir: Path | None = None, timeout: int = _TIMEOUT) -> None:
+    def __init__(
+        self,
+        *,
+        cache_dir: Path | None = None,
+        timeout: int = _TIMEOUT,
+        storage_root: Path | None = None,
+    ) -> None:
         self.cache_dir = cache_dir
         self.timeout = timeout
+        self.storage_root = storage_root
 
     def fetch_metadata(self, accession: str) -> dict[str, Any]:
         accession = accession.strip().upper()
@@ -165,4 +172,45 @@ class UniProtAdapter:
         )
 
     def fetch_annotation(self, accession: str) -> UniProtAnnotationRecord:
+        local_record = self._fetch_local_index_record(accession)
+        if local_record is not None:
+            return local_record
         return self.normalize_record(self.fetch_metadata(accession))
+
+    def _fetch_local_index_record(self, accession: str) -> UniProtAnnotationRecord | None:
+        if self.storage_root is None:
+            return None
+        try:
+            from pbdata.source_indexes import query_uniprot_swissprot_index
+            from pbdata.storage import build_storage_layout
+
+            payload = query_uniprot_swissprot_index(
+                build_storage_layout(self.storage_root),
+                accession,
+            )
+        except Exception:
+            return None
+        if not payload:
+            return None
+        return UniProtAnnotationRecord(
+            accession=str(payload.get("accession") or "").strip().upper(),
+            reviewed=bool(payload.get("reviewed")),
+            protein_name=str(payload.get("protein_name") or "").strip(),
+            gene_names=[str(value) for value in payload.get("gene_names") or [] if str(value).strip()],
+            organism_name=str(payload.get("organism_name") or "").strip(),
+            taxonomy_id=_safe_int(payload.get("taxonomy_id")),
+            sequence="",
+            sequence_length=_safe_int(payload.get("sequence_length")),
+            pdb_ids=[str(value) for value in payload.get("pdb_ids") or [] if str(value).strip()],
+            interpro_ids=[str(value) for value in payload.get("interpro_ids") or [] if str(value).strip()],
+            pfam_ids=[str(value) for value in payload.get("pfam_ids") or [] if str(value).strip()],
+            go_terms=[str(value) for value in payload.get("go_terms") or [] if str(value).strip()],
+            keywords=[str(value) for value in payload.get("keywords") or [] if str(value).strip()],
+        )
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

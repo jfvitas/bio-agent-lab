@@ -229,6 +229,7 @@ def fetch_bindingdb_samples_for_pdb(
     if not config.sources.bindingdb.enabled or not pdb_id:
         return []
     enrichable_comp_ids = _raw_enrichable_comp_ids(raw or {})
+    chain_ids_by_uniprot = _raw_chain_ids_by_uniprot(raw or {})
     if raw is not None and not enrichable_comp_ids:
         write_source_state(
             layout,
@@ -242,13 +243,44 @@ def fetch_bindingdb_samples_for_pdb(
         return []
 
     from pbdata.sources.bindingdb import BindingDBAdapter
+    from pbdata.sources.bindingdb_bulk import build_bindingdb_bulk_index, fetch_bindingdb_bulk_samples
 
     local_dir = str(config.sources.bindingdb.extra.get("local_dir") or "").strip()
+    bulk_zip = Path(
+        str(
+            config.sources.bindingdb.extra.get("bulk_zip")
+            or (layout.root / "data_sources" / "bindingdb" / "BDB-mySQL_All_202603_dmp.zip")
+        )
+    )
     local_cache_path = Path(local_dir) / f"{pdb_id.upper()}.json" if local_dir else None
     managed_cache_path = layout.raw_bindingdb_dir / f"{pdb_id.upper()}.json"
     cache_path = managed_cache_path
     cache_mode = "managed_cache"
-    raw: dict | None = None
+    bindingdb_raw: dict | None = None
+
+    if bulk_zip.exists():
+        try:
+            bulk_index = build_bindingdb_bulk_index(layout, dump_zip_path=bulk_zip)
+            bulk_samples = fetch_bindingdb_bulk_samples(layout, pdb_id, index_path=bulk_index.index_path)
+            bulk_samples = _apply_bindingdb_chain_context(bulk_samples, chain_ids_by_uniprot)
+            write_source_state(
+                layout,
+                source_name="BindingDB",
+                status="ready" if bulk_samples else "no_matches",
+                mode="bulk_index",
+                cache_path=bulk_index.index_path,
+                record_id=pdb_id.upper(),
+                record_count=len(bulk_samples),
+                notes="BindingDB enrichment loaded from the staged bulk index.",
+                extra={
+                    "configured_bulk_zip": str(bulk_zip),
+                    "configured_local_dir": local_dir or None,
+                    "bulk_index_manifest": str(bulk_index.manifest_path),
+                },
+            )
+            return bulk_samples
+        except Exception as exc:
+            logger.warning("BindingDB bulk index lookup failed for %s: %s", pdb_id, exc)
 
     if local_cache_path and reuse_existing_file(
         local_cache_path,
@@ -256,18 +288,18 @@ def fetch_bindingdb_samples_for_pdb(
     ):
         cache_path = local_cache_path
         cache_mode = "local_cache"
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        bindingdb_raw = json.loads(cache_path.read_text(encoding="utf-8"))
     elif reuse_existing_file(
         managed_cache_path,
         validator=lambda path, expected=pdb_id: validate_bindingdb_raw_json(path, expected_pdb_id=expected),
     ):
         cache_path = managed_cache_path
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        bindingdb_raw = json.loads(cache_path.read_text(encoding="utf-8"))
     else:
         managed_cache_path.parent.mkdir(parents=True, exist_ok=True)
         adapter = BindingDBAdapter()
         try:
-            raw = adapter.fetch_metadata(pdb_id)
+            bindingdb_raw = adapter.fetch_metadata(pdb_id)
         except requests.HTTPError as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             if status_code == 404:
@@ -304,7 +336,7 @@ def fetch_bindingdb_samples_for_pdb(
                 extra={"configured_local_dir": local_dir or None},
             )
             return []
-        managed_cache_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        managed_cache_path.write_text(json.dumps(bindingdb_raw, indent=2), encoding="utf-8")
         cache_path = managed_cache_path
         cache_mode = "live_api"
         if not validate_bindingdb_raw_json(cache_path, expected_pdb_id=pdb_id):
@@ -336,7 +368,7 @@ def fetch_bindingdb_samples_for_pdb(
         ], layout.catalog_path)
 
     try:
-        samples = BindingDBAdapter().normalize_all(raw or {})
+        samples = BindingDBAdapter().normalize_all(bindingdb_raw or {})
     except Exception as exc:
         logger.warning("BindingDB normalization failed for %s: %s", pdb_id, exc)
         write_source_state(
@@ -351,6 +383,7 @@ def fetch_bindingdb_samples_for_pdb(
         )
         return []
 
+    samples = _apply_bindingdb_chain_context(samples, chain_ids_by_uniprot)
     samples = [
         sample.model_copy(update={
             "provenance": {
@@ -374,3 +407,24 @@ def fetch_bindingdb_samples_for_pdb(
         extra={"configured_local_dir": local_dir or None},
     )
     return samples
+
+
+def _apply_bindingdb_chain_context(
+    samples: list,
+    chain_ids_by_uniprot: dict[str, list[str]],
+) -> list:
+    if not samples or not chain_ids_by_uniprot:
+        return samples
+
+    contextualized: list = []
+    for sample in samples:
+        resolved_chain_ids: list[str] = []
+        for accession in sample.uniprot_ids or []:
+            for chain_id in chain_ids_by_uniprot.get(str(accession), []):
+                if chain_id and chain_id not in resolved_chain_ids:
+                    resolved_chain_ids.append(chain_id)
+        if resolved_chain_ids:
+            contextualized.append(sample.model_copy(update={"chain_ids_receptor": resolved_chain_ids}))
+        else:
+            contextualized.append(sample)
+    return contextualized
