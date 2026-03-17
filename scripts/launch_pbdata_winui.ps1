@@ -10,6 +10,7 @@ $localDotnetDir = Join-Path $repoRoot ".tools\dotnet"
 $localDotnetExe = Join-Path $localDotnetDir "dotnet.exe"
 $dotnetInstallScript = Join-Path $repoRoot ".tools\dotnet-install.ps1"
 $buildLogPath = Join-Path $repoRoot "logs\winui_launcher_build.log"
+$runtimeLogPath = Join-Path $repoRoot "logs\winui_launcher_runtime.log"
 
 function Write-Step([string]$message) {
     Write-Host ""
@@ -142,7 +143,35 @@ function Build-App([string]$dotnetCmd) {
 
 function Start-App() {
     Write-Step "Launching pbdata WinUI"
-    Start-Process -FilePath $exePath | Out-Null
+    Ensure-ParentDirectory $runtimeLogPath
+    $process = Start-Process -FilePath $exePath -PassThru
+    Start-Sleep -Seconds 6
+
+    $running = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    if ($null -eq $running) {
+        $message = @(
+            "[$timestamp] PbdataWinUI exited immediately after launch.",
+            "Executable: $exePath",
+            "Possible causes:",
+            "  - Windows App Runtime is missing or not registered correctly.",
+            "  - The machine is missing a required WebView2/runtime dependency.",
+            "  - The app hit a startup exception before the first window stayed open."
+        ) -join [Environment]::NewLine
+        Set-Content -Path $runtimeLogPath -Value $message -Encoding UTF8
+        throw "PbdataWinUI exited immediately after launch. See $runtimeLogPath"
+    }
+
+    $title = $running.MainWindowTitle
+    $windowText = if ([string]::IsNullOrWhiteSpace($title)) { "<no window title yet>" } else { $title }
+    $message = @(
+        "[$timestamp] PbdataWinUI launch verification succeeded.",
+        "PID: $($running.Id)",
+        "Title: $windowText",
+        "Responding: $($running.Responding)"
+    ) -join [Environment]::NewLine
+    Set-Content -Path $runtimeLogPath -Value $message -Encoding UTF8
 }
 
 $dotnetCmd = Ensure-Dotnet

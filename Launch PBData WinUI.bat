@@ -15,6 +15,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%BOOTSTRAP%"
 if errorlevel 1 (
     echo.
     echo ProteoSphere WinUI launch failed.
+    echo Check logs\winui_launcher_build.log and logs\winui_launcher_runtime.log for details.
     pause
     exit /b 1
 )
