@@ -77,8 +77,12 @@ class RunComparison:
     run_name: str
     location: Path
     family: str
+    requested_family: str
+    executed_family: str
     task: str
     source: str
+    functional_status: str
+    backend_id: str
     primary_metric_name: str
     primary_metric_value: float | None
     summary: str
@@ -89,9 +93,12 @@ class RunInspection:
     run_name: str
     location: Path
     family: str
+    requested_family: str
+    executed_family: str
     task: str
     source: str
     runtime_target: str
+    functional_status: str
     backend_id: str
     primary_metric_name: str
     primary_metric_value: float | None
@@ -205,6 +212,79 @@ def _extract_primary_metric(metrics: Any) -> tuple[str, float | None]:
     return "metric", None
 
 
+def _functional_status_from_manifest(manifest: dict[str, Any]) -> str:
+    status = str(manifest.get("functional_status") or "").strip()
+    if status:
+        return status
+    backend_plan = manifest.get("backend_plan") or {}
+    implementation = str(backend_plan.get("implementation") or "").strip()
+    if implementation == "native":
+        return "first_class"
+    if implementation == "fallback":
+        return "fallback"
+    if implementation == "surrogate":
+        return "surrogate"
+    if implementation == "unsupported":
+        return "planned"
+    return "unknown"
+
+
+def _executed_family_from_backend(backend_id: str, fallback_family: str) -> str:
+    backend_to_family = {
+        "xgboost": "xgboost",
+        "sklearn_hist_gradient_boosting": "hist_gradient_boosting",
+        "sklearn_random_forest": "random_forest",
+        "torch_tabular_mlp": "dense_nn",
+        "sklearn_mlp": "dense_nn",
+        "pyg_gnn": "gnn",
+        "pyg_hybrid_fusion": "hybrid_fusion",
+        "graph_surrogate_dense": "dense_nn",
+        "hybrid_surrogate_dense": "dense_nn",
+        "sklearn_kmeans": "clustering",
+        "pca_autoencoder": "pca_embedding",
+    }
+    return backend_to_family.get(str(backend_id or "").strip(), fallback_family)
+
+
+def _requested_family_from_manifest(manifest: dict[str, Any], metrics: dict[str, Any]) -> str:
+    return str(
+        manifest.get("requested_family")
+        or manifest.get("family")
+        or metrics.get("requested_family")
+        or metrics.get("family")
+        or "unknown"
+    )
+
+
+def _executed_family_from_manifest(manifest: dict[str, Any], metrics: dict[str, Any]) -> str:
+    backend_plan = manifest.get("backend_plan") or {}
+    backend_id = str(backend_plan.get("backend_id") or manifest.get("backend") or metrics.get("backend") or "").strip()
+    fallback_family = str(
+        manifest.get("executed_family")
+        or backend_plan.get("execution_family")
+        or manifest.get("family")
+        or metrics.get("family")
+        or "unknown"
+    )
+    return _executed_family_from_backend(backend_id, fallback_family)
+
+
+def _extract_split_counts(split_summary: Any) -> dict[str, int]:
+    split_counts: dict[str, int] = {}
+    if not isinstance(split_summary, dict):
+        return split_counts
+    nested_counts = split_summary.get("counts")
+    if isinstance(nested_counts, dict):
+        for split_name in ("train", "val", "test", "all"):
+            if split_name in nested_counts:
+                split_counts[split_name] = int(nested_counts.get(split_name) or 0)
+    for split_name in ("train", "val", "test", "all"):
+        details = split_summary.get(split_name)
+        if isinstance(details, dict):
+            split_counts[split_name] = int(details.get("count") or split_counts.get(split_name) or 0)
+    return split_counts
+
+
 def _copy_alias_artifact(dest_dir: Path, canonical_name: str, aliases: tuple[str, ...]) -> str | None:
     canonical_path = dest_dir / canonical_name
     if canonical_path.exists():
@@ -310,13 +390,26 @@ def _normalize_import_manifest(
             or backend in {"pyg_gnn", "pyg_hybrid_fusion"}
         ),
     }
+    requested_family = family
+    executed_family = _executed_family_from_backend(
+        str(backend_plan.get("backend_id") or backend),
+        str(backend_plan.get("execution_family") or family),
+    )
     normalized_manifest = {
         "generated_at": _utc_now(),
         "family": family,
+        "requested_family": requested_family,
+        "executed_family": executed_family,
+        "functional_status": _functional_status_from_manifest({"backend_plan": backend_plan}),
         "task": task,
         "backend": backend,
         "backend_plan": backend_plan,
         "runtime_target": runtime_target,
+        "graph_contract": (
+            config.get("graph_contract")
+            if isinstance(config.get("graph_contract"), dict)
+            else {}
+        ),
         "warnings": list(normalized_metrics.get("warnings") or []) if isinstance(normalized_metrics, dict) else [],
         "artifacts": {
             "metrics": "metrics.json" if (dest_dir / "metrics.json").exists() else None,
@@ -1313,6 +1406,13 @@ def execute_training_run(
             training_cfg=dict(starter_config.get("training") or {}),
         )
         warnings = list(backend_plan.warnings) + list(trainer_warnings)
+        functional_status = _functional_status_from_manifest({
+            "backend_plan": {"implementation": backend_plan.implementation},
+        })
+        executed_family = _executed_family_from_backend(
+            str(backend_plan.backend_id),
+            str(backend_plan.execution_family or family),
+        )
         metrics = {"unsupervised": dict(backend_info.get("metrics") or {})}
         resolved_config = dict(starter_config)
         resolved_config.update({
@@ -1375,6 +1475,9 @@ def execute_training_run(
             "generated_at": _utc_now(),
             "run_name": resolved_run_name,
             "family": family,
+            "requested_family": family,
+            "executed_family": executed_family,
+            "functional_status": functional_status,
             "task": "unsupervised",
             "runtime_target": runtime_target,
             "backend": backend_info.get("backend"),
@@ -1387,6 +1490,16 @@ def execute_training_run(
             },
             "storage_root": str(layout.root),
             "warnings": warnings,
+            "data_readiness": {
+                "raw_example_count": len(raw_examples),
+                "usable_example_count": len(examples),
+                "graph_contract_available": graph_contract.available,
+                "graph_contract_fraction": (
+                    graph_contract.matched_example_count / graph_contract.total_example_count
+                    if graph_contract.total_example_count
+                    else 0.0
+                ),
+            },
             "artifacts": {
                 "config": "config.json",
                 "model": "model.pkl",
@@ -1433,6 +1546,10 @@ def execute_training_run(
 
     effective_family = backend_plan.execution_family
     warnings: list[str] = list(backend_plan.warnings)
+    if str(split_info.get("strategy") or "") != "explicit":
+        warnings.append("Training split assignment was not fully explicit; at least part of this run used hash fallback splits.")
+    if family in {"gnn", "hybrid_fusion"} and not graph_contract.available:
+        warnings.append("Requested graph-native family without a native graph learning contract; graph execution could not be first-class.")
     graph_sample_manifest_path: str | None = None
     graph_dataset_manifest_path: str | None = None
     pyg_ready_manifest_path: str | None = None
@@ -1489,6 +1606,13 @@ def execute_training_run(
             training_cfg=dict(starter_config.get("training") or {}),
         )
     warnings.extend(trainer_warnings)
+    functional_status = _functional_status_from_manifest({
+        "backend_plan": {"implementation": backend_plan.implementation},
+    })
+    executed_family = _executed_family_from_backend(
+        str(backend_plan.backend_id),
+        str(backend_plan.execution_family or family),
+    )
 
     if runtime_target == "local_gpu":
         warnings.append("The initial local trainer currently uses CPU-backed sklearn/xgboost paths even when local_gpu is selected.")
@@ -1611,6 +1735,9 @@ def execute_training_run(
         "generated_at": _utc_now(),
         "run_name": resolved_run_name,
         "family": family,
+        "requested_family": family,
+        "executed_family": executed_family,
+        "functional_status": functional_status,
         "task": task,
         "runtime_target": runtime_target,
         "backend": backend_info.get("backend"),
@@ -1631,6 +1758,30 @@ def execute_training_run(
         "storage_root": str(layout.root),
         "target_name": target_name,
         "warnings": warnings,
+        "data_readiness": {
+            "raw_example_count": len(raw_examples),
+            "labeled_example_count": len(labeled_examples),
+            "split_strategy": split_info.get("strategy"),
+            "explicit_split_matches": int(split_info.get("explicit_matches") or 0),
+            "split_counts": split_info.get("counts") or {},
+            "graph_contract_available": graph_contract.available,
+            "graph_contract_fraction": (
+                graph_contract.matched_example_count / graph_contract.total_example_count
+                if graph_contract.total_example_count
+                else 0.0
+            ),
+        },
+        "evaluation_summary": {
+            "primary_metric_name": "f1" if task == "classification" else "rmse",
+            "primary_metric_value": (
+                float((metrics.get("test") or metrics.get("val") or metrics.get("train") or {}).get("f1", 0.0))
+                if task == "classification"
+                else float((metrics.get("test") or metrics.get("val") or metrics.get("train") or {}).get("rmse", 0.0))
+            ),
+            "train_prediction_count": len(train_pred),
+            "val_prediction_count": len(val_pred),
+            "test_prediction_count": len(test_pred),
+        },
         "artifacts": {
             "config": "config.json",
             "model": "model.pkl",
@@ -1645,6 +1796,9 @@ def execute_training_run(
             "hybrid_training_payload_manifest": hybrid_training_payload_manifest_path,
             "training_curve": "training_curve.svg",
             "test_performance": "test_performance.svg",
+            "train_predictions": "train_predictions.json",
+            "val_predictions": "val_predictions.json",
+            "test_predictions": "test_predictions.json",
         },
     }
     (run_dir / "run_manifest.json").write_text(json.dumps(run_manifest, indent=2), encoding="utf-8")
@@ -1740,19 +1894,31 @@ def compare_training_runs(layout: StorageLayout) -> list[RunComparison]:
         for run_dir in sorted((path for path in root.iterdir() if path.is_dir()), key=lambda item: item.name):
             manifest = _read_json(run_dir / "run_manifest.json") or {}
             metrics = _read_json(run_dir / "metrics.json") or _read_json(run_dir / "run_metrics.json") or {}
-            family = str(manifest.get("family") or metrics.get("family") or "unknown")
+            requested_family = _requested_family_from_manifest(manifest, metrics if isinstance(metrics, dict) else {})
+            executed_family = _executed_family_from_manifest(manifest, metrics if isinstance(metrics, dict) else {})
+            family = executed_family
             task = str(manifest.get("task") or metrics.get("task") or "unknown")
+            backend_plan = manifest.get("backend_plan") or {}
+            backend_id = str(backend_plan.get("backend_id") or manifest.get("backend") or metrics.get("backend") or "unknown")
+            functional_status = _functional_status_from_manifest(manifest)
             primary_name, primary_value = _extract_primary_metric(metrics)
             if primary_value is None:
                 summary = f"{run_dir.name}: metrics not yet normalized for comparison."
             else:
-                summary = f"{run_dir.name}: {family} {task} {primary_name}={primary_value:.3f}"
+                summary = (
+                    f"{run_dir.name}: requested={requested_family}, executed={executed_family}, "
+                    f"status={functional_status}, {task} {primary_name}={primary_value:.3f}"
+                )
             comparisons.append(RunComparison(
                 run_name=run_dir.name,
                 location=run_dir,
                 family=family,
+                requested_family=requested_family,
+                executed_family=executed_family,
                 task=task,
                 source=source_name,
+                functional_status=functional_status,
+                backend_id=backend_id,
                 primary_metric_name=primary_name,
                 primary_metric_value=primary_value,
                 summary=summary,
@@ -1774,11 +1940,14 @@ def inspect_training_run(run_dir: str | Path, *, source: str = "unknown") -> Run
     metrics = _read_json(resolved_run_dir / "metrics.json") or _read_json(resolved_run_dir / "run_metrics.json") or {}
     history = _read_json(resolved_run_dir / "history.json") or []
     split_summary = _read_json(resolved_run_dir / "split_summary.json") or {}
-    family = str(manifest.get("family") or metrics.get("family") or "unknown")
+    requested_family = _requested_family_from_manifest(manifest, metrics if isinstance(metrics, dict) else {})
+    executed_family = _executed_family_from_manifest(manifest, metrics if isinstance(metrics, dict) else {})
+    family = executed_family
     task = str(manifest.get("task") or metrics.get("task") or "unknown")
     runtime_target = str(manifest.get("runtime_target") or "unknown")
     backend_plan = manifest.get("backend_plan") or {}
     backend_id = str(backend_plan.get("backend_id") or manifest.get("backend") or "unknown")
+    functional_status = _functional_status_from_manifest(manifest)
     primary_metric_name, primary_metric_value = _extract_primary_metric(metrics)
     epoch_count = len(history) if isinstance(history, list) else 0
     history_summary: dict[str, Any] = {"epoch_count": epoch_count}
@@ -1799,12 +1968,7 @@ def inspect_training_run(run_dir: str | Path, *, source: str = "unknown") -> Run
                 history_summary["best_val_metric"] = min(val_candidates)
             else:
                 history_summary["best_val_metric"] = max(val_candidates)
-    split_counts: dict[str, int] = {}
-    if isinstance(split_summary, dict):
-        for split_name in ("train", "val", "test"):
-            details = split_summary.get(split_name)
-            if isinstance(details, dict):
-                split_counts[split_name] = int(details.get("count") or 0)
+    split_counts = _extract_split_counts(split_summary)
     training_curve_path = resolved_run_dir / "training_curve.svg"
     test_performance_path = resolved_run_dir / "test_performance.svg"
     train_predictions_path = resolved_run_dir / "train_predictions.json"
@@ -1838,9 +2002,12 @@ def inspect_training_run(run_dir: str | Path, *, source: str = "unknown") -> Run
         run_name=resolved_run_dir.name,
         location=resolved_run_dir,
         family=family,
+        requested_family=requested_family,
+        executed_family=executed_family,
         task=task,
         source=source,
         runtime_target=runtime_target,
+        functional_status=functional_status,
         backend_id=backend_id,
         primary_metric_name=primary_metric_name,
         primary_metric_value=primary_metric_value,
@@ -1886,11 +2053,15 @@ def build_training_run_report(layout: StorageLayout) -> dict[str, Any]:
         "chart_ready_count": sum(1 for item in inspections if item.chart_ready),
         "test_plot_ready_count": sum(1 for item in inspections if item.test_plot_ready),
         "native_graph_run_count": sum(1 for item in inspections if item.backend_id in {"pyg_gnn", "pyg_hybrid_fusion"}),
+        "non_first_class_run_count": sum(1 for item in inspections if item.functional_status != "first_class"),
         "best_overall": None if best_overall is None else {
             "run_name": best_overall.run_name,
             "family": best_overall.family,
+            "requested_family": best_overall.requested_family,
+            "executed_family": best_overall.executed_family,
             "task": best_overall.task,
             "backend_id": best_overall.backend_id,
+            "functional_status": best_overall.functional_status,
             "primary_metric_name": best_overall.primary_metric_name,
             "primary_metric_value": best_overall.primary_metric_value,
             "location": str(best_overall.location),
@@ -1899,7 +2070,10 @@ def build_training_run_report(layout: StorageLayout) -> dict[str, Any]:
             {
                 "family": family,
                 "run_name": inspection.run_name,
+                "requested_family": inspection.requested_family,
+                "executed_family": inspection.executed_family,
                 "backend_id": inspection.backend_id,
+                "functional_status": inspection.functional_status,
                 "primary_metric_name": inspection.primary_metric_name,
                 "primary_metric_value": inspection.primary_metric_value,
                 "location": str(inspection.location),
@@ -1910,10 +2084,13 @@ def build_training_run_report(layout: StorageLayout) -> dict[str, Any]:
             {
                 "run_name": inspection.run_name,
                 "family": inspection.family,
+                "requested_family": inspection.requested_family,
+                "executed_family": inspection.executed_family,
                 "task": inspection.task,
                 "source": inspection.source,
                 "runtime_target": inspection.runtime_target,
                 "backend_id": inspection.backend_id,
+                "functional_status": inspection.functional_status,
                 "primary_metric_name": inspection.primary_metric_name,
                 "primary_metric_value": inspection.primary_metric_value,
                 "epoch_count": inspection.epoch_count,

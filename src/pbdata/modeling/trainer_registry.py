@@ -49,6 +49,16 @@ def resolve_trainer_backend(
     warnings: list[str] = []
 
     if family == "random_forest":
+        if "sklearn" not in available:
+            warnings.append("scikit-learn is not installed; random forest cannot run in this runtime.")
+            return TrainerBackendPlan(
+                requested_family=family,
+                execution_family=family,
+                backend_id="unsupported",
+                implementation="unsupported",
+                native_graph=False,
+                warnings=tuple(warnings),
+            )
         return TrainerBackendPlan(
             requested_family=family,
             execution_family="random_forest",
@@ -145,6 +155,16 @@ def resolve_trainer_backend(
         )
 
     if family == "clustering":
+        if "sklearn" not in available:
+            warnings.append("scikit-learn is not installed; clustering cannot run in this runtime.")
+            return TrainerBackendPlan(
+                requested_family=family,
+                execution_family=family,
+                backend_id="unsupported",
+                implementation="unsupported",
+                native_graph=False,
+                warnings=tuple(warnings),
+            )
         return TrainerBackendPlan(
             requested_family=family,
             execution_family="clustering",
@@ -155,11 +175,22 @@ def resolve_trainer_backend(
         )
 
     if family == "autoencoder":
+        if "sklearn" not in available:
+            warnings.append("scikit-learn is not installed; the current autoencoder path cannot run in this runtime.")
+            return TrainerBackendPlan(
+                requested_family=family,
+                execution_family=family,
+                backend_id="unsupported",
+                implementation="unsupported",
+                native_graph=False,
+                warnings=tuple(warnings),
+            )
+        warnings.append("True neural autoencoder training is not implemented yet; using a PCA embedding surrogate.")
         return TrainerBackendPlan(
             requested_family=family,
             execution_family="autoencoder",
             backend_id="pca_autoencoder",
-            implementation="fallback",
+            implementation="surrogate",
             native_graph=False,
             warnings=tuple(warnings),
         )

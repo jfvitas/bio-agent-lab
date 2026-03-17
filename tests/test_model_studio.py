@@ -57,10 +57,20 @@ def test_build_dataset_profile_detects_graph_and_attribute_modalities() -> None:
     layout.splits_dir.mkdir(parents=True, exist_ok=True)
     (layout.training_dir / "training_examples.json").write_text(json.dumps([{
         "example_id": "train:1ABC:0",
+        "structure": {"pdb_id": "1ABC"},
+        "provenance": {"pdb_id": "1ABC", "pair_identity_key": "pair:1ABC"},
         "labels": {"binding_affinity_log10": 1.2, "affinity_type": "Kd"},
     }]), encoding="utf-8")
-    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{"node_id": "n1"}]), encoding="utf-8")
-    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{"source_node_id": "n1", "target_node_id": "n1"}]), encoding="utf-8")
+    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{
+        "node_id": "protein:1ABC",
+        "primary_id": "1ABC",
+        "metadata": {"pdb_id": "1ABC"},
+    }]), encoding="utf-8")
+    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{
+        "source_node_id": "protein:1ABC",
+        "target_node_id": "protein:1ABC",
+        "metadata": {"pdb_id": "1ABC"},
+    }]), encoding="utf-8")
     (layout.splits_dir / "train.txt").write_text("train:1ABC:0\n", encoding="utf-8")
     (layout.splits_dir / "val.txt").write_text("val:1ABC:0\n", encoding="utf-8")
     (layout.splits_dir / "test.txt").write_text("test:1ABC:0\n", encoding="utf-8")
@@ -69,6 +79,7 @@ def test_build_dataset_profile_detects_graph_and_attribute_modalities() -> None:
 
     assert profile.example_count == 1
     assert profile.graph_ready is True
+    assert profile.graph_native_ready is True
     assert profile.attribute_ready is True
     assert "graphs+attributes" in profile.modalities_available
     assert "regression" in profile.tasks_available
@@ -120,11 +131,24 @@ def test_recommend_model_architectures_prefers_hybrid_when_both_modalities_exist
     layout.graph_dir.mkdir(parents=True, exist_ok=True)
     layout.splits_dir.mkdir(parents=True, exist_ok=True)
     (layout.training_dir / "training_examples.json").write_text(json.dumps([
-        {"example_id": f"train:1ABC:{idx}", "labels": {"binding_affinity_log10": 1.0 + idx}}
+        {
+            "example_id": f"train:1ABC:{idx}",
+            "structure": {"pdb_id": "1ABC"},
+            "provenance": {"pdb_id": "1ABC", "pair_identity_key": f"pair:1ABC:{idx}"},
+            "labels": {"binding_affinity_log10": 1.0 + idx},
+        }
         for idx in range(1200)
     ]), encoding="utf-8")
-    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{"node_id": "n1"}]), encoding="utf-8")
-    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{"source_node_id": "n1", "target_node_id": "n1"}]), encoding="utf-8")
+    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{
+        "node_id": "protein:1ABC",
+        "primary_id": "1ABC",
+        "metadata": {"pdb_id": "1ABC"},
+    }]), encoding="utf-8")
+    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{
+        "source_node_id": "protein:1ABC",
+        "target_node_id": "protein:1ABC",
+        "metadata": {"pdb_id": "1ABC"},
+    }]), encoding="utf-8")
     (layout.splits_dir / "train.txt").write_text("\n".join(f"train:1ABC:{idx}" for idx in range(900)), encoding="utf-8")
     (layout.splits_dir / "val.txt").write_text("\n".join(f"val:1ABC:{idx}" for idx in range(150)), encoding="utf-8")
     (layout.splits_dir / "test.txt").write_text("\n".join(f"test:1ABC:{idx}" for idx in range(150)), encoding="utf-8")
@@ -133,11 +157,37 @@ def test_recommend_model_architectures_prefers_hybrid_when_both_modalities_exist
     recommendations = recommend_model_architectures(
         profile,
         ModelStudioSelection(modality="graphs+attributes", task="regression", compute_budget="high"),
+        installed_backends=("sklearn", "torch", "torch_geometric"),
     )
 
     assert len(recommendations) == 3
-    assert recommendations[0].family in {"hybrid_fusion", "gnn", "xgboost"}
-    assert any(rec.family == "hybrid_fusion" for rec in recommendations)
+    assert recommendations[0].functional_status == "first_class"
+    assert any(rec.family == "hybrid_fusion" and rec.functional_status == "first_class" for rec in recommendations)
+
+
+def test_recommend_model_architectures_demotes_graph_families_without_native_contract() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_recommend_demote_graph"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.graph_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(json.dumps([
+        {"example_id": f"train:X001:{idx}", "labels": {"binding_affinity_log10": 1.0 + idx}}
+        for idx in range(300)
+    ]), encoding="utf-8")
+    (layout.graph_dir / "graph_nodes.json").write_text(json.dumps([{"node_id": "n1"}]), encoding="utf-8")
+    (layout.graph_dir / "graph_edges.json").write_text(json.dumps([{"source_node_id": "n1", "target_node_id": "n1"}]), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("train:X001:0\n", encoding="utf-8")
+
+    profile = build_dataset_profile(layout)
+    recommendations = recommend_model_architectures(
+        profile,
+        ModelStudioSelection(modality="graphs+attributes", task="regression", compute_budget="high"),
+        installed_backends=("sklearn", "torch", "torch_geometric"),
+    )
+
+    assert recommendations[0].functional_status == "first_class"
+    assert recommendations[0].family in {"xgboost", "random_forest", "dense_nn"}
+    assert all(rec.family not in {"gnn", "hybrid_fusion"} for rec in recommendations)
 
 
 def test_recommend_model_architectures_returns_unsupervised_options() -> None:
@@ -206,7 +256,9 @@ def test_build_and_export_model_recommendation_report() -> None:
     json_path, md_path, saved_report = export_model_recommendation_report(layout)
 
     assert report["status"] in {"ready", "ready_with_warnings"}
-    assert report["top_recommendation"]["family"] in {"hybrid_fusion", "gnn", "xgboost"}
+    assert report["top_recommendation"]["functional_status"] == "first_class"
+    assert "functional_recommendations" in report
+    assert "secondary_recommendations" in report
     assert report["dataset_profile"]["graph_covered_fraction"] == pytest.approx(0.84)
     assert json_path.exists()
     assert md_path.exists()
@@ -313,6 +365,7 @@ def test_train_recommended_model_cli_safe_baseline() -> None:
     assert manifest["execution_strategy"] == "safe_baseline"
     assert manifest["recommended_family"]
     assert manifest["selected_family"] in {"random_forest", "dense_nn"}
+    assert manifest["executed_family"] in {"random_forest", "dense_nn"}
     assert "runtime_adjustment" in manifest
 
 
@@ -348,6 +401,14 @@ def test_resolve_trainer_backend_prefers_expected_fallbacks() -> None:
     )
     assert xgb_plan.implementation == "fallback"
     assert xgb_plan.backend_id == "sklearn_hist_gradient_boosting"
+
+    autoencoder_plan = resolve_trainer_backend(
+        "autoencoder",
+        runtime_target="local_cpu",
+        installed_backends=("sklearn",),
+    )
+    assert autoencoder_plan.implementation == "surrogate"
+    assert autoencoder_plan.backend_id == "pca_autoencoder"
 
     native_gnn_plan = resolve_trainer_backend(
         "gnn",
@@ -541,6 +602,7 @@ def test_import_training_run_detects_nested_output_layout_and_metrics_json() -> 
     import_manifest = json.loads((imported_dir / "import_manifest.json").read_text(encoding="utf-8"))
     assert manifest["runtime_target"] == "colab"
     assert manifest["backend"] == "torch_tabular_mlp"
+    assert manifest["executed_family"] == "dense_nn"
     assert import_manifest["detected_runtime_target"] == "colab"
     assert "runtime_targets.json" in import_manifest["copied_context_files"]
 
@@ -657,10 +719,43 @@ def test_import_training_run_uses_config_metadata_when_metrics_are_sparse() -> N
     assert manifest["backend"] == "pyg_hybrid_fusion"
     assert manifest["backend_plan"]["native_graph"] is True
     assert inspection.family == "hybrid_fusion"
+    assert inspection.executed_family == "hybrid_fusion"
     assert inspection.backend_id == "pyg_hybrid_fusion"
     assert inspection.primary_metric_name == "rmse"
     assert inspection.primary_metric_value == pytest.approx(0.38)
     assert inspection.artifacts["import_manifest"].endswith("import_manifest.json")
+
+
+def test_compare_training_runs_uses_executed_family_when_surrogate_manifest_present() -> None:
+    layout = build_storage_layout(_tmp_dir("model_studio_compare_surrogate_family"))
+    run_dir = layout.models_dir / "model_studio" / "runs" / "surrogate_gnn_demo"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_manifest.json").write_text(json.dumps({
+        "family": "gnn",
+        "requested_family": "gnn",
+        "executed_family": "dense_nn",
+        "functional_status": "surrogate",
+        "task": "regression",
+        "backend": "graph_surrogate_dense",
+        "backend_plan": {
+            "requested_family": "gnn",
+            "execution_family": "dense_nn",
+            "backend_id": "graph_surrogate_dense",
+            "implementation": "surrogate",
+            "native_graph": False,
+        },
+    }), encoding="utf-8")
+    (run_dir / "metrics.json").write_text(json.dumps({"test": {"rmse": 0.55}}), encoding="utf-8")
+
+    comparisons = compare_training_runs(layout)
+    inspection = inspect_training_run(run_dir, source="local")
+
+    assert comparisons[0].family == "dense_nn"
+    assert comparisons[0].requested_family == "gnn"
+    assert comparisons[0].functional_status == "surrogate"
+    assert inspection.family == "dense_nn"
+    assert inspection.requested_family == "gnn"
+    assert inspection.functional_status == "surrogate"
 
 
 def test_run_saved_model_batch_inference_collects_successes_and_failures() -> None:
@@ -1351,6 +1446,8 @@ def test_build_training_run_report_summarizes_chart_and_backend_state() -> None:
     assert report["test_plot_ready_count"] >= 1
     assert report["best_overall"]["run_name"] == result.run_name
     assert report["recent_runs"][0]["backend_id"] == "sklearn_random_forest"
+    assert report["recent_runs"][0]["split_counts"]["train"] == 8
+    assert report["recent_runs"][0]["functional_status"] == "first_class"
     assert report["recent_runs"][0]["artifacts"]["training_curve"].endswith("training_curve.svg")
 
 
@@ -1419,7 +1516,10 @@ def test_execute_unsupervised_clustering_run_writes_embedding_artifacts() -> Non
         starter_config={"family": "clustering", "task": "unsupervised", "training": {"cluster_count": 3, "seed": 9}},
     )
     metrics = json.loads((result.run_dir / "metrics.json").read_text(encoding="utf-8"))
+    manifest = json.loads((result.run_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert result.task == "unsupervised"
     assert "unsupervised" in metrics
+    assert manifest["functional_status"] == "first_class"
+    assert manifest["executed_family"] == "clustering"
     assert (result.run_dir / "embedding_records.json").exists()
     assert (result.run_dir / "test_performance.svg").exists()
