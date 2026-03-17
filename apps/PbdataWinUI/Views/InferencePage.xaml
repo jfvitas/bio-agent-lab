@@ -14,8 +14,8 @@
             Spacing="20">
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="12">
-                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="INFERENCE LAB" />
-                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Turn the saved model into ranked, explainable predictions" />
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="INFERENCE" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Review ranked, explainable predictions from a saved model" />
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.InferenceNarrative, Mode=OneWay}" />
                     <CommandBar DefaultLabelPosition="Right">
                         <AppBarButton
@@ -31,7 +31,7 @@
 
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="8">
-                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Scenario" />
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Use case" />
                     <ComboBox
                         DisplayMemberPath="Label"
                         ItemsSource="{x:Bind ViewModel.InferenceScenarios, Mode=OneWay}"

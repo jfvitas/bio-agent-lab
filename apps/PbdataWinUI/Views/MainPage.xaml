@@ -7,14 +7,14 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <NavigationView
+        <NavigationView
         x:Name="ShellNav"
         CompactModeThresholdWidth="960"
         ExpandedModeThresholdWidth="1360"
         CompactPaneLength="48"
         IsBackButtonVisible="Collapsed"
         IsSettingsVisible="False"
-        OpenPaneLength="220"
+        OpenPaneLength="232"
         PaneDisplayMode="Left"
         SelectionChanged="OnSelectionChanged">
         <NavigationView.Header>
@@ -23,16 +23,17 @@
                 Margin="20,12,20,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="360" />
+                    <ColumnDefinition Width="392" />
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Spacing="8">
-                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="PBDATA WORKSPACE" />
-                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Protein Binding Data Platform" />
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="PROTEOSPHERE" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Protein Intelligence Platform" />
                     <TextBlock
-                        MaxWidth="680"
+                        MaxWidth="700"
                         Style="{StaticResource SectionCaptionStyle}"
-                        Text="{x:Bind ViewModel.DemoDisclaimer, Mode=OneWay}" />
+                        Text="{x:Bind ViewModel.DemoDisclaimer, Mode=OneWay}"
+                        TextWrapping="WrapWholeWords" />
                     <StackPanel Orientation="Horizontal" Spacing="16">
                         <Border Style="{StaticResource SubtleCardBorderStyle}">
                             <StackPanel Spacing="4">
@@ -57,14 +58,19 @@
                         <TextBlock
                             FontSize="22"
                             FontWeight="SemiBold"
-                            Text="{x:Bind ViewModel.CurrentStepTitle, Mode=OneWay}" />
+                            Text="{x:Bind ViewModel.CurrentStepTitle, Mode=OneWay}"
+                            TextWrapping="WrapWholeWords" />
                         <TextBlock Style="{StaticResource MetricLabelStyle}" Text="{x:Bind ViewModel.ProgressLabel, Mode=OneWay}" />
-                        <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.CurrentStepWhy, Mode=OneWay}" />
+                        <TextBlock
+                            Style="{StaticResource BodyTextStyle}"
+                            Text="{x:Bind ViewModel.CurrentStepWhy, Mode=OneWay}"
+                            TextWrapping="WrapWholeWords" />
                         <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Click this next" />
                         <TextBlock
                             FontSize="16"
                             FontWeight="SemiBold"
-                            Text="{x:Bind ViewModel.CurrentStepClick, Mode=OneWay}" />
+                            Text="{x:Bind ViewModel.CurrentStepClick, Mode=OneWay}"
+                            TextWrapping="WrapWholeWords" />
                         <StackPanel
                             Orientation="Horizontal"
                             Spacing="10">
@@ -98,7 +104,7 @@
                     <SymbolIcon Symbol="Bullets" />
                 </NavigationViewItem.Icon>
             </NavigationViewItem>
-            <NavigationViewItem Tag="Inference" Content="Inference Lab">
+            <NavigationViewItem Tag="Inference" Content="Inference">
                 <NavigationViewItem.Icon>
                     <SymbolIcon Symbol="Forward" />
                 </NavigationViewItem.Icon>

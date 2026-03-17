@@ -88,7 +88,13 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
     split_diagnostics = _read_json(layout.splits_dir / "split_diagnostics.json")
     split_diagnostics = split_diagnostics if isinstance(split_diagnostics, dict) else {}
     metadata_rows = _read_csv_rows(layout.workspace_metadata_dir / "protein_metadata.csv")
+    model_ready_rows = _read_csv_rows(layout.root / "model_ready_pairs.csv")
     split_assignment = _split_assignment_by_example(examples, layout)
+    release_eligible_keys = {
+        (str(row.get("pair_identity_key") or "").strip(), str(row.get("binding_affinity_type") or "").strip())
+        for row in model_ready_rows
+        if str(row.get("pair_identity_key") or "").strip()
+    }
 
     example_count = len(examples)
     supervised_count = 0
@@ -120,6 +126,8 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         "missing_affinity_type": 0,
     }
     split_counts = {"train": 0, "val": 0, "test": 0, "unsplit": 0}
+    release_eligible_example_count = 0
+    release_eligible_assigned_count = 0
     train_targets: set[str] = set()
     train_ligands: set[str] = set()
     train_pairs: set[str] = set()
@@ -203,6 +211,11 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         source_agreement_counts[source_agreement] = source_agreement_counts.get(source_agreement, 0) + 1
 
         split_name = split_assignment.get(example_id, "unsplit")
+        is_release_eligible = (pair_key, affinity_type) in release_eligible_keys
+        if is_release_eligible:
+            release_eligible_example_count += 1
+            if split_name != "unsplit":
+                release_eligible_assigned_count += 1
         split_counts[split_name] += 1
         normalized_rows.append(
             {
@@ -212,6 +225,7 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
                 "pair_identity_key": pair_key,
                 "split_name": split_name,
                 "is_supervised": is_supervised,
+                "is_release_eligible": is_release_eligible,
             }
         )
         if split_name == "train":
@@ -294,6 +308,11 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         f"{conflict_fraction:.1%} conflicted; {degraded_fraction:.1%} degraded; "
         f"split={split_status or 'unknown'}"
     )
+    if release_eligible_example_count:
+        quality += (
+            "; release-eligible split coverage="
+            f"{(release_eligible_assigned_count / release_eligible_example_count):.1%}"
+        )
     if example_count == 0:
         next_action = "Build training examples, then splits, before training models."
     elif supervised_count == 0:
@@ -359,6 +378,16 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         "split_assignment_coverage": {
             "assigned_example_count": len(split_assignment),
             "assigned_fraction": round((len(split_assignment) / example_count), 6) if example_count else 0.0,
+        },
+        "release_split_coverage": {
+            "eligible_example_count": release_eligible_example_count,
+            "eligible_assigned_count": release_eligible_assigned_count,
+            "eligible_assigned_fraction": (
+                round((release_eligible_assigned_count / release_eligible_example_count), 6)
+                if release_eligible_example_count
+                else 0.0
+            ),
+            "excluded_nonrelease_example_count": max(example_count - release_eligible_example_count, 0),
         },
         "overlap_with_train": overlap,
         "missing_field_counts": missing_field_counts,

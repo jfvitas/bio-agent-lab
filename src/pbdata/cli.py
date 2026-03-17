@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+import csv
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import defaultdict
 from pathlib import Path
@@ -222,6 +223,16 @@ def _read_metadata_rows(layout: StorageLayout) -> list[dict[str, str]]:
         with path.open(newline="", encoding="utf-8") as handle:
             import csv
 
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+def _read_repo_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
             return list(csv.DictReader(handle))
     except OSError:
         return []
@@ -1425,6 +1436,10 @@ def score_pathway_risk_cmd(
 
 
 def _pair_split_items_from_layout(layout: StorageLayout) -> list:
+    artifact_items = _pair_split_items_from_artifacts(layout)
+    if artifact_items:
+        return artifact_items
+
     chains = _load_table_rows(layout.extracted_dir / "chains")
     assays = _load_table_rows(layout.extracted_dir / "assays")
     entries = _load_table_rows(layout.extracted_dir / "entry")
@@ -1590,6 +1605,173 @@ def _pair_split_items_from_layout(layout: StorageLayout) -> list:
                 source_group_key="|".join([parsed_pair.task_type, preferred_source]),
                 release_date=release_date_by_pdb.get(pdb_id),
             ))
+    return items
+
+
+def _pair_split_items_from_artifacts(layout: StorageLayout) -> list:
+    from pbdata.dataset.splits import PairSplitItem
+    from pbdata.master_export import master_csv_path
+
+    root = layout.root
+    model_ready_rows = _read_repo_csv_rows(root / "model_ready_pairs.csv")
+    if not model_ready_rows:
+        return []
+
+    training_examples = (
+        _load_json_rows(layout.training_dir / "training_examples.json")
+        if (layout.training_dir / "training_examples.json").exists()
+        else []
+    )
+    metadata_rows = _read_metadata_rows(layout)
+    master_rows = _read_repo_csv_rows(master_csv_path(root))
+
+    example_id_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+    training_example_by_id: dict[str, dict] = {}
+    for row in training_examples:
+        provenance = row.get("provenance") or {}
+        labels = row.get("labels") or {}
+        pair_key = str(provenance.get("pair_identity_key") or "")
+        affinity_type = str(labels.get("affinity_type") or "")
+        example_id = str(row.get("example_id") or "")
+        if pair_key and example_id:
+            example_id_by_key[(pair_key, affinity_type)].append(example_id)
+            training_example_by_id[example_id] = row
+
+    metadata_by_pair_key: dict[str, dict[str, str]] = {}
+    metadata_by_pdb: dict[str, dict[str, str]] = {}
+    for row in metadata_rows:
+        pair_key = str(row.get("pair_identity_key") or "").strip()
+        pdb_id = str(row.get("pdb_id") or "").strip().upper()
+        if pair_key and pair_key not in metadata_by_pair_key:
+            metadata_by_pair_key[pair_key] = row
+        if pdb_id and pdb_id not in metadata_by_pdb:
+            metadata_by_pdb[pdb_id] = row
+
+    release_date_by_pdb = {
+        str(row.get("pdb_id") or "").strip().upper(): str(row.get("release_date") or "").strip()[:10]
+        for row in master_rows
+        if str(row.get("pdb_id") or "").strip()
+    }
+
+    items: list[PairSplitItem] = []
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    for row in model_ready_rows:
+        pair_key = str(row.get("pair_identity_key") or "").strip()
+        affinity_type = str(row.get("binding_affinity_type") or "").strip()
+        source_name = str(row.get("source_database") or "").strip()
+        dedupe_key = (
+            str(row.get("pdb_id") or "").strip().upper(),
+            pair_key,
+            affinity_type,
+            source_name,
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+
+        parsed_pair = parse_pair_identity_key(pair_key)
+        if not pair_key or parsed_pair is None:
+            continue
+        pdb_id = (parsed_pair.pdb_id or str(row.get("pdb_id") or "")).strip().upper()
+        metadata_row = metadata_by_pair_key.get(pair_key) or metadata_by_pdb.get(pdb_id) or {}
+        receptor_uniprot_ids = _normalize_delimited_values(row.get("receptor_uniprot_ids"))
+        receptor_chain_ids = list(parsed_pair.receptor_chain_ids) or _normalize_delimited_values(
+            row.get("receptor_chain_ids")
+        )
+        receptor_identity = ",".join(receptor_uniprot_ids) if receptor_uniprot_ids else (
+            f"{pdb_id}:{','.join(receptor_chain_ids) or '-'}"
+        )
+        interpro_ids = _normalize_delimited_values(metadata_row.get("interpro_ids"))
+        pfam_ids = _normalize_delimited_values(metadata_row.get("pfam_ids"))
+        pathway_ids = _normalize_delimited_values(metadata_row.get("reactome_pathway_ids"))
+        structural_fold = str(
+            metadata_row.get("structural_fold")
+            or metadata_row.get("cath_ids")
+            or metadata_row.get("scop_ids")
+            or ""
+        ).strip()
+        metadata_family_tokens = interpro_ids or pfam_ids
+        metadata_family_key = ",".join(metadata_family_tokens) if metadata_family_tokens else ""
+        domain_group_key = (
+            "|".join([parsed_pair.task_type, metadata_family_key]) if metadata_family_key else ""
+        )
+        pathway_group_key = (
+            "|".join([parsed_pair.task_type, pathway_ids[0]]) if pathway_ids else ""
+        )
+        fold_group_key = (
+            "|".join([parsed_pair.task_type, structural_fold]) if structural_fold else ""
+        )
+        mutation_key = (parsed_pair.mutation_key or "wt_or_unspecified").lower()
+        mutation_family = (
+            "wildtype"
+            if mutation_key in {"wt", "wildtype", "wt_or_unspecified"}
+            else ("unknown" if mutation_key.startswith("mutation_unknown") else "mutant")
+        )
+        representation_key = "|".join(
+            [
+                parsed_pair.task_type,
+                affinity_type or "assay_unknown",
+                mutation_family,
+                "sequence_unknown",
+            ]
+        )
+        hard_group_key = "|".join(
+            [
+                parsed_pair.task_type,
+                receptor_identity,
+                parsed_pair.ligand_key or ",".join(parsed_pair.partner_chain_ids) or "-",
+            ]
+        )
+        target_ids = example_id_by_key.get((pair_key, affinity_type), []) or [f"{pair_key}|{affinity_type or 'assay_unknown'}"]
+        for target_id in target_ids:
+            training_example = training_example_by_id.get(target_id) or {}
+            ligand = training_example.get("ligand") if isinstance(training_example.get("ligand"), dict) else {}
+            ligand_proxy = (
+                str(ligand.get("inchikey") or "").strip()
+                or str(ligand.get("smiles") or "").strip()
+                or str(ligand.get("ligand_id") or "").strip()
+                or str(parsed_pair.ligand_key or "").strip()
+                or ",".join(parsed_pair.partner_chain_ids)
+                or "-"
+            )
+            preferred_source = (
+                str((training_example.get("labels") or {}).get("preferred_source_database") or "").strip()
+                or str((training_example.get("experiment") or {}).get("preferred_source_database") or "").strip()
+                or str(row.get("selected_preferred_source") or "").strip()
+                or source_name
+                or "source_unknown"
+            )
+            mutation_group = (parsed_pair.mutation_key or "wt_or_unspecified").strip().lower() or "wt_or_unspecified"
+            items.append(
+                PairSplitItem(
+                    item_id=target_id,
+                    pair_identity_key=pair_key,
+                    affinity_type=affinity_type or None,
+                    receptor_sequence=None,
+                    receptor_identity=receptor_identity,
+                    representation_key=representation_key,
+                    hard_group_key=hard_group_key,
+                    scaffold_key="|".join([parsed_pair.task_type, ligand_proxy]),
+                    family_key=(
+                        "|".join([parsed_pair.task_type, metadata_family_key])
+                        if metadata_family_key
+                        else "|".join([parsed_pair.task_type, receptor_identity])
+                    ),
+                    domain_group_key=domain_group_key,
+                    pathway_group_key=pathway_group_key,
+                    fold_group_key=fold_group_key,
+                    mutation_group_key="|".join(
+                        [
+                            parsed_pair.task_type,
+                            metadata_family_key or receptor_identity,
+                            ligand_proxy,
+                            mutation_group,
+                        ]
+                    ),
+                    source_group_key="|".join([parsed_pair.task_type, preferred_source]),
+                    release_date=release_date_by_pdb.get(pdb_id),
+                )
+            )
     return items
 
 

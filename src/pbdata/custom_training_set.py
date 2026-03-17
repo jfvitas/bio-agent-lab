@@ -478,9 +478,21 @@ def build_custom_training_set(
     if per_receptor_cluster_cap <= 0:
         raise ValueError("per_receptor_cluster_cap must be > 0")
 
+    from pbdata.master_export import (
+        _repair_master_pair_repository_csv_from_existing_artifacts,
+        _repair_master_repository_csv_from_existing_artifacts,
+        pair_master_csv_path,
+        master_csv_path,
+        refresh_master_exports,
+    )
     from pbdata.release_export import export_release_artifacts
 
     root = repo_root or Path.cwd()
+    repaired_master = _repair_master_repository_csv_from_existing_artifacts(layout, repo_root=root)
+    repaired_pairs = _repair_master_pair_repository_csv_from_existing_artifacts(layout, repo_root=root)
+    if repaired_master is None or repaired_pairs is None:
+        if not master_csv_path(root).exists() or not pair_master_csv_path(root).exists():
+            refresh_master_exports(layout, repo_root=root)
     export_release_artifacts(layout, repo_root=root)
     candidates, exclusions = _build_candidates(layout, repo_root=root, mode=mode)
 

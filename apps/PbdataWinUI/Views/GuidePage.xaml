@@ -14,7 +14,7 @@
             Spacing="20">
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="14">
-                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="START HERE" />
+                    <TextBlock Style="{StaticResource EyebrowStyle}" Text="PLATFORM TOUR" />
                     <TextBlock Style="{StaticResource PageTitleStyle}" Text="{x:Bind ViewModel.DemoHeadline, Mode=OneWay}" />
                     <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.WorkspaceSummary, Mode=OneWay}" />
                     <StackPanel Spacing="6">
@@ -41,7 +41,7 @@
                             Height="28"
                             IsActive="{x:Bind ViewModel.IsWorkflowBusy, Mode=OneWay}" />
                         <StackPanel Grid.Column="1" Spacing="2">
-                            <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Workflow engine" />
+                            <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Workflow status" />
                             <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.ActiveWorkflowLabel, Mode=OneWay}" />
                             <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="{x:Bind ViewModel.WorkflowStatus, Mode=OneWay}" />
                         </StackPanel>
@@ -51,14 +51,14 @@
                     <CommandBar DefaultLabelPosition="Right">
                         <AppBarButton
                             Command="{x:Bind ViewModel.RunStatusCheckCommand}"
-                            Label="Status">
+                            Label="Status check">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Sync" />
                             </AppBarButton.Icon>
                         </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.RunDoctorCheckCommand}"
-                            Label="Doctor">
+                            Label="Readiness">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Repair" />
                             </AppBarButton.Icon>
@@ -72,14 +72,14 @@
                         </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.StartGuidedDemoCommand}"
-                            Label="Begin workflow">
+                            Label="Start tour">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Play" />
                             </AppBarButton.Icon>
                         </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.BuildBootstrapStoreCommand}"
-                            Label="Build bootstrap store">
+                            Label="Build foundation">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Download" />
                             </AppBarButton.Icon>
@@ -93,7 +93,7 @@
                         </AppBarButton>
                         <AppBarButton
                             Command="{x:Bind ViewModel.ResetDemoCommand}"
-                            Label="Reset workspace view">
+                            Label="Refresh view">
                             <AppBarButton.Icon>
                                 <SymbolIcon Symbol="Refresh" />
                             </AppBarButton.Icon>
@@ -110,7 +110,7 @@
 
                 <Border Grid.Column="0" Style="{StaticResource CardBorderStyle}">
                     <StackPanel Spacing="14">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Guided walkthrough" />
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Product workflow" />
                         <ItemsControl ItemsSource="{x:Bind ViewModel.TimelineStages, Mode=OneWay}">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
@@ -147,7 +147,7 @@
                 <StackPanel Grid.Column="1" Spacing="20">
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="8">
-                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="What to click next" />
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Recommended next action" />
                             <TextBlock Style="{StaticResource MetricLabelStyle}" Text="Recommended control" />
                             <TextBlock
                                 FontSize="18"
@@ -235,8 +235,8 @@
 
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="12">
-                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="What this workspace communicates" />
-                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="This shell shows the current product state for local bootstrap coverage, representative search breadth, leakage-aware dataset design, model-family tradeoffs, training curves, and saved-model inference." />
+                            <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Platform at a glance" />
+                            <TextBlock Style="{StaticResource BodyTextStyle}" Text="ProteoSphere brings together local data foundation coverage, representative search breadth, leakage-aware dataset design, model-family tradeoffs, training evidence, and explainable saved-model inference." />
                             <ItemsControl ItemsSource="{x:Bind ViewModel.MetricBars, Mode=OneWay}">
                                 <ItemsControl.ItemTemplate>
                                     <DataTemplate>

@@ -1,5 +1,6 @@
 import csv
 import json
+import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from pbdata.master_export import (
     export_issue_repository_csv,
     export_master_pair_repository_csv,
     export_master_repository_csv,
+    refresh_master_exports,
     export_source_state_csv,
 )
 from pbdata.schemas.records import EntryRecord
@@ -265,6 +267,60 @@ def test_export_master_pair_repository_csv_populates_policy_fields_from_live_inp
     assert row["source_conflict_summary"] == "single_measurement_no_cross_source_conflict_assessment"
     assert row["source_agreement_band"] == "not_assessed_single_source"
     assert row["release_split"] == "train"
+
+
+def test_refresh_master_exports_repairs_existing_root_exports_from_local_indexes() -> None:
+    tmp_root = _tmp_dir("refresh_master_repair")
+    layout = build_storage_layout(tmp_root / "storage")
+    layout.source_indexes_dir.mkdir(parents=True, exist_ok=True)
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = layout.source_indexes_dir / "uniprot_swissprot_index.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE uniprot_records (accession TEXT PRIMARY KEY, payload_json TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO uniprot_records(accession, payload_json) VALUES (?, ?)",
+            ("P12345", json.dumps({"accession": "P12345", "organism_name": "Homo sapiens"})),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,experimental_method,structure_resolution,organism_names,quality_score,source_databases,has_ligand_signal,has_protein_signal,protein_chain_ids,protein_chain_uniprot_ids,taxonomy_ids,structure_file_cif_path,ligand_count,assay_record_count,protein_entity_count\n"
+        "1ABC,X-RAY DIFFRACTION,2.1,,, , , ,A,P12345,9606,/tmp/1ABC.cif,1,1,1\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,mutation_strings,source_conflict_summary,source_agreement_band,release_split\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,Kd,,,,\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "model_ready_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,mutation_strings,source_conflict_summary,source_agreement_band,release_split,selected_preferred_source\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,Kd,wt,single_measurement_no_cross_source_conflict_assessment,not_assessed_single_source,train,BindingDB\n",
+        encoding="utf-8",
+    )
+    (layout.splits_dir / "train.txt").write_text("protein_ligand|1ABC|A|ATP|wt|Kd\n", encoding="utf-8")
+
+    refresh_master_exports(layout, repo_root=tmp_root)
+
+    with (tmp_root / "master_pdb_repository.csv").open(newline="", encoding="utf-8") as handle:
+        master_rows = list(csv.DictReader(handle))
+    with (tmp_root / "master_pdb_pairs.csv").open(newline="", encoding="utf-8") as handle:
+        pair_rows = list(csv.DictReader(handle))
+
+    assert master_rows[0]["organism_names"] == "Homo sapiens"
+    assert float(master_rows[0]["quality_score"]) > 0.7
+    assert master_rows[0]["source_databases"] == "BindingDB; RCSB"
+    assert master_rows[0]["has_ligand_signal"] == "true"
+    assert master_rows[0]["has_protein_signal"] == "true"
+    assert pair_rows[0]["mutation_strings"] == "wt"
+    assert pair_rows[0]["source_conflict_summary"] == "single_measurement_no_cross_source_conflict_assessment"
+    assert pair_rows[0]["source_agreement_band"] == "not_assessed_single_source"
+    assert pair_rows[0]["release_split"] == "train"
 
 
 def test_export_issue_repository_csv_reports_review_gaps() -> None:

@@ -15,7 +15,7 @@
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="10">
                     <TextBlock Style="{StaticResource EyebrowStyle}" Text="OUTPUTS" />
-                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Current workspace outputs and operational artifacts" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Saved outputs, reports, and delivery assets" />
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.RunSummary, Mode=OneWay}" />
                     <TextBlock
                         FontSize="18"
@@ -57,7 +57,7 @@
 
                 <Border Grid.Column="1" Style="{StaticResource CardBorderStyle}">
                     <StackPanel Spacing="12">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Workflow engine" />
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Execution status" />
                         <Grid ColumnSpacing="12">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
@@ -90,7 +90,7 @@
 
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="12">
-                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Activity log" />
+                    <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Recent workflow activity" />
                     <ItemsControl ItemsSource="{x:Bind ViewModel.ActivityLog, Mode=OneWay}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>

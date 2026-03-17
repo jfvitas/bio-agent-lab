@@ -19,6 +19,7 @@ from pbdata.dataset.splits import (
 )
 from pbdata.gui import _call_on_tk_thread
 from pbdata.sources import rcsb_search
+from pbdata.storage import build_storage_layout
 
 _LOCAL_TMP = Path(__file__).parent / "_tmp"
 _LOCAL_TMP.mkdir(exist_ok=True)
@@ -611,3 +612,65 @@ def test_build_splits_source_and_time_modes() -> None:
     time_diagnostics = json.loads((tmp_root / "data" / "splits" / "split_diagnostics.json").read_text(encoding="utf-8"))
     assert time_metadata["strategy"] == "time_ordered"
     assert time_diagnostics["strategy"] == "time_ordered"
+
+
+def test_build_splits_uses_existing_artifact_tables_when_extracted_tables_are_unavailable() -> None:
+    tmp_root = _tmp_dir("artifact_split_cli")
+    layout = build_storage_layout(tmp_root)
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.workspace_metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,release_date\n"
+        "1ABC,2018-01-01\n"
+        "2DEF,2022-01-01\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "model_ready_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,selected_preferred_source,receptor_chain_ids,receptor_uniprot_ids,ligand_key\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,PDBbind,Kd,PDBbind,A,P12345,ATP\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|A42V,BindingDB,Kd,BindingDB,A,Q99999,GTP\n",
+        encoding="utf-8",
+    )
+    (layout.training_dir / "training_examples.json").write_text(
+        json.dumps(
+            [
+                {
+                    "example_id": "ex1",
+                    "provenance": {"pair_identity_key": "protein_ligand|1ABC|A|ATP|wt"},
+                    "labels": {"affinity_type": "Kd", "preferred_source_database": "PDBbind"},
+                    "ligand": {"inchikey": "ATP-KEY", "ligand_id": "ATP"},
+                },
+                {
+                    "example_id": "ex2",
+                    "provenance": {"pair_identity_key": "protein_ligand|2DEF|A|GTP|A42V"},
+                    "labels": {"affinity_type": "Kd", "preferred_source_database": "BindingDB"},
+                    "ligand": {"inchikey": "GTP-KEY", "ligand_id": "GTP"},
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (layout.workspace_metadata_dir / "protein_metadata.csv").write_text(
+        "pdb_id,pair_identity_key,interpro_ids,reactome_pathway_ids,structural_fold\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,IPR0001,R-HSA-1,foldA\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|A42V,IPR0002,R-HSA-2,foldB\n",
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--storage-root", str(tmp_root), "build-splits"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    metadata = json.loads((tmp_root / "data" / "splits" / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["strategy"] == "pair_aware_grouped"
+    written_ids = {
+        split_name: set((tmp_root / "data" / "splits" / f"{split_name}.txt").read_text(encoding="utf-8").split())
+        for split_name in ("train", "val", "test")
+    }
+    assert sum(len(ids) for ids in written_ids.values()) == 2
+    assert {"ex1", "ex2"} == set().union(*written_ids.values())

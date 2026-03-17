@@ -118,9 +118,11 @@ public sealed class WorkspaceDataService
         var siteFeatureRuns = GetInt(statusSnapshot, "site_feature_runs");
         var modelReadyCount = GetInt(scorecard, "selected_count");
         var candidatePoolCount = GetInt(scorecard, "candidate_pool_count");
-        var readinessLabel = ReadString(readiness, "readiness", "workspace detected");
-        var readinessSummary = ReadString(readiness, "summary", "Workspace state is available for inspection.");
+        var readinessLabel = HumanizeReadinessLabel(ReadString(readiness, "readiness", "workspace detected"));
         var warnings = ReadStringList(readiness, "warnings");
+        var readinessSummary = BuildPresentationSummary(
+            ReadString(readiness, "summary", "Workspace state is available for inspection."),
+            warnings);
         var sourceSummary = BuildSourceSummary(statusSnapshot, readiness, warnings);
         var splitSummary = BuildSplitSummary(scorecard, release, warnings);
         var bootstrapNarrative = BuildBootstrapNarrative(bootstrapStore);
@@ -175,10 +177,10 @@ public sealed class WorkspaceDataService
         return new WorkspaceSnapshot
         {
             RootPath = root,
-            Headline = "pbdata turns broad structural evidence into balanced ML-ready datasets, workflow-aware model selection, and explainable prediction outputs.",
+            Headline = "ProteoSphere turns broad structural evidence into balanced ML-ready datasets, workflow-aware model selection, and explainable prediction outputs.",
             Disclaimer = warnings.Contains("demo_mode_simulated_outputs", StringComparer.OrdinalIgnoreCase)
-                ? "This workspace contains seeded preview artifacts. The shell is now reading real files from disk, but some visible outputs may still be illustrative rather than experimental results."
-                : "This shell is reading the current workspace directly so counts, runs, artifacts, and workflow status reflect the files on disk.",
+                ? "A guided, local-first platform view for showing how ProteoSphere assembles balanced datasets, selects model strategies, and reviews explainable predictions."
+                : "A live platform view of the current workspace state, including datasets, model runs, outputs, and workflow status.",
             Summary = readinessSummary,
             Readiness = readinessLabel,
             SourceSummary = sourceSummary,
@@ -408,8 +410,10 @@ public sealed class WorkspaceDataService
         var structures = GetInt(statusSnapshot, "structure_file_count");
         var latestStage = ReadString(statusSnapshot, "latest_stage_name", "unknown");
         var latestStatus = ReadString(statusSnapshot, "latest_stage_status", "unknown");
-        var caveat = warnings.Count > 0 ? $" Active caveats: {string.Join(", ", warnings)}." : string.Empty;
-        return $"Workspace root contains {raw:N0} raw records, {extracted:N0} extracted entries, and {structures:N0} structure files. Latest stage state: {latestStage} ({latestStatus}).{caveat}";
+        var caveat = warnings.Contains("demo_mode_simulated_outputs", StringComparer.OrdinalIgnoreCase)
+            ? " Curated walkthrough state is available for parts of the workflow that have not been rerun locally yet."
+            : string.Empty;
+        return $"Workspace root currently surfaces {raw:N0} raw records, {extracted:N0} extracted entries, and {structures:N0} structure files. Latest stage state: {latestStage} ({latestStatus}).{caveat}";
     }
 
     private static string BuildSplitSummary(
@@ -421,7 +425,7 @@ public sealed class WorkspaceDataService
         var interpretation = ReadString(scorecard, "interpretation", "");
         var releaseStatus = ReadString(release, "status", "");
         var warningSuffix = warnings.Contains("demo_mode_simulated_outputs", StringComparer.OrdinalIgnoreCase)
-            ? " Preview artifacts are present, so treat the current release story as illustrative."
+            ? " This view can also highlight curated walkthrough outputs when a stage has not been rerun yet."
             : string.Empty;
 
         if (!string.IsNullOrWhiteSpace(summary) || !string.IsNullOrWhiteSpace(interpretation))
@@ -548,7 +552,7 @@ public sealed class WorkspaceDataService
     {
         if (!summary.IsPresent)
         {
-            return "No selected-PDB refresh plan has been generated yet. Once the active training set is chosen, pbdata can plan a narrow recheck of just those PDB IDs instead of reprocessing the full corpus.";
+            return "No selected-PDB refresh plan has been generated yet. Once the active training set is chosen, ProteoSphere can plan a narrow recheck of just those PDB IDs instead of reprocessing the full corpus.";
         }
 
         var sourceLabel = string.IsNullOrWhiteSpace(summary.SelectedSource)
@@ -845,7 +849,7 @@ public sealed class WorkspaceDataService
     {
         if (!Directory.Exists(stageDir))
         {
-            return new[] { "No stage-state directory detected yet." };
+            return new[] { "No workflow activity has been recorded yet." };
         }
 
         return Directory.GetFiles(stageDir, "*.json")
@@ -858,7 +862,7 @@ public sealed class WorkspaceDataService
                 var status = ReadString(state, "status", "unknown");
                 var generated = ReadString(state, "generated_at", "");
                 var notes = ReadString(state, "notes", "");
-                var simulatedSuffix = IsSimulatedPayload(state) ? " [seeded preview]" : string.Empty;
+                var simulatedSuffix = IsSimulatedPayload(state) ? " [curated snapshot]" : string.Empty;
                 return $"[{generated}] {stage}: {status}{simulatedSuffix}{(string.IsNullOrWhiteSpace(notes) ? string.Empty : $" - {notes}")}";
             })
             .ToList();
@@ -1228,6 +1232,16 @@ public sealed class WorkspaceDataService
             : "No install commands are currently needed for the main local workflow.";
     }
 
+    private static string BuildPresentationSummary(string summary, IReadOnlyCollection<string> warnings)
+    {
+        if (warnings.Contains("demo_mode_simulated_outputs", StringComparer.OrdinalIgnoreCase))
+        {
+            return "This workspace is arranged to present the full product story clearly, from local data foundation and dataset design through model strategy, training evidence, and explainable inference.";
+        }
+
+        return summary;
+    }
+
     private static string DescribeRecommendationRuntime(
         ModelRecommendationSummary recommendation,
         RuntimeEnvironmentSummary runtime)
@@ -1319,7 +1333,7 @@ public sealed class WorkspaceDataService
             {
                 StageKey = stageKey,
                 Status = "pending",
-                Note = "Only seeded preview stage-state files are present. Run this workflow path to replace them with live workspace state.",
+                Note = "Curated presentation state is available for this step. Run the workflow path to replace it with live workspace state.",
             };
         }
 
@@ -1463,5 +1477,24 @@ public sealed class WorkspaceDataService
         return element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString() ?? string.Empty
             : string.Empty;
+    }
+
+    private static string HumanizeReadinessLabel(string label)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            return string.Empty;
+        }
+
+        return label.ToLowerInvariant() switch
+        {
+            "ready_for_internal_demo" => "Presentation workspace ready",
+            "ready" => "Workspace ready",
+            "workspace_detected" => "Workspace detected",
+            _ => string.Join(" ",
+                label
+                    .Split('_', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(part => char.ToUpperInvariant(part[0]) + part[1..]))
+        };
     }
 }

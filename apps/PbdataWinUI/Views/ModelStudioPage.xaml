@@ -15,7 +15,7 @@
             <Border Style="{StaticResource CardBorderStyle}">
                 <StackPanel Spacing="12">
                     <TextBlock Style="{StaticResource EyebrowStyle}" Text="MODEL STUDIO" />
-                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Choose an architecture and review the training outputs" />
+                    <TextBlock Style="{StaticResource PageTitleStyle}" Text="Shape the model strategy and review training evidence" />
                     <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SelectedModelPitch, Mode=OneWay}" />
                     <CommandBar DefaultLabelPosition="Right">
                         <AppBarButton
@@ -110,7 +110,7 @@
 
                     <Border Style="{StaticResource CardBorderStyle}">
                         <StackPanel Spacing="12">
-                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Model system" />
+                        <TextBlock Style="{StaticResource SectionTitleStyle}" Text="Recommended system" />
                             <TextBlock Style="{StaticResource BodyTextStyle}" Text="{x:Bind ViewModel.SelectedModelHeadline, Mode=OneWay}" />
                             <ItemsControl ItemsSource="{x:Bind ViewModel.ArchitectureStages, Mode=OneWay}">
                                 <ItemsControl.ItemTemplate>
@@ -178,10 +178,10 @@
                             </StackPanel>
                             <Button
                                 Command="{x:Bind ViewModel.RunSmokeCheckCommand}"
-                                Content="Run quick smoke check"
+                                Content="Run platform smoke check"
                                 HorizontalAlignment="Left"
                                 Style="{StaticResource SecondaryActionStyle}" />
-                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="Model Studio now shows whether the current recommendation will run natively, fall back to another backend, or stay blocked until dependencies are installed." />
+                            <TextBlock Style="{StaticResource SectionCaptionStyle}" Text="Model Studio shows whether the current recommendation will run natively, shift to a fallback backend, or remain blocked until dependencies are installed." />
                         </StackPanel>
                     </Border>
 

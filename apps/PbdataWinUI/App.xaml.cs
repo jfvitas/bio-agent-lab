@@ -19,7 +19,7 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs e)
     {
         _window ??= new Window();
-        _window.Title = "pbdata - Protein Binding Data Platform";
+        _window.Title = "ProteoSphere - Protein Intelligence Platform";
 
         if (_window.Content is not Frame rootFrame)
         {

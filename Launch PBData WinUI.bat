@@ -14,7 +14,7 @@ if not exist "%BOOTSTRAP%" (
 powershell -NoProfile -ExecutionPolicy Bypass -File "%BOOTSTRAP%"
 if errorlevel 1 (
     echo.
-    echo PBData WinUI launch failed.
+    echo ProteoSphere WinUI launch failed.
     pause
     exit /b 1
 )

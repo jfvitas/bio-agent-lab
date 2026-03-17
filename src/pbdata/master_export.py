@@ -75,6 +75,14 @@ def _load_csv_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _load_csv_header(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or [])
+
+
 def _stringify(value: Any) -> str:
     if value is None:
         return ""
@@ -103,6 +111,22 @@ def _safe_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _parse_delimited_values(raw: Any) -> list[str]:
+    text = str(raw or "")
+    values = [
+        value.strip()
+        for chunk in text.replace(";", ",").split(",")
+        for value in [chunk.strip()]
+        if value.strip()
+    ]
+    return list(dict.fromkeys(values))
+
+
+def _csv_truthy(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y"}
 
 
 def _split_assignment_map(layout: StorageLayout) -> dict[tuple[str, str, str], str]:
@@ -203,6 +227,183 @@ def _entry_quality_score(entry: dict[str, Any], pdb_chains: list[dict[str, Any]]
     if not any(checks):
         return None
     return round(sum(checks) / len(checks), 4)
+
+
+def _entry_quality_score_from_row(row: dict[str, str]) -> float | None:
+    explicit = _safe_float(row.get("quality_score"))
+    if explicit is not None:
+        return round(max(0.0, min(explicit, 1.0)), 4)
+    resolution = _safe_float(row.get("structure_resolution"))
+    checks = [
+        bool(str(row.get("experimental_method") or "").strip()),
+        resolution is not None and resolution <= 3.5,
+        bool(_parse_delimited_values(row.get("protein_chain_ids"))),
+        bool(_parse_delimited_values(row.get("protein_chain_uniprot_ids"))),
+        bool(_parse_delimited_values(row.get("taxonomy_ids"))),
+        bool(_parse_delimited_values(row.get("organism_names"))),
+        bool(str(row.get("structure_file_cif_path") or "").strip()),
+    ]
+    if not any(checks):
+        return None
+    return round(sum(checks) / len(checks), 4)
+
+
+def _lookup_organism_names(
+    layout: StorageLayout,
+    accessions: list[str],
+    cache: dict[str, list[str]],
+) -> list[str]:
+    from pbdata.source_indexes import query_uniprot_swissprot_index
+
+    names: list[str] = []
+    for accession in accessions:
+        normalized = accession.strip().upper()
+        if not normalized:
+            continue
+        if normalized not in cache:
+            record = query_uniprot_swissprot_index(layout, normalized)
+            organism_name = str((record or {}).get("organism_name") or "").strip()
+            cache[normalized] = [organism_name] if organism_name else []
+        names.extend(cache[normalized])
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _repair_master_repository_csv_from_existing_artifacts(
+    layout: StorageLayout,
+    *,
+    repo_root: Path | None = None,
+) -> Path | None:
+    out_path = master_csv_path(repo_root)
+    rows = _load_csv_rows(out_path)
+    header = _load_csv_header(out_path)
+    if not rows or not header:
+        return None
+
+    pair_sources_by_pdb: dict[str, set[str]] = defaultdict(set)
+    pair_signal_by_pdb: dict[str, dict[str, bool]] = defaultdict(lambda: {"ligand": False, "protein": False})
+    for source_path in (
+        pair_master_csv_path(repo_root),
+        (repo_root or Path.cwd()) / "canonical_pairs.csv",
+        (repo_root or Path.cwd()) / "model_ready_pairs.csv",
+    ):
+        for pair_row in _load_csv_rows(source_path):
+            pdb_id = str(pair_row.get("pdb_id") or "").strip()
+            if not pdb_id:
+                continue
+            source_name = str(
+                pair_row.get("selected_preferred_source")
+                or pair_row.get("source_database")
+                or ""
+            ).strip()
+            if source_name:
+                pair_sources_by_pdb[pdb_id].add(source_name)
+            if (
+                _parse_delimited_values(pair_row.get("ligand_component_ids"))
+                or _parse_delimited_values(pair_row.get("ligand_inchikeys"))
+                or _parse_delimited_values(pair_row.get("ligand_types"))
+                or str(pair_row.get("ligand_key") or "").strip()
+            ):
+                pair_signal_by_pdb[pdb_id]["ligand"] = True
+            if (
+                _parse_delimited_values(pair_row.get("receptor_chain_ids"))
+                or _parse_delimited_values(pair_row.get("receptor_uniprot_ids"))
+            ):
+                pair_signal_by_pdb[pdb_id]["protein"] = True
+
+    organism_cache: dict[str, list[str]] = {}
+    repaired_rows: list[dict[str, str]] = []
+    for row in rows:
+        updated = dict(row)
+        pdb_id = str(updated.get("pdb_id") or "").strip()
+        organism_names = _parse_delimited_values(updated.get("organism_names"))
+        if not organism_names:
+            accessions = _parse_delimited_values(updated.get("protein_chain_uniprot_ids"))
+            organism_names = _lookup_organism_names(layout, accessions, organism_cache)
+        updated["organism_names"] = _stringify(organism_names)
+
+        existing_sources = set(_parse_delimited_values(updated.get("source_databases")))
+        combined_sources = existing_sources | pair_sources_by_pdb.get(pdb_id, set())
+        if str(updated.get("structure_file_cif_path") or "").strip() or str(updated.get("raw_file_path") or "").strip():
+            combined_sources.add("RCSB")
+        updated["source_databases"] = _stringify(sorted(combined_sources))
+
+        if not str(updated.get("has_ligand_signal") or "").strip():
+            ligand_count = _safe_int(updated.get("ligand_count")) or 0
+            assay_count = _safe_int(updated.get("assay_record_count")) or 0
+            updated["has_ligand_signal"] = _stringify(
+                ligand_count > 0 or assay_count > 0 or pair_signal_by_pdb.get(pdb_id, {}).get("ligand", False)
+            )
+
+        if not str(updated.get("has_protein_signal") or "").strip():
+            protein_chain_ids = _parse_delimited_values(updated.get("protein_chain_ids"))
+            protein_entity_count = _safe_int(updated.get("protein_entity_count")) or 0
+            updated["has_protein_signal"] = _stringify(
+                bool(protein_chain_ids)
+                or protein_entity_count > 0
+                or pair_signal_by_pdb.get(pdb_id, {}).get("protein", False)
+            )
+
+        updated["quality_score"] = _stringify(_entry_quality_score_from_row(updated))
+        repaired_rows.append({column: str(updated.get(column) or "") for column in header})
+
+    _write_csv_rows(out_path, columns=header, rows=repaired_rows)
+    return out_path
+
+
+def _repair_master_pair_repository_csv_from_existing_artifacts(
+    layout: StorageLayout,
+    *,
+    repo_root: Path | None = None,
+) -> Path | None:
+    out_path = pair_master_csv_path(repo_root)
+    rows = _load_csv_rows(out_path)
+    header = _load_csv_header(out_path)
+    if not rows or not header:
+        return None
+
+    donor_rows = _load_csv_rows((repo_root or Path.cwd()) / "model_ready_pairs.csv")
+    if not donor_rows:
+        donor_rows = _load_csv_rows((repo_root or Path.cwd()) / "canonical_pairs.csv")
+    donors_by_key4: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    donors_by_key3: dict[tuple[str, str, str], dict[str, str]] = {}
+    for donor in donor_rows:
+        pdb_id = str(donor.get("pdb_id") or "").strip()
+        pair_key = str(donor.get("pair_identity_key") or "").strip()
+        affinity_type = str(donor.get("binding_affinity_type") or "").strip()
+        source_name = str(donor.get("source_database") or "").strip()
+        if not pdb_id or not pair_key:
+            continue
+        if pdb_id and pair_key and affinity_type and source_name:
+            donors_by_key4[(pdb_id, pair_key, affinity_type, source_name)] = donor
+        donors_by_key3.setdefault((pdb_id, pair_key, affinity_type), donor)
+
+    split_assignment = _split_assignment_map(layout)
+    repaired_rows: list[dict[str, str]] = []
+    for row in rows:
+        updated = dict(row)
+        pdb_id = str(updated.get("pdb_id") or "").strip()
+        pair_key = str(updated.get("pair_identity_key") or "").strip()
+        affinity_type = str(updated.get("binding_affinity_type") or "").strip()
+        source_name = str(updated.get("source_database") or "").strip()
+        donor = donors_by_key4.get((pdb_id, pair_key, affinity_type, source_name)) or donors_by_key3.get(
+            (pdb_id, pair_key, affinity_type)
+        ) or {}
+
+        updated["mutation_strings"] = _stringify(
+            donor.get("mutation_strings") or _normalized_mutation_strings(updated)
+        )
+        conflict_summary, agreement_band = _normalized_conflict_fields(donor or updated)
+        updated["source_conflict_summary"] = _stringify(conflict_summary)
+        updated["source_agreement_band"] = _stringify(agreement_band)
+        updated["release_split"] = _stringify(
+            split_assignment.get((pdb_id, pair_key, affinity_type))
+            or donor.get("release_split")
+            or ""
+        )
+        repaired_rows.append({column: str(updated.get(column) or "") for column in header})
+
+    _write_csv_rows(out_path, columns=header, rows=repaired_rows)
+    return out_path
 
 
 def _normalized_mutation_strings(assay: dict[str, Any]) -> list[str]:
@@ -741,11 +942,13 @@ def refresh_master_exports(
     """
     result: dict[str, str] = {}
     try:
-        result["master_csv"] = str(export_master_repository_csv(layout, repo_root=repo_root))
+        master_csv = _repair_master_repository_csv_from_existing_artifacts(layout, repo_root=repo_root)
+        result["master_csv"] = str(master_csv or export_master_repository_csv(layout, repo_root=repo_root))
     except OSError as exc:
         result["master_csv_error"] = str(exc)
     try:
-        result["pair_csv"] = str(export_master_pair_repository_csv(layout, repo_root=repo_root))
+        pair_csv = _repair_master_pair_repository_csv_from_existing_artifacts(layout, repo_root=repo_root)
+        result["pair_csv"] = str(pair_csv or export_master_pair_repository_csv(layout, repo_root=repo_root))
     except OSError as exc:
         result["pair_csv_error"] = str(exc)
     try:

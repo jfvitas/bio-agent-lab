@@ -106,7 +106,7 @@ public sealed partial class DemoHubViewModel : BaseViewModel
         {
             new() { Key = "fast", Label = "Fast preview", Caption = "Shortest preview train time and lighter output." },
             new() { Key = "balanced", Label = "Balanced", Caption = "Good tradeoff between explanation depth and accuracy." },
-            new() { Key = "best", Label = "Best accuracy", Caption = "Longer simulated run with stronger cross-family generalization." },
+            new() { Key = "best", Label = "Best accuracy", Caption = "Longest profile with the strongest cross-family generalization target." },
         };
 
         TrainingExecutionModes = new ObservableCollection<ChoiceItem>
@@ -161,7 +161,7 @@ public sealed partial class DemoHubViewModel : BaseViewModel
             new() { Number = 6, PageKey = "Dataset", Title = "Plan selected-PDB refresh", ActionLabel = "Plan refresh", WhyItMatters = "After the active set is chosen, the platform can recheck only those selected PDB IDs instead of the full corpus.", WhatToClick = "Plan Refresh", HowToFindIt = "Stay in Dataset and use the targeted refresh action." },
             new() { Number = 7, PageKey = "Model", Title = "Refresh the model path", ActionLabel = "Recommend", WhyItMatters = "Model Studio explains why a given architecture suits the selected modalities and objective.", WhatToClick = "Recommend", HowToFindIt = "Open Models and use the first action button." },
             new() { Number = 8, PageKey = "Model", Title = "Train the candidate", ActionLabel = "Train", WhyItMatters = "The training view shows realistic curves, scores, and architecture tradeoffs.", WhatToClick = "Train", HowToFindIt = "Use the primary training button in Models." },
-            new() { Number = 9, PageKey = "Inference", Title = "Run saved-model inference", ActionLabel = "Run inference", WhyItMatters = "This demonstrates how the platform turns a saved model into ranked, explainable predictions.", WhatToClick = "Run Inference", HowToFindIt = "Open Inference Lab and use the primary inference button." },
+            new() { Number = 9, PageKey = "Inference", Title = "Run saved-model inference", ActionLabel = "Run inference", WhyItMatters = "This demonstrates how the platform turns a saved model into ranked, explainable predictions.", WhatToClick = "Run Inference", HowToFindIt = "Open Inference and use the primary inference button." },
         };
 
         TimelineStages = new ObservableCollection<DemoTimelineStage>();
@@ -1157,7 +1157,7 @@ public sealed partial class DemoHubViewModel : BaseViewModel
             Predictions.Add(new() { PairLabel = "HSP90 / CDC37 interface", Score = "0.912", Confidence = "High", Rationale = "Strong contact density, compatible motif neighborhoods, and family-consistent interface geometry.", RiskNote = "Watch for scaffold over-representation in chaperone-rich folds." });
             Predictions.Add(new() { PairLabel = "PD-1 / PD-L1 variant", Score = "0.873", Confidence = "High", Rationale = "Interface residues align well with learned hotspot neighborhoods and calibration remains stable.", RiskNote = "Mutation cluster is close to seen immune checkpoint families." });
             Predictions.Add(new() { PairLabel = "RAS / RAF pocketed assembly", Score = "0.801", Confidence = "Medium", Rationale = "Good graph topology match, but assay context is thinner than the top-ranked examples.", RiskNote = "Sparser assay support than the top two predictions." });
-            InferenceNarrative = "Inference Lab is showing an interface-heavy triage view, where the saved model ranks protein-protein complexes and surfaces likely reasons for strong interaction confidence.";
+            InferenceNarrative = "This inference view highlights an interface-heavy triage story, where the saved model ranks protein-protein complexes and surfaces likely reasons for strong interaction confidence.";
         }
         else if (SelectedInferenceScenarioKey == "mutant_scan")
         {
@@ -1171,7 +1171,7 @@ public sealed partial class DemoHubViewModel : BaseViewModel
             Predictions.Add(new() { PairLabel = "MCL1 hydrophobic cleft", Score = "0.921", Confidence = "High", Rationale = "Pocket geometry, motif coverage, and embedding context all align with strong binder patterns.", RiskNote = "Minimal; chemistry is well represented in the current training coverage." });
             Predictions.Add(new() { PairLabel = "BRD4 bromodomain pocket", Score = "0.866", Confidence = "High", Rationale = "Assay evidence and structural motif placement both support ranking this near the top.", RiskNote = "Generalization remains strongest for bromodomain-adjacent families." });
             Predictions.Add(new() { PairLabel = "CDK2 allosteric niche", Score = "0.793", Confidence = "Medium", Rationale = "The graph branch is confident, though assay context is sparser than the top hits.", RiskNote = "Pocket novelty is higher here, so the explanation calls out moderate uncertainty." });
-            InferenceNarrative = "Inference Lab is showing a novel pocket screening story, where the saved model surfaces ranked hits plus the motifs and structural reasons behind each score.";
+            InferenceNarrative = "This inference view highlights a novel pocket screening story, where the saved model surfaces ranked hits plus the motifs and structural reasons behind each score.";
         }
     }
 
@@ -1347,7 +1347,7 @@ public sealed partial class DemoHubViewModel : BaseViewModel
 
         DemoHeadline = snapshot.Headline;
         DemoDisclaimer = snapshot.Disclaimer;
-        WorkspaceSummary = $"{snapshot.Readiness}: {snapshot.Summary}";
+        WorkspaceSummary = snapshot.Summary;
         BootstrapNarrative = snapshot.BootstrapNarrative;
         RefreshPlanNarrative = snapshot.RefreshPlanNarrative;
         GraphPackageNarrative = snapshot.GraphPackageNarrative;
