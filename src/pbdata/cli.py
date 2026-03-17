@@ -2193,6 +2193,10 @@ def index_uniprot_swissprot_cmd(
         Optional[int],
         typer.Option("--limit", min=1, help="Optional maximum number of Swiss-Prot records to index for smoke/preview runs."),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rebuild the local index even if the existing manifest matches the staged source."),
+    ] = False,
 ) -> None:
     """Build a lightweight local index from the staged UniProt Swiss-Prot flat file."""
     from pbdata.source_indexes import index_uniprot_swissprot
@@ -2204,10 +2208,12 @@ def index_uniprot_swissprot_cmd(
         configured = str(config.sources.uniprot.extra.get("local_swissprot") or "").strip()
         resolved_source = Path(configured) if configured else (layout.root / "data_sources" / "uniprot" / "uniprot_sprot.dat.gz")
 
-    result = index_uniprot_swissprot(layout, source_path=resolved_source, limit=limit)
+    result = index_uniprot_swissprot(layout, source_path=resolved_source, limit=limit, force=force)
     typer.echo(f"Storage root : {layout.root}")
     typer.echo(f"Source path  : {resolved_source}")
     typer.echo(f"Index path   : {result.index_path}")
+    if result.lookup_db_path is not None:
+        typer.echo(f"Lookup DB    : {result.lookup_db_path}")
     typer.echo(f"Manifest     : {result.manifest_path}")
     typer.echo(f"Record count : {result.record_count}")
 
@@ -2223,6 +2229,18 @@ def index_alphafold_archive_cmd(
         Optional[int],
         typer.Option("--limit", min=1, help="Optional maximum number of AlphaFold archive members to index for smoke/preview runs."),
     ] = None,
+    chunk_size: Annotated[
+        Optional[int],
+        typer.Option("--chunk-size", min=1, help="Optional number of archive members to index in this chunk before stopping."),
+    ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option("--resume", help="Resume a partial AlphaFold index from the manifest's saved tar offset."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Discard any existing AlphaFold local index and rebuild from the beginning."),
+    ] = False,
 ) -> None:
     """Build a lightweight accession index from the staged AlphaFold bulk archive."""
     from pbdata.source_indexes import index_alphafold_archive
@@ -2234,10 +2252,200 @@ def index_alphafold_archive_cmd(
         configured = str(config.sources.alphafold_db.extra.get("local_archive") or "").strip()
         resolved_archive = Path(configured) if configured else (layout.root / "data_sources" / "alphafold" / "swissprot_pdb_v6.tar")
 
-    result = index_alphafold_archive(layout, archive_path=resolved_archive, limit=limit)
+    result = index_alphafold_archive(
+        layout,
+        archive_path=resolved_archive,
+        limit=limit,
+        chunk_size=chunk_size,
+        resume=resume,
+        force=force,
+    )
     typer.echo(f"Storage root : {layout.root}")
     typer.echo(f"Archive path : {resolved_archive}")
     typer.echo(f"Index path   : {result.index_path}")
+    if result.lookup_db_path is not None:
+        typer.echo(f"Lookup DB    : {result.lookup_db_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+
+
+@app.command("index-bindingdb-bulk")
+def index_bindingdb_bulk_cmd(
+    ctx: typer.Context,
+    dump_zip_path: Annotated[
+        Optional[Path],
+        typer.Option("--dump-zip-path", help="Optional path to the staged BindingDB bulk dump zip."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rebuild the local BindingDB bulk index even if the manifest matches the staged dump."),
+    ] = False,
+) -> None:
+    """Build a reusable local BindingDB assay lookup from the staged MySQL dump."""
+    from pbdata.sources.bindingdb_bulk import build_bindingdb_bulk_index
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    resolved_dump = dump_zip_path
+    if resolved_dump is None:
+        configured = str(config.sources.bindingdb.extra.get("bulk_zip") or "").strip()
+        resolved_dump = Path(configured) if configured else (layout.root / "data_sources" / "bindingdb" / "BDB-mySQL_All_202603_dmp.zip")
+
+    result = build_bindingdb_bulk_index(layout, dump_zip_path=resolved_dump, force=force)
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Dump zip     : {resolved_dump}")
+    typer.echo(f"Index path   : {result.index_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+    typer.echo(f"PDB count    : {result.pdb_count}")
+
+
+@app.command("index-reactome-pathways")
+def index_reactome_pathways_cmd(
+    ctx: typer.Context,
+    mapping_path: Annotated[
+        Optional[Path],
+        typer.Option("--mapping-path", help="Optional path to the staged UniProt-to-Reactome mapping file."),
+    ] = None,
+    pathways_path: Annotated[
+        Optional[Path],
+        typer.Option("--pathways-path", help="Optional path to the staged Reactome pathway names file."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of UniProt accessions to index for preview runs."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Discard any existing Reactome local index and rebuild it."),
+    ] = False,
+) -> None:
+    """Build a reusable local Reactome pathway lookup from staged flat files."""
+    from pbdata.source_indexes import index_reactome_pathways
+
+    layout = _storage_layout(ctx)
+    config = ctx.obj["config"]
+    resolved_mapping = mapping_path
+    if resolved_mapping is None:
+        configured_dir = str(config.sources.reactome.extra.get("local_dir") or "").strip()
+        base_dir = Path(configured_dir) if configured_dir else (layout.root / "data_sources" / "reactome")
+        resolved_mapping = base_dir / "UniProt2Reactome_All_Levels.txt"
+    resolved_pathways = pathways_path
+    if resolved_pathways is None:
+        configured_dir = str(config.sources.reactome.extra.get("local_dir") or "").strip()
+        base_dir = Path(configured_dir) if configured_dir else (layout.root / "data_sources" / "reactome")
+        resolved_pathways = base_dir / "ReactomePathways.txt"
+
+    result = index_reactome_pathways(
+        layout,
+        mapping_path=resolved_mapping,
+        pathways_path=resolved_pathways,
+        limit=limit,
+        force=force,
+    )
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Mapping path : {resolved_mapping}")
+    typer.echo(f"Pathways path: {resolved_pathways}")
+    typer.echo(f"Index path   : {result.index_path}")
+    if result.lookup_db_path is not None:
+        typer.echo(f"Lookup DB    : {result.lookup_db_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+
+
+@app.command("index-cath-domains")
+def index_cath_domains_cmd(
+    ctx: typer.Context,
+    domain_list_path: Annotated[
+        Optional[Path],
+        typer.Option("--domain-list-path", help="Optional path to the staged CATH domain list file."),
+    ] = None,
+    boundaries_path: Annotated[
+        Optional[Path],
+        typer.Option("--boundaries-path", help="Optional path to the staged CATH domain boundaries file."),
+    ] = None,
+    names_path: Annotated[
+        Optional[Path],
+        typer.Option("--names-path", help="Optional path to the staged CATH names file."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of PDB entries to index for preview runs."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Discard any existing local CATH index and rebuild it."),
+    ] = False,
+) -> None:
+    """Build a reusable local CATH chain-aware lookup from staged flat files."""
+    from pbdata.source_indexes import index_cath_domains
+
+    layout = _storage_layout(ctx)
+    base_dir = layout.root / "data_sources" / "cath"
+    resolved_domain_list = domain_list_path or (base_dir / "cath-domain-list.txt")
+    resolved_boundaries = boundaries_path or (base_dir / "cath-domain-boundaries.txt")
+    resolved_names = names_path or (base_dir / "cath-names.txt")
+
+    result = index_cath_domains(
+        layout,
+        domain_list_path=resolved_domain_list,
+        boundaries_path=resolved_boundaries,
+        names_path=resolved_names,
+        limit=limit,
+        force=force,
+    )
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Domain list  : {resolved_domain_list}")
+    typer.echo(f"Boundaries   : {resolved_boundaries}")
+    typer.echo(f"Names path   : {resolved_names}")
+    typer.echo(f"Index path   : {result.index_path}")
+    if result.lookup_db_path is not None:
+        typer.echo(f"Lookup DB    : {result.lookup_db_path}")
+    typer.echo(f"Manifest     : {result.manifest_path}")
+    typer.echo(f"Record count : {result.record_count}")
+
+
+@app.command("index-scop-domains")
+def index_scop_domains_cmd(
+    ctx: typer.Context,
+    classification_path: Annotated[
+        Optional[Path],
+        typer.Option("--classification-path", help="Optional path to the staged SCOPe classification file."),
+    ] = None,
+    descriptions_path: Annotated[
+        Optional[Path],
+        typer.Option("--descriptions-path", help="Optional path to the staged SCOPe description file."),
+    ] = None,
+    limit: Annotated[
+        Optional[int],
+        typer.Option("--limit", min=1, help="Optional maximum number of PDB entries to index for preview runs."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Discard any existing local SCOPe index and rebuild it."),
+    ] = False,
+) -> None:
+    """Build a reusable local SCOPe chain-aware lookup from staged flat files."""
+    from pbdata.source_indexes import index_scop_domains
+
+    layout = _storage_layout(ctx)
+    base_dir = layout.root / "data_sources" / "scope"
+    resolved_classification = classification_path or (base_dir / "dir.cla.scope.2.08-stable.txt")
+    resolved_descriptions = descriptions_path or (base_dir / "dir.des.scope.txt")
+
+    result = index_scop_domains(
+        layout,
+        classification_path=resolved_classification,
+        descriptions_path=resolved_descriptions,
+        limit=limit,
+        force=force,
+    )
+    typer.echo(f"Storage root : {layout.root}")
+    typer.echo(f"Class path   : {resolved_classification}")
+    typer.echo(f"Desc path    : {resolved_descriptions}")
+    typer.echo(f"Index path   : {result.index_path}")
+    if result.lookup_db_path is not None:
+        typer.echo(f"Lookup DB    : {result.lookup_db_path}")
     typer.echo(f"Manifest     : {result.manifest_path}")
     typer.echo(f"Record count : {result.record_count}")
 

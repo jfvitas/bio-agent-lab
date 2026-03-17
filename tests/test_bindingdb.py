@@ -1,4 +1,5 @@
 import json
+import zipfile
 from pathlib import Path
 from uuid import uuid4
 from unittest.mock import Mock, patch
@@ -95,6 +96,86 @@ def test_fetch_bindingdb_samples_prefers_local_cache_dir() -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["mode"] == "local_cache"
     assert state["record_count"] == 1
+
+
+def test_fetch_bindingdb_samples_prefers_bulk_index_when_staged_dump_is_present() -> None:
+    tmp_root = _tmp_dir("bindingdb_bulk_preferred")
+    layout = build_storage_layout(tmp_root / "storage")
+    bulk_dir = tmp_root / "data_sources" / "bindingdb"
+    bulk_dir.mkdir(parents=True, exist_ok=True)
+    dump_zip_path = bulk_dir / "BDB-mySQL_All_202603_dmp.zip"
+    with zipfile.ZipFile(dump_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "BDB-mySQL_All_202603.dmp",
+            "\n".join(
+                [
+                    "INSERT INTO `pdb_bdb` VALUES ('1ABC','1001',NULL,NULL,NULL,NULL,NULL,NULL,NULL);",
+                    "INSERT INTO `cobweb_bdb` VALUES ('Kinase A','ATP',42,'Kd',5.0000,' 5.0',0,1001,'Homo sapiens');",
+                    "INSERT INTO `monomer` VALUES (0,'','null','C10H16N5O13P3','ATP','ATP','AAAA-BBBB',NULL,NULL,42,'InChI=1S/example','507.00','Small organic molecule',1,'CCO',NULL);",
+                    "INSERT INTO `enzyme_reactant_set` VALUES ('Kinase A',NULL,1,1001,NULL,NULL,7,NULL,NULL,NULL,'ATP',NULL,42,NULL,NULL,NULL,8,'protein_ligand',NULL,NULL);",
+                    "INSERT INTO `polymer` VALUES (NULL,NULL,'Linear',NULL,'Homo sapiens',NULL,'Homo sapiens','Protein','Kinase A',320,NULL,1,'9606','P12345',8,'1ABC',NULL,NULL,NULL);",
+                    "INSERT INTO `entry` VALUES (NULL,'Example citation','2026-03-16 00:00:00','Example kinase binding',NULL,NULL,7,'Enzyme Inhibition',NULL,'EZ123');",
+                ]
+            ),
+        )
+
+    local_dir = tmp_root / "bindingdb_local"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "1ABC.json").write_text(
+        json.dumps(
+            {
+                "pdb_id": "1ABC",
+                "monomers": [
+                    {
+                        "monomerID": "WRONG",
+                        "affinities": [
+                            {
+                                "affinity": "99",
+                                "affinityUnit": "nM",
+                                "affinityType": "Kd",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig(
+        sources=SourcesConfig(
+            bindingdb=SourceConfig(
+                enabled=True,
+                extra={
+                    "bulk_zip": str(dump_zip_path),
+                    "local_dir": str(local_dir),
+                },
+            ),
+        ),
+    )
+    raw = {
+        "rcsb_id": "1ABC",
+        "nonpolymer_entities": [
+            {"nonpolymer_comp": {"chem_comp": {"id": "ATP"}}},
+        ],
+        "polymer_entities": [
+            {
+                "rcsb_polymer_entity_container_identifiers": {
+                    "uniprot_ids": ["P12345"],
+                    "auth_asym_ids": ["A"],
+                }
+            }
+        ],
+    }
+
+    rows = _fetch_bindingdb_samples_for_pdb("1ABC", config, layout=layout, raw=raw)
+
+    assert len(rows) == 1
+    assert rows[0].ligand_id == "ATP"
+    assert rows[0].chain_ids_receptor == ["A"]
+    assert rows[0].provenance["source_mode"] == "bulk_index"
+    state = json.loads((layout.source_state_dir / "bindingdb.json").read_text(encoding="utf-8"))
+    assert state["mode"] == "bulk_index"
 
 
 def test_bindingdb_adapter_retries_transient_failure() -> None:
