@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from pbdata.modeling.trainer_registry import resolve_trainer_backend
 from pbdata.storage import StorageLayout
 
 Modality = Literal["attributes", "graphs", "graphs+attributes", "unsupervised"]
@@ -40,6 +41,9 @@ class DatasetProfile:
     graph_export_formats: tuple[str, ...] = ()
     graph_covered_rows: int = 0
     graph_covered_fraction: float = 0.0
+    graph_native_ready: bool = False
+    graph_matched_example_count: int = 0
+    graph_matched_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,9 @@ class ModelRecommendation:
     starter_recipe: tuple[str, ...]
     compute_cost: str
     interpretability: str
+    functional_status: str
+    execution_backend: str
+    execution_family: str
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -397,6 +404,41 @@ def _tasks_from_labels(label_fields: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(tasks))
 
 
+def _graph_match_stats(
+    training_examples: list[dict[str, Any]],
+    graph_nodes: Any,
+    graph_edges: Any,
+) -> tuple[int, float]:
+    if not training_examples or not isinstance(graph_nodes, list) or not isinstance(graph_edges, list):
+        return 0, 0.0
+    node_pdbs: set[str] = set()
+    edge_pdbs: set[str] = set()
+    for node in graph_nodes:
+        if not isinstance(node, dict):
+            continue
+        metadata = node.get("metadata") or {}
+        pdb_id = str(metadata.get("pdb_id") or node.get("primary_id") or "").strip().upper()
+        if pdb_id:
+            node_pdbs.add(pdb_id)
+    for edge in graph_edges:
+        if not isinstance(edge, dict):
+            continue
+        metadata = edge.get("metadata") or {}
+        pdb_id = str(metadata.get("pdb_id") or "").strip().upper()
+        if pdb_id:
+            edge_pdbs.add(pdb_id)
+    matched_count = 0
+    for row in training_examples:
+        if not isinstance(row, dict):
+            continue
+        structure = row.get("structure") or {}
+        provenance = row.get("provenance") or {}
+        pdb_id = str(structure.get("pdb_id") or provenance.get("pdb_id") or "").strip().upper()
+        if pdb_id and pdb_id in node_pdbs and pdb_id in edge_pdbs:
+            matched_count += 1
+    return matched_count, (matched_count / len(training_examples) if training_examples else 0.0)
+
+
 def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto") -> DatasetProfile:
     training_examples = _read_json(layout.training_dir / "training_examples.json")
     training_rows = training_examples if isinstance(training_examples, list) else []
@@ -409,9 +451,10 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
     engineered_train = _read_csv_rows(layout.workspace_datasets_dir / "engineered_dataset" / "train.csv")
     custom_rows = _read_csv_rows(layout.root / "custom_training_set.csv")
     graph_config = _read_latest_dataset_graph_config(layout)
-
     graph_ready = isinstance(graph_nodes, list) and bool(graph_nodes) and isinstance(graph_edges, list) and bool(graph_edges)
     attribute_ready = bool(training_rows or engineered_train or custom_rows or isinstance(feature_records, list) and feature_records)
+    graph_matched_example_count, graph_matched_fraction = _graph_match_stats(training_rows, graph_nodes, graph_edges)
+    graph_native_ready = graph_ready and graph_matched_fraction >= 0.35
     graph_covered_rows = int(graph_config.get("graph_covered_rows") or 0)
     try:
         graph_covered_fraction = float(graph_config.get("graph_covered_fraction") or 0.0)
@@ -429,9 +472,9 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
     modalities: list[str] = []
     if attribute_ready:
         modalities.append("attributes")
-    if graph_ready:
+    if graph_ready and graph_native_ready:
         modalities.append("graphs")
-    if attribute_ready and graph_ready:
+    if attribute_ready and graph_ready and graph_native_ready:
         modalities.append("graphs+attributes")
     modalities.append("unsupervised")
 
@@ -451,6 +494,10 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
         quality_flags.append("training_examples_missing")
     if not graph_ready:
         quality_flags.append("graph_artifacts_missing")
+    elif graph_matched_example_count == 0:
+        quality_flags.append("graph_learning_contract_missing")
+    elif graph_matched_fraction < 0.35:
+        quality_flags.append("weak_graph_learning_coverage")
     if not attribute_ready:
         quality_flags.append("attribute_artifacts_missing")
 
@@ -459,12 +506,19 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
         if graph_dataset_name
         else ""
     )
+    native_graph_suffix = (
+        f"; graph_native_match={graph_matched_fraction:.0%} across {graph_matched_example_count:,} examples"
+        if graph_ready
+        else ""
+    )
     summary = (
         f"{example_count:,} examples available; modalities="
         f"{', '.join(modalities)}; tasks={', '.join(tasks_available)}"
-        f"{coverage_suffix}"
+        f"{coverage_suffix}{native_graph_suffix}"
     )
-    if training_rows:
+    if training_rows and graph_ready and not graph_native_ready:
+        next_action = "Do not treat graph-native families as functional yet; verify per-example graph coverage before preferring GNN or hybrid training."
+    elif training_rows:
         next_action = "Use the recommendations below to choose a baseline, then compare against a graph-native or hybrid model."
     else:
         next_action = "Run build-training-examples and build-splits first so Model Studio can recommend trainable architectures."
@@ -499,6 +553,9 @@ def build_dataset_profile(layout: StorageLayout, *, dataset_source: str = "auto"
         graph_export_formats=graph_export_formats,
         graph_covered_rows=graph_covered_rows,
         graph_covered_fraction=graph_covered_fraction,
+        graph_native_ready=graph_native_ready,
+        graph_matched_example_count=graph_matched_example_count,
+        graph_matched_fraction=graph_matched_fraction,
     )
 
 
@@ -547,6 +604,12 @@ def validate_model_studio_selection(
             title="Graph artifacts unavailable",
             body="Graph-native models need graph_nodes.json and graph_edges.json from the graph stages.",
         ))
+    if modality == "graphs" and profile.graph_ready and not profile.graph_native_ready:
+        messages.append(CompatibilityMessage(
+            priority="error",
+            title="Graph learning contract unavailable",
+            body="Raw graph files exist, but the workspace does not yet expose enough per-example graph coverage for native graph training.",
+        ))
     if modality == "attributes" and not profile.attribute_ready:
         messages.append(CompatibilityMessage(
             priority="error",
@@ -558,6 +621,12 @@ def validate_model_studio_selection(
             priority="error",
             title="Hybrid inputs incomplete",
             body="Hybrid graph+attribute models need both graph artifacts and attribute-style training data.",
+        ))
+    if modality == "graphs+attributes" and profile.graph_ready and profile.attribute_ready and not profile.graph_native_ready:
+        messages.append(CompatibilityMessage(
+            priority="warning",
+            title="Hybrid graph contract weak",
+            body="Graph+attribute training would currently run without reliable per-example graph coverage, so graph-native families are not first-class yet.",
         ))
     family = selection.preferred_family
     if family in {"cnn", "unet"} and modality not in {"graphs"}:
@@ -578,6 +647,12 @@ def validate_model_studio_selection(
             title="Hybrid model underfed",
             body="Hybrid fusion models make the most sense when both graph and attribute branches are available.",
         ))
+    if family in {"gnn", "hybrid_fusion"} and not profile.graph_native_ready and profile.graph_ready:
+        messages.append(CompatibilityMessage(
+            priority="warning",
+            title="Graph-native execution not ready",
+            body="This workspace can expose graph context features, but native graph-family execution would still fall back to a surrogate path.",
+        ))
     if family in {"dense_nn", "gnn", "hybrid_fusion"} and profile.example_count and profile.example_count < 250:
         messages.append(CompatibilityMessage(
             priority="warning",
@@ -596,7 +671,7 @@ def validate_model_studio_selection(
 def _effective_modality(profile: DatasetProfile, selection: ModelStudioSelection) -> str:
     if selection.modality != "auto":
         return selection.modality
-    if profile.graph_ready and profile.attribute_ready and profile.graph_dataset_name:
+    if profile.graph_native_ready and profile.graph_ready and profile.attribute_ready and profile.graph_dataset_name:
         if profile.graph_covered_fraction < 0.35:
             return "attributes"
         return "graphs+attributes"
@@ -619,11 +694,34 @@ def _effective_task(profile: DatasetProfile, selection: ModelStudioSelection) ->
     return "unsupervised"
 
 
-def _score_candidate(candidate: _Candidate, profile: DatasetProfile, selection: ModelStudioSelection) -> tuple[float, list[str]]:
+def _functional_status(implementation: str) -> str:
+    if implementation == "native":
+        return "first_class"
+    if implementation == "fallback":
+        return "fallback"
+    if implementation == "surrogate":
+        return "surrogate"
+    return "planned"
+
+
+def _score_candidate(
+    candidate: _Candidate,
+    profile: DatasetProfile,
+    selection: ModelStudioSelection,
+    *,
+    installed_backends: tuple[str, ...] | None = None,
+) -> tuple[float, list[str], str, str, str]:
     modality = _effective_modality(profile, selection)
     task = _effective_task(profile, selection)
     reasons: list[str] = []
     score = 0.0
+    backend_plan = resolve_trainer_backend(
+        candidate.family,
+        runtime_target="local_cpu",
+        installed_backends=installed_backends,
+        native_graph_contract_available=profile.graph_native_ready,
+    )
+    functional_status = _functional_status(backend_plan.implementation)
 
     if modality in candidate.modality_support:
         score += 4.0
@@ -690,16 +788,35 @@ def _score_candidate(candidate: _Candidate, profile: DatasetProfile, selection: 
     if candidate.supervision == "supervised" and task == "unsupervised":
         score -= 8.0
 
-    return score, reasons
+    if functional_status == "first_class":
+        reasons.append(f"Locally runnable as a first-class {backend_plan.backend_id} backend.")
+    elif functional_status == "fallback":
+        score -= 1.0
+        reasons.append(f"Only available through fallback backend {backend_plan.backend_id} in the current runtime.")
+    elif functional_status == "surrogate":
+        score -= 3.5
+        reasons.append(f"Would execute as a surrogate path ({backend_plan.backend_id}) rather than the requested family.")
+    else:
+        score -= 8.0
+        reasons.append("No supported local backend is registered for this family yet.")
+
+    return score, reasons, functional_status, backend_plan.backend_id, backend_plan.execution_family
 
 
 def recommend_model_architectures(
     profile: DatasetProfile,
     selection: ModelStudioSelection,
+    *,
+    installed_backends: tuple[str, ...] | None = None,
 ) -> list[ModelRecommendation]:
     ranked: list[ModelRecommendation] = []
     for candidate in _CANDIDATES:
-        score, reasons = _score_candidate(candidate, profile, selection)
+        score, reasons, functional_status, execution_backend, execution_family = _score_candidate(
+            candidate,
+            profile,
+            selection,
+            installed_backends=installed_backends,
+        )
         if score <= -2.0:
             continue
         warnings: list[str] = []
@@ -707,6 +824,12 @@ def recommend_model_architectures(
             warnings.append("Advanced roadmap option: current pipeline does not yet expose first-class grid/tensor datasets.")
         if candidate.family == "hybrid_fusion" and not (profile.graph_ready and profile.attribute_ready):
             warnings.append("Requires both graph and attribute artifacts.")
+        if functional_status == "fallback":
+            warnings.append(f"Current runtime would use fallback backend `{execution_backend}` rather than a native implementation.")
+        elif functional_status == "surrogate":
+            warnings.append(f"Current runtime would execute this as surrogate family `{execution_family}` via backend `{execution_backend}`.")
+        elif functional_status == "planned":
+            warnings.append("This family is still planned or unsupported for local first-class execution.")
         ranked.append(ModelRecommendation(
             rank=0,
             model_id=candidate.model_id,
@@ -722,9 +845,13 @@ def recommend_model_architectures(
             starter_recipe=candidate.recipe,
             compute_cost=candidate.compute_cost,
             interpretability=candidate.interpretability,
+            functional_status=functional_status,
+            execution_backend=execution_backend,
+            execution_family=execution_family,
             warnings=tuple(warnings),
         ))
-    ranked.sort(key=lambda item: (-item.fit_score, item.compute_cost, item.label))
+    status_rank = {"first_class": 0, "fallback": 1, "surrogate": 2, "planned": 3}
+    ranked.sort(key=lambda item: (status_rank.get(item.functional_status, 99), -item.fit_score, item.compute_cost, item.label))
     top = ranked[:3]
     return [
         ModelRecommendation(
@@ -742,6 +869,9 @@ def recommend_model_architectures(
             starter_recipe=item.starter_recipe,
             compute_cost=item.compute_cost,
             interpretability=item.interpretability,
+            functional_status=item.functional_status,
+            execution_backend=item.execution_backend,
+            execution_family=item.execution_family,
             warnings=item.warnings,
         )
         for index, item in enumerate(top, start=1)
@@ -878,11 +1008,20 @@ def build_model_recommendation_report(
     *,
     selection: ModelStudioSelection | None = None,
 ) -> dict[str, Any]:
+    from pbdata.modeling.runtime import detect_runtime_capabilities
+
     active_selection = selection or ModelStudioSelection()
     profile = build_dataset_profile(layout, dataset_source=active_selection.dataset_source)
+    runtime_capabilities = detect_runtime_capabilities()
     compatibility_messages = validate_model_studio_selection(profile, active_selection)
-    recommendations = recommend_model_architectures(profile, active_selection)
-    top_recommendation = recommendations[0] if recommendations else None
+    recommendations = recommend_model_architectures(
+        profile,
+        active_selection,
+        installed_backends=runtime_capabilities.installed_backends,
+    )
+    functional_recommendations = [item for item in recommendations if item.functional_status == "first_class"]
+    secondary_recommendations = [item for item in recommendations if item.functional_status != "first_class"]
+    top_recommendation = functional_recommendations[0] if functional_recommendations else None
     starter_path = (
         export_starter_model_config(layout, build_starter_model_config(profile, top_recommendation, active_selection))
         if top_recommendation is not None
@@ -892,17 +1031,25 @@ def build_model_recommendation_report(
     blocking_errors = [message for message in compatibility_messages if message.priority == "error"]
     warnings = [message for message in compatibility_messages if message.priority == "warning"]
     if top_recommendation is None:
-        status = "blocked"
+        status = "limited_functional_support" if secondary_recommendations else "blocked"
     elif blocking_errors:
         status = "ready_with_blockers"
-    elif warnings:
+    elif warnings or secondary_recommendations:
         status = "ready_with_warnings"
     else:
         status = "ready"
 
     if top_recommendation is None:
-        summary = "No trainable recommendation is available yet from the current workspace state."
-        next_action = profile.next_action
+        if secondary_recommendations:
+            secondary = secondary_recommendations[0]
+            summary = (
+                f"No first-class local recommendation is available yet. "
+                f"Highest-scoring secondary option: {secondary.label} ({secondary.family}) via {secondary.execution_backend} [{secondary.functional_status}]."
+            )
+            next_action = "Prefer a supported baseline or improve runtime/data coverage before treating higher-complexity families as functional."
+        else:
+            summary = "No trainable recommendation is available yet from the current workspace state."
+            next_action = profile.next_action
     else:
         graph_suffix = (
             f" Graph coverage is {profile.graph_covered_fraction:.0%} across {profile.graph_covered_rows:,} engineered rows."
@@ -926,9 +1073,16 @@ def build_model_recommendation_report(
         "summary": summary,
         "next_action": next_action,
         "dataset_profile": asdict(profile),
+        "runtime_capabilities": {
+            "installed_backends": list(runtime_capabilities.installed_backends),
+            "supported_targets": list(runtime_capabilities.supported_targets),
+            "summary": runtime_capabilities.summary,
+        },
         "selection": asdict(active_selection),
         "compatibility_messages": [asdict(message) for message in compatibility_messages],
         "recommendations": [asdict(item) for item in recommendations],
+        "functional_recommendations": [asdict(item) for item in functional_recommendations],
+        "secondary_recommendations": [asdict(item) for item in secondary_recommendations],
         "top_recommendation": asdict(top_recommendation) if top_recommendation is not None else None,
         "starter_config_path": str(starter_path) if starter_path is not None else "",
         "starter_config_ready": starter_path is not None and starter_path.exists(),
@@ -947,9 +1101,11 @@ def export_model_recommendation_report(
     json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     dataset_profile = report.get("dataset_profile") or {}
+    runtime_capabilities = report.get("runtime_capabilities") or {}
     top_recommendation = report.get("top_recommendation") or {}
     compatibility_messages = report.get("compatibility_messages") or []
-    recommendation_rows = report.get("recommendations") or []
+    recommendation_rows = report.get("functional_recommendations") or []
+    secondary_rows = report.get("secondary_recommendations") or []
     lines = [
         "# Model Studio Recommendation",
         "",
@@ -959,6 +1115,8 @@ def export_model_recommendation_report(
         f"- Dataset source: {dataset_profile.get('dataset_source', 'unknown')}",
         f"- Examples: {dataset_profile.get('example_count', 0)}",
         f"- Graph coverage: {dataset_profile.get('graph_covered_fraction', 0.0):.0%} across {dataset_profile.get('graph_covered_rows', 0)} rows",
+        f"- Native graph match: {dataset_profile.get('graph_matched_fraction', 0.0):.0%} across {dataset_profile.get('graph_matched_example_count', 0)} examples",
+        f"- Runtime backends: {', '.join(runtime_capabilities.get('installed_backends', [])) or 'none detected'}",
         "",
         "## Top recommendation",
     ]
@@ -967,6 +1125,8 @@ def export_model_recommendation_report(
             [
                 f"- Label: {top_recommendation.get('label')}",
                 f"- Family: {top_recommendation.get('family')}",
+                f"- Functional status: {top_recommendation.get('functional_status')}",
+                f"- Execution backend: {top_recommendation.get('execution_backend')}",
                 f"- Modality: {top_recommendation.get('modality')}",
                 f"- Fit score: {top_recommendation.get('fit_score')}",
                 f"- Why it fits: {top_recommendation.get('why_it_fits')}",
@@ -974,13 +1134,23 @@ def export_model_recommendation_report(
             ]
         )
     else:
-        lines.append("- No recommendation available yet.")
+        lines.append("- No first-class local recommendation available yet.")
 
-    lines.extend(["", "## Ranked options"])
+    lines.extend(["", "## Functional options"])
     for row in recommendation_rows:
         lines.append(
-            f"- #{row.get('rank')}: {row.get('label')} ({row.get('family')}) | modality={row.get('modality')} | fit_score={row.get('fit_score')}"
+            f"- #{row.get('rank')}: {row.get('label')} ({row.get('family')}) | modality={row.get('modality')} | fit_score={row.get('fit_score')} | backend={row.get('execution_backend')}"
         )
+    if not recommendation_rows:
+        lines.append("- No first-class functional options are currently available.")
+
+    lines.extend(["", "## Secondary Or Planned Options"])
+    for row in secondary_rows:
+        lines.append(
+            f"- #{row.get('rank')}: {row.get('label')} ({row.get('family')}) | status={row.get('functional_status')} | backend={row.get('execution_backend')} | execution_family={row.get('execution_family')}"
+        )
+    if not secondary_rows:
+        lines.append("- No secondary or planned options recorded.")
 
     lines.extend(["", "## Compatibility checks"])
     if compatibility_messages:

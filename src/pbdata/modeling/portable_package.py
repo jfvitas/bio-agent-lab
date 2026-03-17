@@ -704,6 +704,9 @@ def run_training(package_root: Path, output_dir: Path):
         (output_dir / "run_manifest.json").write_text(json.dumps({
             "generated_at": utc_now(),
             "family": family,
+            "requested_family": family,
+            "executed_family": "clustering" if backend == "sklearn_kmeans" else "pca_embedding" if backend == "pca_autoencoder" else family,
+            "functional_status": "first_class" if backend == "sklearn_kmeans" else "surrogate",
             "task": "unsupervised",
             "backend": backend,
             "trainer_backend": trainer_backend,
@@ -779,6 +782,9 @@ def run_training(package_root: Path, output_dir: Path):
             (output_dir / "run_manifest.json").write_text(json.dumps({
                 "generated_at": utc_now(),
                 "family": family,
+                "requested_family": family,
+                "executed_family": family,
+                "functional_status": "first_class",
                 "task": task,
                 "backend": backend["backend"],
                 "trainer_backend": trainer_backend,
@@ -834,6 +840,9 @@ def run_training(package_root: Path, output_dir: Path):
     (output_dir / "run_manifest.json").write_text(json.dumps({
         "generated_at": utc_now(),
         "family": family,
+        "requested_family": family,
+        "executed_family": effective_family,
+        "functional_status": "surrogate" if effective_family != family else "first_class",
         "task": task,
         "backend": backend,
         "trainer_backend": trainer_backend,

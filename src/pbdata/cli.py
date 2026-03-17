@@ -1201,6 +1201,13 @@ def train_recommended_model_cmd(
                 manifest_payload["execution_strategy"] = execution_strategy
                 manifest_payload["recommended_family"] = original_family
                 manifest_payload["selected_family"] = str(starter_config.get("family") or original_family)
+                manifest_payload["executed_family"] = str(
+                    manifest_payload.get("executed_family")
+                    or (manifest_payload.get("backend_plan") or {}).get("execution_family")
+                    or manifest_payload.get("family")
+                    or starter_config.get("family")
+                    or original_family
+                )
                 if fallback_note:
                     manifest_payload["runtime_adjustment"] = fallback_note
                 manifest_path.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
@@ -1211,6 +1218,13 @@ def train_recommended_model_cmd(
                 config_payload["execution_strategy"] = execution_strategy
                 config_payload["recommended_family"] = original_family
                 config_payload["selected_family"] = str(starter_config.get("family") or original_family)
+                config_payload["executed_family"] = str(
+                    (manifest_payload or {}).get("executed_family")
+                    or (config_payload.get("backend_plan") or {}).get("execution_family")
+                    or config_payload.get("family")
+                    or starter_config.get("family")
+                    or original_family
+                )
                 if fallback_note:
                     config_payload["runtime_adjustment"] = fallback_note
                 config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
