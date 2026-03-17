@@ -326,3 +326,67 @@ def test_release_readiness_surfaces_split_readiness_and_exploratory_strategy_war
     assert report["split_readiness"]["strategy_family"] == "exploratory"
     assert "exploratory_split_strategy" in report["warnings"]
     assert "source_group_overlap_detected" in report["warnings"]
+
+
+def test_release_readiness_surfaces_screening_policy_risk_summary() -> None:
+    tmp_path = _tmp_dir("release_readiness_screening_policy")
+    layout = build_storage_layout(tmp_path)
+    (tmp_path / "master_pdb_repository.csv").write_text(
+        "pdb_id,experimental_method,structure_resolution,organism_names,quality_score,source_databases,has_ligand_signal,has_protein_signal\n"
+        "1ABC,X-RAY DIFFRACTION,2.0,,,BindingDB,true,true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,receptor_uniprot_ids,ligand_types,matching_interface_types,binding_affinity_type,mutation_strings,source_conflict_summary,source_agreement_band,release_split\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,P12345,small_molecule,protein_ligand,Kd,,,,\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "master_pdb_issues.csv").write_text("scope,pdb_id,pair_identity_key,issue_type,details\n", encoding="utf-8")
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.splits_dir / "metadata.json").write_text('{"strategy":"pair_aware_grouped"}', encoding="utf-8")
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text("[]", encoding="utf-8")
+    export_training_set_quality_report(layout)
+
+    _, report = build_release_readiness_report(layout, repo_root=tmp_path)
+
+    assert "screening_policy_fields_unsafe" in report["warnings"]
+    assert report["screening_field_audit"]["unsafe_policy_field_count"] > 0
+
+
+def test_release_readiness_warns_when_model_ready_split_assignments_are_incomplete() -> None:
+    tmp_path = _tmp_dir("release_readiness_incomplete_split_assignment")
+    layout = build_storage_layout(tmp_path)
+    (tmp_path / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,structure_file_cif_path,experimental_method,structure_resolution,quality_score,source_databases,has_ligand_signal,has_protein_signal\n"
+        "1ABC,Example,/tmp/1ABC.cif,X-RAY DIFFRACTION,2.0,1.0,BindingDB,true,true\n"
+        "2DEF,Example,/tmp/2DEF.cif,X-RAY DIFFRACTION,2.0,1.0,BindingDB,true,true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,receptor_uniprot_ids,ligand_types,matching_interface_types,binding_affinity_type,mutation_strings,source_conflict_summary,source_agreement_band,release_split,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,ligand_key,ligand_component_ids,ligand_inchikeys,matching_interface_count\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,P12345,small_molecule,protein_ligand,Kd,wt,single_measurement_no_cross_source_conflict_assessment,not_assessed_single_source,,5,nM,0.699,\"BindingDB:Kd=5 nM\",0.699,1,false,BindingDB,\"single_source:BindingDB\",A,ATP,ATP,ATP-KEY,1\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|wt,BindingDB,Q99999,small_molecule,protein_ligand,Kd,wt,single_measurement_no_cross_source_conflict_assessment,not_assessed_single_source,,8,nM,0.903,\"BindingDB:Kd=8 nM\",0.903,1,false,BindingDB,\"single_source:BindingDB\",A,GTP,GTP,GTP-KEY,1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "master_pdb_issues.csv").write_text("scope,pdb_id,pair_identity_key,issue_type,details\n", encoding="utf-8")
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.splits_dir / "train.txt").write_text("protein_ligand|1ABC|A|ATP|wt|Kd\n", encoding="utf-8")
+    (layout.splits_dir / "metadata.json").write_text(json.dumps({"strategy": "pair_aware_grouped"}), encoding="utf-8")
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(
+        json.dumps([{
+            "example_id": "train:1ABC:0",
+            "protein": {"uniprot_id": "P12345"},
+            "ligand": {"smiles": "CCO"},
+            "provenance": {"pair_identity_key": "protein_ligand|1ABC|A|ATP|wt", "has_graph_data": True},
+            "labels": {"binding_affinity_log10": 1.0, "affinity_type": "Kd"},
+        }]),
+        encoding="utf-8",
+    )
+    export_training_set_quality_report(layout)
+
+    _, report = build_release_readiness_report(layout, repo_root=tmp_path)
+
+    assert "model_ready_split_assignments_incomplete" in report["warnings"]
+    assert report["split_readiness"]["assignment_coverage_fraction"] == 0.5

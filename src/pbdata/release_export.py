@@ -111,6 +111,9 @@ def _semicolon_values(raw: str) -> list[str]:
 def _split_readiness_summary(
     split_metadata: dict[str, Any],
     split_diagnostics: dict[str, Any],
+    *,
+    model_ready_pair_count: int,
+    assigned_model_ready_pair_count: int,
 ) -> dict[str, Any]:
     strategy = str(split_metadata.get("strategy") or "").strip() or "unknown"
     sizes = split_metadata.get("sizes") or {}
@@ -120,6 +123,11 @@ def _split_readiness_summary(
     diagnostics_counts = split_diagnostics.get("counts") or {}
     overlap = split_diagnostics.get("overlap") or {}
     split_status = str(split_diagnostics.get("status") or "missing")
+    assignment_coverage_fraction = (
+        float(assigned_model_ready_pair_count) / model_ready_pair_count
+        if model_ready_pair_count
+        else 0.0
+    )
     strategy_family = (
         "release_grade"
         if strategy in _RELEASE_GRADE_SPLIT_STRATEGIES
@@ -139,6 +147,9 @@ def _split_readiness_summary(
         "strategy_family": strategy_family,
         "held_out_count": held_out_count,
         "held_out_ready": held_out_count > 0,
+        "assigned_model_ready_pair_count": assigned_model_ready_pair_count,
+        "unassigned_model_ready_pair_count": max(model_ready_pair_count - assigned_model_ready_pair_count, 0),
+        "assignment_coverage_fraction": round(assignment_coverage_fraction, 6),
         "diagnostic_status": split_status,
         "hard_group_overlap_count": int(diagnostics_counts.get("hard_group_overlap_count") or 0),
         "family_overlap_count": int(diagnostics_counts.get("family_overlap_count") or 0),
@@ -236,6 +247,9 @@ def export_release_artifacts(
 ) -> dict[str, str]:
     """Write stable canonical/release exports from current root review files."""
     from pbdata.master_export import (
+        _normalized_conflict_fields,
+        _normalized_mutation_strings,
+        _split_assignment_map,
         issue_csv_path,
         master_csv_path,
         pair_master_csv_path,
@@ -294,6 +308,7 @@ def export_release_artifacts(
         "reported_measurements_text",
         "reported_measurement_mean_log10_standardized",
         "reported_measurement_count",
+        "mutation_strings",
         "source_conflict_flag",
         "source_conflict_summary",
         "source_agreement_band",
@@ -310,7 +325,12 @@ def export_release_artifacts(
         "assay_field_confidence_json",
     ]
     canonical_pairs = [
-        {column: str(row.get(column) or "") for column in canonical_pair_columns}
+        {
+            **{column: str(row.get(column) or "") for column in canonical_pair_columns},
+            "mutation_strings": _stringify(_normalized_mutation_strings(row)),
+            "source_conflict_summary": _stringify(_normalized_conflict_fields(row)[0]),
+            "source_agreement_band": _stringify(_normalized_conflict_fields(row)[1]),
+        }
         for row in pair_rows
     ]
     canonical_pairs.sort(key=lambda row: (row["pdb_id"], row["pair_identity_key"], row["binding_affinity_type"]))
@@ -324,31 +344,7 @@ def export_release_artifacts(
     model_ready_rows: list[dict[str, str]] = []
     exclusion_rows: list[dict[str, str]] = []
 
-    training_examples_path = layout.training_dir / "training_examples.json"
-    split_assignment: dict[tuple[str, str, str], str] = {}
-    if training_examples_path.exists():
-        raw = json.loads(training_examples_path.read_text(encoding="utf-8"))
-        examples = raw if isinstance(raw, list) else []
-        example_lookup: dict[str, tuple[str, str, str]] = {}
-        for row in examples:
-            if not isinstance(row, dict):
-                continue
-            example_id = str(row.get("example_id") or "")
-            provenance = row.get("provenance") or {}
-            labels = row.get("labels") or {}
-            pair_key = str(provenance.get("pair_identity_key") or "")
-            affinity_type = str(labels.get("affinity_type") or "")
-            pdb_id = str((row.get("structure") or {}).get("pdb_id") or "")
-            if example_id and pair_key:
-                example_lookup[example_id] = (pdb_id, pair_key, affinity_type)
-        for split_name in ("train", "val", "test"):
-            split_path = layout.splits_dir / f"{split_name}.txt"
-            if not split_path.exists():
-                continue
-            for line in split_path.read_text(encoding="utf-8").splitlines():
-                item_id = line.strip()
-                if item_id in example_lookup:
-                    split_assignment[example_lookup[item_id]] = split_name
+    split_assignment = _split_assignment_map(layout)
 
     exclusion_counts: Counter[str] = Counter()
     for row in pair_rows:
@@ -382,7 +378,11 @@ def export_release_artifacts(
             column: str(row.get(column) or "")
             for column in canonical_pair_columns
         }
-        model_ready_row["release_split"] = split_assignment.get((pdb_id, pair_key, affinity_type), "")
+        model_ready_row["mutation_strings"] = _stringify(_normalized_mutation_strings(row))
+        conflict_summary, agreement_band = _normalized_conflict_fields(row)
+        model_ready_row["source_conflict_summary"] = _stringify(conflict_summary)
+        model_ready_row["source_agreement_band"] = _stringify(agreement_band)
+        model_ready_row["release_split"] = split_assignment.get((pdb_id, pair_key, affinity_type), str(row.get("release_split") or ""))
         model_ready_row["model_ready_policy_version"] = "v1"
         model_ready_rows.append(model_ready_row)
 
@@ -409,7 +409,15 @@ def export_release_artifacts(
         else {}
     )
     split_diagnostics_counts = split_diagnostics.get("counts") or {}
-    split_readiness = _split_readiness_summary(split_metadata, split_diagnostics)
+    assigned_model_ready_pair_count = sum(
+        1 for row in model_ready_rows if str(row.get("release_split") or "").strip() in {"train", "val", "test"}
+    )
+    split_readiness = _split_readiness_summary(
+        split_metadata,
+        split_diagnostics,
+        model_ready_pair_count=len(model_ready_rows),
+        assigned_model_ready_pair_count=assigned_model_ready_pair_count,
+    )
     split_rows: list[dict[str, str]] = []
     for split_name in ("train", "val", "test"):
         split_path = layout.splits_dir / f"{split_name}.txt"
@@ -427,6 +435,9 @@ def export_release_artifacts(
             "strategy": _stringify(split_metadata.get("strategy") if split_name == "train" else ""),
             "strategy_family": _stringify(split_readiness.get("strategy_family") if split_name == "train" else ""),
             "held_out_ready": _stringify(split_readiness.get("held_out_ready") if split_name == "train" else ""),
+            "assigned_model_ready_pair_count": _stringify(split_readiness.get("assigned_model_ready_pair_count") if split_name == "train" else ""),
+            "unassigned_model_ready_pair_count": _stringify(split_readiness.get("unassigned_model_ready_pair_count") if split_name == "train" else ""),
+            "assignment_coverage_fraction": _stringify(split_readiness.get("assignment_coverage_fraction") if split_name == "train" else ""),
             "diagnostic_status": _stringify(split_diagnostics.get("status") if split_name == "train" else ""),
             "hard_group_overlap_count": _stringify(split_diagnostics_counts.get("hard_group_overlap_count") if split_name == "train" else ""),
             "family_overlap_count": _stringify(split_diagnostics_counts.get("family_overlap_count") if split_name == "train" else ""),
@@ -447,6 +458,9 @@ def export_release_artifacts(
             "strategy",
             "strategy_family",
             "held_out_ready",
+            "assigned_model_ready_pair_count",
+            "unassigned_model_ready_pair_count",
+            "assignment_coverage_fraction",
             "diagnostic_status",
             "hard_group_overlap_count",
             "family_overlap_count",
@@ -499,10 +513,13 @@ def build_release_readiness_report(
     repo_root: Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Build a release-readiness report with explicit blockers and warnings."""
+    from pbdata.screening_field_audit import build_screening_field_audit
+
     root = repo_root or Path.cwd()
     artifacts = export_release_artifacts(layout, repo_root=root)
     manifest_path = Path(artifacts["release_manifest_json"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    screening_audit = build_screening_field_audit(layout, repo_root=root)
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -524,6 +541,8 @@ def build_release_readiness_report(
         blockers.append("no_split_metadata")
     elif not bool(split_readiness.get("held_out_ready")):
         blockers.append("no_held_out_split")
+    if model_ready_pair_count > 0 and float(split_readiness.get("assignment_coverage_fraction") or 0.0) < 1.0:
+        warnings.append("model_ready_split_assignments_incomplete")
 
     cfg_path = layout.root / "configs" / "sources.yaml"
     try:
@@ -592,6 +611,8 @@ def build_release_readiness_report(
             warnings.append("identity_crosswalk_contains_many_fallbacks")
     if not (layout.models_dir / "ligand_memory_model.json").exists():
         warnings.append("no_baseline_model_artifact")
+    if int(screening_audit.get("unsafe_policy_field_count") or 0) > 0:
+        warnings.append("screening_policy_fields_unsafe")
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -608,6 +629,13 @@ def build_release_readiness_report(
             "held_out_count": int(split_readiness.get("held_out_count") or 0),
         },
         "split_readiness": split_readiness,
+        "screening_field_audit": {
+            "issue_count": int(screening_audit.get("issue_count") or 0),
+            "restricted_policy_field_count": int(screening_audit.get("restricted_policy_field_count") or 0),
+            "restricted_policy_fields": screening_audit.get("restricted_policy_fields") or [],
+            "unsafe_policy_field_count": int(screening_audit.get("unsafe_policy_field_count") or 0),
+            "unsafe_policy_fields": screening_audit.get("unsafe_policy_fields") or [],
+        },
         "quality_gates": {
             "source_capabilities": {
                 "status": source_status,

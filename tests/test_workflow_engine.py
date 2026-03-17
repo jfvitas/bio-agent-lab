@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import csv
 
 from typer.testing import CliRunner
 
@@ -144,3 +145,98 @@ def test_cli_workflow_graph_and_dataset_commands() -> None:
     assert result_harvest.exit_code == 0
     assert result_graphs.exit_code == 0
     assert result_dataset.exit_code == 0
+
+
+def test_engineer_dataset_aligns_to_custom_training_selection() -> None:
+    tmp_root = _tmp_dir("workflow_custom_training_alignment")
+    layout = build_storage_layout(tmp_root)
+    initialize_workspace(layout)
+    for name in ["entry", "chains", "assays"]:
+        (layout.extracted_dir / name).mkdir(parents=True, exist_ok=True)
+    (layout.extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "experimental_method": "X-RAY DIFFRACTION",
+        "structure_resolution": 2.0,
+        "organism_names": ["Homo sapiens"],
+    }), encoding="utf-8")
+    (layout.extracted_dir / "entry" / "2DEF.json").write_text(json.dumps({
+        "pdb_id": "2DEF",
+        "experimental_method": "X-RAY DIFFRACTION",
+        "structure_resolution": 2.5,
+        "organism_names": ["Mus musculus"],
+    }), encoding="utf-8")
+    (layout.extracted_dir / "chains" / "1ABC.json").write_text(json.dumps([
+        {"pdb_id": "1ABC", "chain_id": "A", "polymer_sequence": "M" * 180, "uniprot_id": "P12345"},
+    ]), encoding="utf-8")
+    (layout.extracted_dir / "chains" / "2DEF.json").write_text(json.dumps([
+        {"pdb_id": "2DEF", "chain_id": "A", "polymer_sequence": "A" * 200, "uniprot_id": "Q99999"},
+    ]), encoding="utf-8")
+    (layout.extracted_dir / "assays" / "1ABC.json").write_text(json.dumps([
+        {
+            "pdb_id": "1ABC",
+            "pair_identity_key": "protein_ligand|1ABC|A|ATP|wt",
+            "source_database": "BindingDB",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 5.0,
+            "receptor_chain_ids": "A",
+            "receptor_uniprot_ids": "P12345",
+            "ligand_types": "small_molecule",
+            "matching_interface_types": "protein_ligand",
+            "mutation_strings": "wt",
+            "release_split": "train",
+        },
+    ]), encoding="utf-8")
+    (layout.extracted_dir / "assays" / "2DEF.json").write_text(json.dumps([
+        {
+            "pdb_id": "2DEF",
+            "pair_identity_key": "protein_ligand|2DEF|A|GTP|wt",
+            "source_database": "BindingDB",
+            "binding_affinity_type": "Kd",
+            "binding_affinity_value": 8.0,
+            "receptor_chain_ids": "A",
+            "receptor_uniprot_ids": "Q99999",
+            "ligand_types": "small_molecule",
+            "matching_interface_types": "protein_ligand",
+            "mutation_strings": "wt",
+            "release_split": "test",
+        },
+    ]), encoding="utf-8")
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,experimental_method,structure_resolution,organism_names,oligomeric_state\n"
+        "1ABC,X-RAY DIFFRACTION,2.0,Homo sapiens,1.10.510.10\n"
+        "2DEF,X-RAY DIFFRACTION,2.5,Mus musculus,2.40.50.140\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,receptor_chain_ids,receptor_uniprot_ids,receptor_organisms,ligand_types,matching_interface_types,mutation_strings,release_split\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,Kd,5,A,P12345,Homo sapiens,small_molecule,protein_ligand,wt,train\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|wt,BindingDB,Kd,8,A,Q99999,Mus musculus,small_molecule,protein_ligand,wt,test\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "custom_training_set.csv").write_text(
+        "selection_rank,selection_mode,pdb_id,pair_identity_key,binding_affinity_type,source_database,receptor_uniprot_ids,receptor_chain_ids,ligand_types,matching_interface_types,mutation_strings,release_split\n"
+        "1,generalist,1ABC,protein_ligand|1ABC|A|ATP|wt,Kd,BindingDB,P12345,A,small_molecule,protein_ligand,wt,train\n",
+        encoding="utf-8",
+    )
+
+    harvest_unified_metadata(layout)
+    dataset_artifacts = engineer_dataset(
+        layout,
+        config=DatasetEngineeringConfig(
+            dataset_name="selected_only",
+            test_frac=0.5,
+            cluster_count=1,
+            seed=5,
+        ),
+    )
+
+    rows = []
+    for split_name in ("train_csv", "test_csv"):
+        with Path(dataset_artifacts[split_name]).open(newline="", encoding="utf-8") as handle:
+            rows.extend(list(csv.DictReader(handle)))
+    diversity_report = json.loads(Path(dataset_artifacts["diversity_report"]).read_text(encoding="utf-8"))
+
+    assert len(rows) == 1
+    assert rows[0]["pair_identity_key"] == "protein_ligand|1ABC|A|ATP|wt"
+    assert rows[0]["dataset_source"] == "custom_training_set"
+    assert diversity_report["dataset_source"] == "custom_training_set"

@@ -58,9 +58,10 @@ class SelectionCandidate:
     homomer_or_heteromer: str
     experimental_method: str
     taxonomy_ids: str
-    quality_score: float
+    quality_score: float | None
     reported_measurement_count: int
     release_split: str
+    mutation_strings: str
     mutation_family: str
     task_type: str
     pair_family_key: str
@@ -105,6 +106,16 @@ def _safe_float(value: str | None, default: float = 0.0) -> float:
         return default
 
 
+def _safe_float_or_none(value: str | None) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _safe_int(value: str | None, default: int = 0) -> int:
     try:
         return int(float(str(value or "").strip()))
@@ -135,23 +146,17 @@ def _confidence_penalty(raw_json: str | None) -> float:
     return penalty
 
 
-def _agreement_bonus(value: str) -> float:
-    label = value.strip().lower()
-    if label == "high":
-        return 0.18
-    if label == "medium":
-        return 0.08
-    if label == "low":
-        return -0.08
-    return 0.0
-
-
 def _normalize_quality_band(score: float) -> str:
     if score >= 0.8:
         return "quality_high"
     if score >= 0.55:
         return "quality_medium"
     return "quality_low"
+
+
+def _normalized_release_split(value: str | None) -> str:
+    split_name = str(value or "").strip().lower()
+    return split_name if split_name in {"train", "val", "test"} else ""
 
 
 def _mode_filter(mode: str, task_type: str, mutation_family: str, confidence_penalty: float) -> bool:
@@ -190,11 +195,10 @@ def _dedupe_model_ready_rows(rows: list[dict[str, str]]) -> tuple[list[dict[str,
     for row in rows:
         grouped[(str(row.get("pair_identity_key") or ""), str(row.get("binding_affinity_type") or ""))].append(row)
 
-    def _rank(row: dict[str, str]) -> tuple[float, float, float, str]:
+    def _rank(row: dict[str, str]) -> tuple[float, float, str]:
         preferred_match = 1.0 if str(row.get("source_database") or "") == str(row.get("selected_preferred_source") or "") else 0.0
         measurement_count = float(_safe_int(row.get("reported_measurement_count")))
-        agreement = {"high": 3.0, "medium": 2.0, "low": 1.0}.get(str(row.get("source_agreement_band") or "").lower(), 0.0)
-        return (preferred_match, agreement, measurement_count, str(row.get("source_database") or ""))
+        return (preferred_match, measurement_count, str(row.get("source_database") or ""))
 
     for rows_for_key in grouped.values():
         ranked = sorted(rows_for_key, key=_rank, reverse=True)
@@ -249,11 +253,10 @@ def _build_candidates(
         fold_group_key = str(metadata.get("structural_fold") or metadata.get("cath_ids") or metadata.get("scop_ids") or "").strip() or "fold_unknown"
         receptor_sequence = _receptor_sequence_token(row)
         confidence_penalty = _confidence_penalty(row.get("assay_field_confidence_json")) + _confidence_penalty(entry.get("field_confidence_json"))
-        quality_score = _safe_float(entry.get("quality_score"), 0.0)
+        quality_score = _safe_float_or_none(entry.get("quality_score"))
         base_score = (
-            quality_score
+            (quality_score if quality_score is not None else 0.0)
             + min(math.log10(max(_safe_int(row.get("reported_measurement_count"), 1), 1) + 1.0), 0.6)
-            + _agreement_bonus(str(row.get("source_agreement_band") or ""))
             + (0.15 if str(row.get("source_database") or "") == str(row.get("selected_preferred_source") or "") else 0.0)
             - confidence_penalty
         )
@@ -278,7 +281,8 @@ def _build_candidates(
             taxonomy_ids=str(entry.get("taxonomy_ids") or ""),
             quality_score=quality_score,
             reported_measurement_count=_safe_int(row.get("reported_measurement_count"), 1),
-            release_split=str(row.get("release_split") or ""),
+            release_split=_normalized_release_split(row.get("release_split")),
+            mutation_strings=str(row.get("mutation_strings") or ""),
             mutation_family=mutation_family,
             task_type=task_type,
             pair_family_key=pair_family,
@@ -316,18 +320,19 @@ def _candidate_tokens(candidate: SelectionCandidate) -> set[str]:
         f"task:{candidate.task_type}",
         f"assay:{candidate.binding_affinity_type}",
         f"source:{candidate.selected_preferred_source or candidate.source_database}",
-        f"agreement:{candidate.source_agreement_band or 'unknown'}",
         f"method:{candidate.experimental_method or 'unknown'}",
         f"membrane:{candidate.membrane_vs_soluble or 'unknown'}",
         f"oligomer:{candidate.oligomeric_state or 'unknown'}",
         f"assembly:{candidate.homomer_or_heteromer or 'unknown'}",
         f"mutation:{candidate.mutation_family}",
-        f"quality:{_normalize_quality_band(candidate.quality_score)}",
-        f"split:{candidate.release_split or 'unsplit'}",
         f"metadata_family:{candidate.metadata_family_key}",
         f"pathway:{candidate.pathway_group_key}",
         f"fold:{candidate.fold_group_key}",
     }
+    if candidate.quality_score is not None:
+        tokens.add(f"quality:{_normalize_quality_band(candidate.quality_score)}")
+    if candidate.release_split:
+        tokens.add(f"split:{candidate.release_split}")
     for ligand_type in _semicolon_values(candidate.ligand_types):
         tokens.add(f"ligand:{ligand_type}")
     for interface_type in _semicolon_values(candidate.matching_interface_types):
@@ -403,7 +408,8 @@ def _build_scorecard(
     method_counts = Counter(candidate.experimental_method or "unknown" for candidate in selected)
     mutation_counts = Counter(candidate.mutation_family for candidate in selected)
     exclusion_counts = Counter(str(row.get("reason") or "unknown") for row in exclusions)
-    mean_quality = round(sum(candidate.quality_score for candidate in selected) / len(selected), 4) if selected else 0.0
+    observed_quality_scores = [candidate.quality_score for candidate in selected if candidate.quality_score is not None]
+    mean_quality = round(sum(observed_quality_scores) / len(observed_quality_scores), 4) if observed_quality_scores else None
     mean_measurements = round(
         sum(candidate.reported_measurement_count for candidate in selected) / len(selected), 4
     ) if selected else 0.0
@@ -418,10 +424,14 @@ def _build_scorecard(
         "per_receptor_cluster_cap": per_receptor_cluster_cap,
         "quality": {
             "mean_quality_score": mean_quality,
+            "quality_score_populated_count": len(observed_quality_scores),
             "mean_reported_measurement_count": mean_measurements,
             "high_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "high"),
             "medium_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "medium"),
             "low_agreement_count": sum(1 for candidate in selected if candidate.source_agreement_band.lower() == "low"),
+        },
+        "selection_policy": {
+            "advisory_fields_excluded_from_selection": ["source_agreement_band"],
         },
         "diversity": {
             "selected_receptor_clusters": len({candidate.receptor_cluster_key for candidate in selected}),
@@ -582,6 +592,7 @@ def build_custom_training_set(
         "ligand_types",
         "matching_interface_types",
         "release_split",
+        "mutation_strings",
         "receptor_cluster_key",
         "pair_family_key",
         "metadata_family_key",
@@ -612,6 +623,7 @@ def build_custom_training_set(
             "ligand_types": candidate.ligand_types,
             "matching_interface_types": candidate.matching_interface_types,
             "release_split": candidate.release_split,
+            "mutation_strings": candidate.mutation_strings,
             "receptor_cluster_key": candidate.receptor_cluster_key,
             "pair_family_key": candidate.pair_family_key,
             "metadata_family_key": candidate.metadata_family_key,
@@ -619,7 +631,7 @@ def build_custom_training_set(
             "fold_group_key": candidate.fold_group_key,
             "mutation_family": candidate.mutation_family,
             "base_score": f"{candidate.base_score:.4f}",
-            "quality_score": f"{candidate.quality_score:.4f}",
+            "quality_score": f"{candidate.quality_score:.4f}" if candidate.quality_score is not None else "",
         }
         selected_rows.append(row)
     selection_path = _write_csv(_repo_path(_CUSTOM_TRAINING_SET_CSV, root), selection_columns, selected_rows)
@@ -655,7 +667,7 @@ def build_custom_training_set(
         "selected_metadata_families": int(scorecard["diversity"]["selected_metadata_families"]),  # type: ignore[index]
         "selected_pathway_groups": int(scorecard["diversity"]["selected_pathway_groups"]),  # type: ignore[index]
         "selected_fold_groups": int(scorecard["diversity"]["selected_fold_groups"]),  # type: ignore[index]
-        "mean_quality_score": float(scorecard["quality"]["mean_quality_score"]),  # type: ignore[index]
+        "mean_quality_score": float(scorecard["quality"]["mean_quality_score"]) if scorecard["quality"]["mean_quality_score"] is not None else None,  # type: ignore[index]
     }
     summary_path = _repo_path(_CUSTOM_TRAINING_SUMMARY_JSON, root)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

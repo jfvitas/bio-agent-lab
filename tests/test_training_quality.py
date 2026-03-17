@@ -177,3 +177,35 @@ def test_training_quality_uses_split_diagnostics_and_metadata_context() -> None:
     assert report["split_diagnostics"]["status"] == "leakage_risk"
     assert report["counts"]["unique_metadata_family_count"] == 1
     assert report["counts"]["unique_pathway_count"] == 1
+
+
+def test_training_quality_maps_pair_level_split_ids_to_examples() -> None:
+    layout = build_storage_layout(_tmp_dir("training_quality_pair_split_ids"))
+    layout.training_dir.mkdir(parents=True, exist_ok=True)
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+    (layout.training_dir / "training_examples.json").write_text(json.dumps([
+        {
+            "example_id": "train:1ABC:0",
+            "protein": {"uniprot_id": "P12345"},
+            "ligand": {"ligand_id": "ATP", "smiles": "ATP-SMILES"},
+            "labels": {"binding_affinity_log10": 1.0, "affinity_type": "Kd"},
+            "provenance": {"pair_identity_key": "protein_ligand|1ABC|A|ATP|wt", "has_graph_data": True},
+        },
+        {
+            "example_id": "train:2DEF:1",
+            "protein": {"uniprot_id": "Q99999"},
+            "ligand": {"ligand_id": "GTP", "smiles": "GTP-SMILES"},
+            "labels": {"binding_affinity_log10": 2.0, "affinity_type": "Kd"},
+            "provenance": {"pair_identity_key": "protein_ligand|2DEF|A|GTP|wt", "has_graph_data": True},
+        },
+    ]), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text("protein_ligand|1ABC|A|ATP|wt|Kd\n", encoding="utf-8")
+    (layout.splits_dir / "test.txt").write_text("protein_ligand|2DEF|A|GTP|wt|Kd\n", encoding="utf-8")
+    (layout.splits_dir / "val.txt").write_text("", encoding="utf-8")
+
+    report = build_training_set_quality_report(layout)
+
+    assert report["split_counts"]["train"] == 1
+    assert report["split_counts"]["test"] == 1
+    assert report["split_counts"]["unsplit"] == 0
+    assert report["split_assignment_coverage"]["assigned_example_count"] == 2

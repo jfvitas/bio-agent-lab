@@ -95,10 +95,15 @@ def test_build_screening_field_audit_flags_sparse_and_empty_fields() -> None:
     pair_table = next(item for item in report["tables"] if item["table_name"] == "master_pdb_pairs.csv")
     conflict_field = next(field for field in pair_table["fields"] if field["field"] == "source_conflict_summary")
     mutation_field = next(field for field in pair_table["fields"] if field["field"] == "mutation_strings")
+    release_field = next(field for field in pair_table["fields"] if field["field"] == "release_split")
 
     assert conflict_field["status"] == "partial"
+    assert conflict_field["policy_role"] == "advisory_only"
     assert mutation_field["status"] == "empty"
+    assert mutation_field["policy_role"] == "quarantined"
+    assert release_field["policy_role"] == "quarantined"
     assert report["issue_count"] >= 1
+    assert report["unsafe_policy_field_count"] >= 1
 
 
 def test_cli_reports_write_output_files() -> None:

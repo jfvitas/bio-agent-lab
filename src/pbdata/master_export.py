@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from pbdata.pairing import parse_pair_identity_key
 from pbdata.storage import StorageLayout
 from pbdata.table_io import load_json_rows, load_table_json
 
@@ -84,6 +85,172 @@ def _stringify(value: Any) -> str:
     if isinstance(value, dict):
         return json.dumps(value, sort_keys=True)
     return str(value)
+
+
+def _safe_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_assignment_map(layout: StorageLayout) -> dict[tuple[str, str, str], str]:
+    split_dir = layout.splits_dir
+    if not split_dir.exists():
+        return {}
+
+    training_examples = load_json_rows(
+        layout.training_dir / "training_examples.json",
+        logger=logger,
+        warning_prefix="Skipping unreadable split-assignment input",
+    )
+    example_lookup: dict[str, tuple[str, str, str]] = {}
+    for row in training_examples:
+        if not isinstance(row, dict):
+            continue
+        example_id = str(row.get("example_id") or "").strip()
+        provenance = row.get("provenance") or {}
+        labels = row.get("labels") or {}
+        pair_key = str(provenance.get("pair_identity_key") or "").strip()
+        affinity_type = str(labels.get("affinity_type") or "").strip()
+        pdb_id = str((row.get("structure") or {}).get("pdb_id") or "").strip()
+        if example_id and pair_key:
+            example_lookup[example_id] = (pdb_id, pair_key, affinity_type)
+
+    split_assignment: dict[tuple[str, str, str], str] = {}
+    for split_name in ("train", "val", "test"):
+        split_path = split_dir / f"{split_name}.txt"
+        if not split_path.exists():
+            continue
+        for line in split_path.read_text(encoding="utf-8").splitlines():
+            item_id = line.strip()
+            if not item_id:
+                continue
+            if item_id in example_lookup:
+                split_assignment[example_lookup[item_id]] = split_name
+                continue
+            pair_key, _, affinity_type = item_id.rpartition("|")
+            if not pair_key:
+                continue
+            parsed = parse_pair_identity_key(pair_key)
+            pdb_id = parsed.pdb_id if parsed is not None else ""
+            normalized_affinity = "" if affinity_type == "assay_unknown" else affinity_type
+            split_assignment[(pdb_id, pair_key, normalized_affinity)] = split_name
+    return split_assignment
+
+
+def _entry_organism_names(entry: dict[str, Any], pdb_chains: list[dict[str, Any]]) -> list[str]:
+    organism_names = [
+        str(value).strip()
+        for value in (entry.get("organism_names") or [])
+        if str(value).strip()
+    ]
+    if organism_names:
+        return organism_names
+    chain_organisms = sorted(
+        {
+            str(row.get("entity_source_organism") or "").strip()
+            for row in pdb_chains
+            if str(row.get("entity_source_organism") or "").strip()
+        }
+    )
+    return chain_organisms
+
+
+def _entry_quality_score(entry: dict[str, Any], pdb_chains: list[dict[str, Any]]) -> float | None:
+    explicit = _safe_float(entry.get("quality_score"))
+    if explicit is not None:
+        return round(max(0.0, min(explicit, 1.0)), 4)
+
+    protein_chains = [row for row in pdb_chains if row.get("is_protein")]
+    uniprot_ids = {
+        str(row.get("uniprot_id") or "").strip()
+        for row in protein_chains
+        if str(row.get("uniprot_id") or "").strip()
+    }
+    taxonomy_ids = list(entry.get("taxonomy_ids") or [])
+    chain_taxonomy_ids: set[int] = set()
+    for row in protein_chains:
+        value = row.get("entity_source_taxonomy_id")
+        if value in (None, ""):
+            continue
+        try:
+            chain_taxonomy_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    organism_names = _entry_organism_names(entry, pdb_chains)
+    resolution = _safe_float(entry.get("structure_resolution"))
+    checks = [
+        bool(str(entry.get("experimental_method") or "").strip()),
+        resolution is not None and resolution <= 3.5,
+        bool(protein_chains),
+        bool(uniprot_ids),
+        bool(taxonomy_ids or chain_taxonomy_ids),
+        bool(organism_names),
+        bool(str(entry.get("structure_file_cif_path") or "").strip()),
+    ]
+    if not any(checks):
+        return None
+    return round(sum(checks) / len(checks), 4)
+
+
+def _normalized_mutation_strings(assay: dict[str, Any]) -> list[str]:
+    raw_values = assay.get("mutation_strings") or []
+    if isinstance(raw_values, str):
+        values = [part.strip() for part in raw_values.split(";") if part.strip()]
+    else:
+        values = [str(part).strip() for part in raw_values if str(part).strip()]
+    if values:
+        return values
+
+    parsed = parse_pair_identity_key(str(assay.get("pair_identity_key") or ""))
+    mutation_key = str(parsed.mutation_key or "").strip() if parsed is not None else ""
+    if not mutation_key:
+        return []
+    lowered = mutation_key.lower()
+    if lowered in {"wt", "wildtype", "wt_or_unspecified"}:
+        return ["wt"]
+    return [mutation_key]
+
+
+def _normalized_conflict_fields(assay: dict[str, Any]) -> tuple[str, str]:
+    summary = str(assay.get("source_conflict_summary") or "").strip()
+    band = str(assay.get("source_agreement_band") or "").strip().lower()
+    if summary and band:
+        return summary, band
+
+    measurement_count = _safe_int(assay.get("reported_measurement_count")) or 0
+    conflict_flag = str(assay.get("source_conflict_flag") or "").strip().lower() == "true"
+    standardized = _safe_float(assay.get("binding_affinity_log10_standardized"))
+    reported_mean = _safe_float(assay.get("reported_measurement_mean_log10_standardized"))
+
+    if conflict_flag:
+        return summary or "conflict_flagged_without_spread_summary", band or "low"
+    if measurement_count <= 1:
+        return (
+            summary or "single_measurement_no_cross_source_conflict_assessment",
+            band or "not_assessed_single_source",
+        )
+    if standardized is None and reported_mean is None:
+        return (
+            summary or "multiple_measurements_without_standardized_affinity_conflict_assessment",
+            band or "not_assessed_missing_standardized_values",
+        )
+    return (
+        summary or "multiple_measurements_without_explicit_conflict_summary",
+        band or "not_assessed_multi_measurement",
+    )
 
 
 def _write_csv_rows(
@@ -169,7 +336,10 @@ def export_master_repository_csv(
         "glycan_present",
         "covalent_binder_present",
         "peptide_partner_present",
+        "has_ligand_signal",
+        "has_protein_signal",
         "multiligand_entry",
+        "source_databases",
         "quality_flags",
         "quality_score",
         "structure_file_cif_path",
@@ -203,6 +373,8 @@ def export_master_repository_csv(
         pdb_bound = bound_by_pdb.get(pdb_id, [])
         pdb_interfaces = interfaces_by_pdb.get(pdb_id, [])
         pdb_assays = assays_by_pdb.get(pdb_id, [])
+        organism_names = _entry_organism_names(entry, pdb_chains)
+        quality_score = _entry_quality_score(entry, pdb_chains)
 
         protein_chains = [row for row in pdb_chains if row.get("is_protein")]
         protein_chain_ids = sorted(
@@ -295,7 +467,7 @@ def export_master_repository_csv(
             "oligomeric_state": _stringify(entry.get("oligomeric_state")),
             "homomer_or_heteromer": _stringify(entry.get("homomer_or_heteromer")),
             "taxonomy_ids": _stringify(entry.get("taxonomy_ids")),
-            "organism_names": _stringify(entry.get("organism_names")),
+            "organism_names": _stringify(organism_names),
             "protein_entity_count": _stringify(entry.get("protein_entity_count")),
             "nonpolymer_entity_count": _stringify(entry.get("nonpolymer_entity_count")),
             "polymer_entity_count": _stringify(entry.get("polymer_entity_count")),
@@ -307,9 +479,12 @@ def export_master_repository_csv(
             "glycan_present": _stringify(entry.get("glycan_present")),
             "covalent_binder_present": _stringify(entry.get("covalent_binder_present")),
             "peptide_partner_present": _stringify(entry.get("peptide_partner_present")),
+            "has_ligand_signal": _stringify(bool(pdb_bound or pdb_assays)),
+            "has_protein_signal": _stringify(bool(protein_chains)),
             "multiligand_entry": _stringify(entry.get("multiligand_entry")),
+            "source_databases": _stringify(assay_sources),
             "quality_flags": _stringify(entry.get("quality_flags")),
-            "quality_score": _stringify(entry.get("quality_score")),
+            "quality_score": _stringify(quality_score),
             "structure_file_cif_path": _stringify(entry.get("structure_file_cif_path")),
             "structure_file_pdb_path": _stringify(entry.get("structure_file_pdb_path")),
             "raw_file_path": _stringify(entry.get("raw_file_path")),
@@ -392,6 +567,7 @@ def export_master_pair_repository_csv(
                 chain_uniprot_by_pdb_chain[(pdb_id, chain_id)] = str(row.get("uniprot_id"))
             if row.get("entity_source_organism"):
                 chain_org_by_pdb_chain[(pdb_id, chain_id)] = str(row.get("entity_source_organism"))
+    split_assignment = _split_assignment_map(layout)
 
     columns = [
         "pdb_id",
@@ -437,6 +613,7 @@ def export_master_pair_repository_csv(
         "ligand_types",
         "matching_interface_count",
         "matching_interface_types",
+        "release_split",
         "feature_record_count",
         "training_example_count",
     ]
@@ -493,6 +670,9 @@ def export_master_pair_repository_csv(
             if ligand_key and row_ligand and row_ligand != ligand_key:
                 continue
             matching_interfaces.append(row)
+        mutation_strings = _normalized_mutation_strings(assay)
+        conflict_summary, agreement_band = _normalized_conflict_fields(assay)
+        release_split = split_assignment.get((pdb_id, pair_key, str(assay.get("binding_affinity_type") or "")), "")
 
         rows.append({
             "pdb_id": _stringify(pdb_id),
@@ -505,7 +685,7 @@ def export_master_pair_repository_csv(
             "delta_g": _stringify(assay.get("delta_g")),
             "delta_delta_g": _stringify(assay.get("delta_delta_g")),
             "binding_affinity_is_mutant_measurement": _stringify(assay.get("binding_affinity_is_mutant_measurement")),
-            "mutation_strings": _stringify(assay.get("mutation_strings")),
+            "mutation_strings": _stringify(mutation_strings),
             "mutation_chain_ids": _stringify(assay.get("mutation_chain_ids")),
             "reported_measurements_text": _stringify(assay.get("reported_measurements_text")),
             "reported_measurement_mean_log10_standardized": _stringify(assay.get("reported_measurement_mean_log10_standardized")),
@@ -515,8 +695,8 @@ def export_master_pair_repository_csv(
             "measurement_source_doi": _stringify(assay.get("measurement_source_doi")),
             "measurement_source_pubmed_id": _stringify(assay.get("measurement_source_pubmed_id")),
             "source_conflict_flag": _stringify(assay.get("source_conflict_flag")),
-            "source_conflict_summary": _stringify(assay.get("source_conflict_summary")),
-            "source_agreement_band": _stringify(assay.get("source_agreement_band")),
+            "source_conflict_summary": _stringify(conflict_summary),
+            "source_agreement_band": _stringify(agreement_band),
             "selected_preferred_source": _stringify(assay.get("selected_preferred_source")),
             "selected_preferred_source_rationale": _stringify(assay.get("selected_preferred_source_rationale")),
             "assay_field_provenance_json": _stringify(assay.get("field_provenance")),
@@ -538,6 +718,7 @@ def export_master_pair_repository_csv(
             "ligand_types": _stringify(sorted({str(row.get("component_type") or "") for row in matching_bound if row.get("component_type")})),
             "matching_interface_count": _stringify(len(matching_interfaces)),
             "matching_interface_types": _stringify(sorted({str(row.get("interface_type") or "") for row in matching_interfaces if row.get("interface_type")})),
+            "release_split": _stringify(release_split),
             "feature_record_count": _stringify(len(features_by_pair.get(pair_key, []))),
             "training_example_count": _stringify(len(training_by_pair.get(pair_key, []))),
         })

@@ -40,7 +40,6 @@ def test_export_master_repository_csv_flattens_extracted_tables() -> None:
         "title": "Example entry",
         "experimental_method": "X-RAY DIFFRACTION",
         "structure_resolution": 2.1,
-        "organism_names": ["Homo sapiens"],
         "quality_flags": ["cofactor_present"],
         "field_provenance": {"title": {"source": "RCSB"}},
         "field_confidence": {"title": "high"},
@@ -50,6 +49,7 @@ def test_export_master_repository_csv_flattens_extracted_tables() -> None:
         "chain_id": "A",
         "is_protein": True,
         "uniprot_id": "P12345",
+        "entity_source_organism": "Homo sapiens",
     }]), encoding="utf-8")
     (layout.extracted_dir / "bound_objects" / "1ABC.json").write_text(json.dumps([{
         "pdb_id": "1ABC",
@@ -81,7 +81,12 @@ def test_export_master_repository_csv_flattens_extracted_tables() -> None:
     assert row["pdb_id"] == "1ABC"
     assert row["protein_chain_ids"] == "A"
     assert row["protein_chain_uniprot_ids"] == "P12345"
+    assert row["organism_names"] == "Homo sapiens"
+    assert float(row["quality_score"]) > 0.7
     assert row["ligand_component_ids"] == "ATP"
+    assert row["source_databases"] == "PDBbind"
+    assert row["has_ligand_signal"] == "true"
+    assert row["has_protein_signal"] == "true"
     assert row["assay_sources"] == "PDBbind"
     assert row["assay_types"] == "Kd"
     assert "RCSB" in row["field_provenance_json"]
@@ -199,6 +204,67 @@ def test_export_master_pair_repository_csv_flattens_pair_rows() -> None:
     assert row["training_example_count"] == "1"
     assert "PDBbind" in row["assay_field_provenance_json"]
     assert row["selected_preferred_source"] == "PDBbind"
+
+
+def test_export_master_pair_repository_csv_populates_policy_fields_from_live_inputs() -> None:
+    tmp_root = _tmp_dir("pair_export_policy_fields")
+    layout = build_storage_layout(tmp_root / "storage")
+    (layout.extracted_dir / "entry").mkdir(parents=True)
+    (layout.extracted_dir / "chains").mkdir(parents=True)
+    (layout.extracted_dir / "bound_objects").mkdir(parents=True)
+    (layout.extracted_dir / "interfaces").mkdir(parents=True)
+    (layout.extracted_dir / "assays").mkdir(parents=True)
+    layout.features_dir.mkdir(parents=True)
+    layout.training_dir.mkdir(parents=True)
+    layout.splits_dir.mkdir(parents=True)
+
+    pair_key = "protein_ligand|1ABC|A|ATP|wt"
+    (layout.extracted_dir / "entry" / "1ABC.json").write_text(json.dumps({
+        "pdb_id": "1ABC",
+        "title": "Example entry",
+    }), encoding="utf-8")
+    (layout.extracted_dir / "chains" / "1ABC.json").write_text(json.dumps([{
+        "pdb_id": "1ABC",
+        "chain_id": "A",
+        "is_protein": True,
+        "uniprot_id": "P12345",
+    }]), encoding="utf-8")
+    (layout.extracted_dir / "bound_objects" / "1ABC.json").write_text(json.dumps([{
+        "pdb_id": "1ABC",
+        "component_id": "ATP",
+        "component_name": "ATP",
+        "component_inchikey": "ATP-KEY",
+        "component_type": "small_molecule",
+    }]), encoding="utf-8")
+    (layout.extracted_dir / "interfaces" / "1ABC.json").write_text(json.dumps([{
+        "pdb_id": "1ABC",
+        "interface_type": "protein_ligand",
+        "binding_site_chain_ids": ["A"],
+        "entity_name_b": "ATP",
+    }]), encoding="utf-8")
+    (layout.extracted_dir / "assays" / "1ABC.json").write_text(json.dumps([{
+        "pdb_id": "1ABC",
+        "pair_identity_key": pair_key,
+        "source_database": "BindingDB",
+        "binding_affinity_type": "Kd",
+        "binding_affinity_value": 5.0,
+        "binding_affinity_unit": "nM",
+        "reported_measurement_count": 1,
+        "selected_preferred_source": "BindingDB",
+    }]), encoding="utf-8")
+    (layout.splits_dir / "train.txt").write_text(f"{pair_key}|Kd\n", encoding="utf-8")
+
+    out_path = export_master_pair_repository_csv(layout, repo_root=tmp_root)
+
+    with out_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["mutation_strings"] == "wt"
+    assert row["source_conflict_summary"] == "single_measurement_no_cross_source_conflict_assessment"
+    assert row["source_agreement_band"] == "not_assessed_single_source"
+    assert row["release_split"] == "train"
 
 
 def test_export_issue_repository_csv_reports_review_gaps() -> None:

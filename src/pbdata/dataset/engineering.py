@@ -51,6 +51,107 @@ def _safe_text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _selection_source(layout: StorageLayout) -> tuple[str, list[dict[str, str]]]:
+    for source_name, path in (
+        ("custom_training_set", layout.root / "custom_training_set.csv"),
+        ("model_ready_pairs", layout.root / "model_ready_pairs.csv"),
+        ("master_pdb_pairs", layout.root / "master_pdb_pairs.csv"),
+    ):
+        rows = _read_csv_rows(path)
+        if rows:
+            return source_name, rows
+    return "protein_metadata", []
+
+
+def _chain_sequence_index(layout: StorageLayout) -> dict[tuple[str, str], dict[str, str]]:
+    chain_rows = _read_csv_rows(layout.root / "master_pdb_pairs.csv")
+    extracted_path = layout.extracted_dir / "chains"
+    if extracted_path.exists():
+        from pbdata.table_io import load_table_json
+
+        extracted_rows = load_table_json(extracted_path)
+        index: dict[tuple[str, str], dict[str, str]] = {}
+        for row in extracted_rows:
+            pdb_id = _safe_text(row.get("pdb_id")).upper()
+            chain_id = _safe_text(row.get("chain_id"))
+            if pdb_id and chain_id:
+                index[(pdb_id, chain_id)] = {
+                    "sequence": _safe_text(row.get("polymer_sequence")),
+                    "uniprot_id": _safe_text(row.get("uniprot_id")),
+                }
+        return index
+    return {
+        (_safe_text(row.get("pdb_id")).upper(), chain_id): {}
+        for row in chain_rows
+        for chain_id in [part.strip() for part in _safe_text(row.get("receptor_chain_ids")).replace(";", ",").split(",") if part.strip()]
+    }
+
+
+def _selection_sequence(selection_row: dict[str, str], chain_index: dict[tuple[str, str], dict[str, str]]) -> str:
+    pdb_id = _safe_text(selection_row.get("pdb_id")).upper()
+    chain_ids = [
+        part.strip()
+        for part in _safe_text(selection_row.get("receptor_chain_ids")).replace(";", ",").split(",")
+        if part.strip()
+    ]
+    sequences = [
+        _safe_text((chain_index.get((pdb_id, chain_id)) or {}).get("sequence"))
+        for chain_id in chain_ids
+    ]
+    sequences = [sequence for sequence in sequences if sequence]
+    return sequences[0] if sequences else ""
+
+
+def _build_engineering_rows(
+    layout: StorageLayout,
+    metadata_rows: list[dict[str, str]],
+) -> tuple[str, list[dict[str, str]]]:
+    selection_source, selection_rows = _selection_source(layout)
+    if not selection_rows:
+        return selection_source, metadata_rows
+
+    metadata_by_pair = {
+        _safe_text(row.get("pair_identity_key")): row
+        for row in metadata_rows
+        if _safe_text(row.get("pair_identity_key"))
+    }
+    metadata_by_pdb = {
+        _safe_text(row.get("pdb_id")).upper(): row
+        for row in metadata_rows
+        if _safe_text(row.get("pdb_id"))
+    }
+    chain_index = _chain_sequence_index(layout)
+    merged_rows: list[dict[str, str]] = []
+    for selection_row in selection_rows:
+        pair_key = _safe_text(selection_row.get("pair_identity_key"))
+        pdb_id = _safe_text(selection_row.get("pdb_id")).upper()
+        metadata_row = metadata_by_pair.get(pair_key) or metadata_by_pdb.get(pdb_id) or {}
+        merged_rows.append(
+            {
+                **metadata_row,
+                "pdb_id": pdb_id or _safe_text(metadata_row.get("pdb_id")),
+                "pair_identity_key": pair_key or _safe_text(metadata_row.get("pair_identity_key")),
+                "uniprot_id": _safe_text(metadata_row.get("uniprot_id")) or _safe_text(selection_row.get("receptor_uniprot_ids")),
+                "organism": _safe_text(metadata_row.get("organism")),
+                "structure_resolution": _safe_text(metadata_row.get("structure_resolution")),
+                "binding_affinity": _safe_text(metadata_row.get("binding_affinity")) or _safe_text(selection_row.get("binding_affinity_value")),
+                "binding_affinity_type": _safe_text(metadata_row.get("binding_affinity_type")) or _safe_text(selection_row.get("binding_affinity_type")),
+                "protein_family": _safe_text(metadata_row.get("protein_family")) or _safe_text(selection_row.get("receptor_uniprot_ids")),
+                "structural_fold": _safe_text(metadata_row.get("structural_fold")),
+                "binding_interface_type": _safe_text(metadata_row.get("binding_interface_type")) or _safe_text(selection_row.get("matching_interface_types")),
+                "ligand_class": _safe_text(metadata_row.get("ligand_class")) or _safe_text(selection_row.get("ligand_types")),
+                "experimental_method": _safe_text(metadata_row.get("experimental_method")),
+                "sequence": _safe_text(metadata_row.get("sequence")) or _selection_sequence(selection_row, chain_index),
+                "sequence_count": _safe_text(metadata_row.get("sequence_count")) or ("1" if (_safe_text(metadata_row.get("sequence")) or _selection_sequence(selection_row, chain_index)) else "0"),
+                "mutation_strings": _safe_text(metadata_row.get("mutation_strings")) or _safe_text(selection_row.get("mutation_strings")),
+                "source_database": _safe_text(metadata_row.get("source_database")) or _safe_text(selection_row.get("source_database")),
+                "release_split": _safe_text(selection_row.get("release_split")) or _safe_text(metadata_row.get("release_split")),
+                "dataset_source": selection_source,
+            }
+        )
+    return selection_source, merged_rows
+
+
 def _find_latest_graph_manifest(layout: StorageLayout) -> Path | None:
     manifests = sorted(
         layout.workspace_graphs_dir.glob("*/graph_manifest.json"),
@@ -275,10 +376,16 @@ def engineer_dataset(
     global _ESM_CACHE_DIR
     _ESM_CACHE_DIR = layout.workspace_metadata_dir / "esm_cache"
     metadata_path = layout.workspace_metadata_dir / "protein_metadata.csv"
-    rows = _read_csv_rows(metadata_path)
-    if not rows:
+    metadata_rows = _read_csv_rows(metadata_path)
+    if not metadata_rows:
         raise ValueError(
             f"No metadata rows found at {metadata_path}. Run 'harvest-metadata' first."
+        )
+    dataset_source, rows = _build_engineering_rows(layout, metadata_rows)
+    if not rows:
+        raise ValueError(
+            "No selectable dataset rows were available after aligning the current selection source "
+            f"('{dataset_source}') with protein_metadata.csv."
         )
 
     backend = _embedding_backend_name(config.embedding_backend)
@@ -371,6 +478,7 @@ def engineer_dataset(
 
     diversity_report = {
         "generated_at": _utc_now(),
+        "dataset_source": dataset_source,
         "embedding_backend": backend,
         "row_count": len(rows),
         "train_count": len(split_rows["train"]),
@@ -397,6 +505,7 @@ def engineer_dataset(
         dataset_name=config.dataset_name,
         dataset_config={
             "dataset_name": config.dataset_name,
+            "dataset_source": dataset_source,
             "test_frac": config.test_frac,
             "cv_folds": config.cv_folds,
             "strict_family_isolation": config.strict_family_isolation,
@@ -406,6 +515,7 @@ def engineer_dataset(
         },
         feature_schema={
             "source": str(metadata_path),
+            "selection_source": dataset_source,
             "feature_types": ["sequence_embedding", "metadata_embedding"],
         },
         graph_config={
