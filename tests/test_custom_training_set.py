@@ -65,6 +65,49 @@ def _write_selection_fixtures(tmp_root: Path) -> Path:
     return storage_root
 
 
+def _write_advisory_agreement_scoring_fixtures(tmp_root: Path) -> Path:
+    storage_root = tmp_root / "storage"
+    layout = build_storage_layout(storage_root)
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,experimental_method,membrane_vs_soluble,oligomeric_state,homomer_or_heteromer,taxonomy_ids,quality_score,field_confidence_json\n"
+        "1ABC,Example 1,X-RAY DIFFRACTION,soluble,monomeric,heteromer,9606,0.90,\"{}\"\n"
+        "2DEF,Example 2,X-RAY DIFFRACTION,soluble,monomeric,heteromer,9606,0.90,\"{}\"\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,source_conflict_summary,source_agreement_band,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,receptor_uniprot_ids,ligand_key,ligand_component_ids,ligand_inchikeys,ligand_types,matching_interface_count,matching_interface_types,assay_field_confidence_json,release_split\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,Kd,5,nM,0.699,\"BindingDB:Kd=5 nM\",0.699,2,false,,high,BindingDB,preferred,A,P11111,ATP,ATP,ATPKEY,small_molecule,1,protein_ligand,\"{}\",train\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|wt,BindingDB,Kd,5,nM,0.699,\"BindingDB:Kd=5 nM\",0.699,2,false,,low,BindingDB,preferred,A,P22222,GTP,GTP,GTPKEY,small_molecule,1,protein_ligand,\"{}\",test\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_issues.csv").write_text(
+        "scope,pdb_id,pair_identity_key,issue_type,details\n",
+        encoding="utf-8",
+    )
+    return storage_root
+
+
+def _write_advisory_agreement_duplicate_fixtures(tmp_root: Path) -> Path:
+    storage_root = tmp_root / "storage"
+    build_storage_layout(storage_root)
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,experimental_method,membrane_vs_soluble,oligomeric_state,homomer_or_heteromer,taxonomy_ids,quality_score,field_confidence_json\n"
+        "1ABC,Example 1,X-RAY DIFFRACTION,soluble,monomeric,heteromer,9606,0.90,\"{}\"\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,source_conflict_summary,source_agreement_band,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,receptor_uniprot_ids,ligand_key,ligand_component_ids,ligand_inchikeys,ligand_types,matching_interface_count,matching_interface_types,assay_field_confidence_json,release_split\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,ADB,Kd,5,nM,0.699,\"ADB:Kd=5 nM\",0.699,1,false,,high,ADB,preferred,A,P11111,ATP,ATP,ATPKEY,small_molecule,1,protein_ligand,\"{}\",train\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,ZDB,Kd,5,nM,0.699,\"ZDB:Kd=5 nM\",0.699,1,false,,low,ZDB,preferred,A,P11111,ATP,ATP,ATPKEY,small_molecule,1,protein_ligand,\"{}\",train\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_issues.csv").write_text(
+        "scope,pdb_id,pair_identity_key,issue_type,details\n",
+        encoding="utf-8",
+    )
+    return storage_root
+
+
 def test_build_custom_training_set_enforces_cluster_diversity() -> None:
     tmp_root = _tmp_dir("custom_training")
     storage_root = _write_selection_fixtures(tmp_root)
@@ -89,6 +132,7 @@ def test_build_custom_training_set_enforces_cluster_diversity() -> None:
 
     assert len(rows) == 2
     assert len({row["receptor_cluster_key"] for row in rows}) == 2
+    assert "mutation_strings" in rows[0]
     assert Path(artifacts["custom_training_manifest_json"]).exists()
     assert summary["selected_count"] == 2
     assert summary["selected_receptor_clusters"] == 2
@@ -118,6 +162,50 @@ def test_build_custom_training_set_mutation_mode_prefers_mutants() -> None:
 
     assert rows
     assert all(row["mutation_family"] != "wildtype_family" for row in rows)
+
+
+def test_build_custom_training_set_excludes_advisory_agreement_band_from_scoring() -> None:
+    tmp_root = _tmp_dir("custom_training_agreement_scoring")
+    storage_root = _write_advisory_agreement_scoring_fixtures(tmp_root)
+    layout = build_storage_layout(storage_root)
+
+    artifacts = build_custom_training_set(
+        layout,
+        repo_root=tmp_root,
+        mode="generalist",
+        target_size=2,
+        per_receptor_cluster_cap=1,
+    )
+
+    with Path(artifacts["custom_training_set_csv"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    scorecard = json.loads(Path(artifacts["custom_training_scorecard_json"]).read_text(encoding="utf-8"))
+
+    assert len(rows) == 2
+    assert {row["source_agreement_band"] for row in rows} == {"high", "low"}
+    assert {row["base_score"] for row in rows} == {"1.5271"}
+    assert scorecard["selection_policy"]["advisory_fields_excluded_from_selection"] == ["source_agreement_band"]
+
+
+def test_build_custom_training_set_ignores_advisory_agreement_band_for_duplicate_resolution() -> None:
+    tmp_root = _tmp_dir("custom_training_agreement_duplicates")
+    storage_root = _write_advisory_agreement_duplicate_fixtures(tmp_root)
+    layout = build_storage_layout(storage_root)
+
+    artifacts = build_custom_training_set(
+        layout,
+        repo_root=tmp_root,
+        mode="generalist",
+        target_size=1,
+        per_receptor_cluster_cap=1,
+    )
+
+    with Path(artifacts["custom_training_set_csv"]).open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["source_database"] == "ZDB"
+    assert rows[0]["source_agreement_band"] == "low"
 
 
 def test_build_custom_training_set_cli_writes_outputs() -> None:

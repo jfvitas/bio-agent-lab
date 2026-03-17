@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pbdata.pairing import parse_pair_identity_key
 from pbdata.storage import StorageLayout
 
 _MIN_EXAMPLES_FOR_USABLE_CORPUS = 25
@@ -39,15 +40,55 @@ def _safe_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _split_assignment_by_example(
+    examples: list[dict[str, Any]],
+    layout: StorageLayout,
+) -> dict[str, str]:
+    assignment: dict[str, str] = {}
+    key_to_example_ids: dict[tuple[str, str], list[str]] = {}
+    example_ids: set[str] = set()
+    for row in examples:
+        if not isinstance(row, dict):
+            continue
+        example_id = str(row.get("example_id") or "").strip()
+        provenance = _safe_dict(row.get("provenance"))
+        labels = _safe_dict(row.get("labels"))
+        pair_key = str(provenance.get("pair_identity_key") or "").strip()
+        affinity_type = str(labels.get("affinity_type") or "").strip()
+        if example_id and pair_key:
+            example_ids.add(example_id)
+            key_to_example_ids.setdefault((pair_key, affinity_type), []).append(example_id)
+
+    for split_name in ("train", "val", "test"):
+        for item_id in _read_split_ids(layout.splits_dir / f"{split_name}.txt"):
+            if item_id in example_ids:
+                assignment[item_id] = split_name
+                continue
+            matched = False
+            pair_key, _, affinity_type = item_id.rpartition("|")
+            if pair_key:
+                normalized_affinity = "" if affinity_type == "assay_unknown" else affinity_type
+                for example_id in key_to_example_ids.get((pair_key, normalized_affinity), []):
+                    assignment[example_id] = split_name
+                    matched = True
+            if matched:
+                continue
+            parsed = parse_pair_identity_key(item_id)
+            if parsed is not None:
+                for (pair_key, _), example_id_rows in key_to_example_ids.items():
+                    if pair_key == item_id:
+                        for example_id in example_id_rows:
+                            assignment[example_id] = split_name
+    return assignment
+
+
 def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
     raw = _read_json(layout.training_dir / "training_examples.json")
     examples = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
     split_diagnostics = _read_json(layout.splits_dir / "split_diagnostics.json")
     split_diagnostics = split_diagnostics if isinstance(split_diagnostics, dict) else {}
     metadata_rows = _read_csv_rows(layout.workspace_metadata_dir / "protein_metadata.csv")
-    train_ids = _read_split_ids(layout.splits_dir / "train.txt")
-    val_ids = _read_split_ids(layout.splits_dir / "val.txt")
-    test_ids = _read_split_ids(layout.splits_dir / "test.txt")
+    split_assignment = _split_assignment_by_example(examples, layout)
 
     example_count = len(examples)
     supervised_count = 0
@@ -161,13 +202,7 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
         source_database_counts[source_database] = source_database_counts.get(source_database, 0) + 1
         source_agreement_counts[source_agreement] = source_agreement_counts.get(source_agreement, 0) + 1
 
-        split_name = "unsplit"
-        if example_id in train_ids:
-            split_name = "train"
-        elif example_id in val_ids:
-            split_name = "val"
-        elif example_id in test_ids:
-            split_name = "test"
+        split_name = split_assignment.get(example_id, "unsplit")
         split_counts[split_name] += 1
         normalized_rows.append(
             {
@@ -321,6 +356,10 @@ def build_training_set_quality_report(layout: StorageLayout) -> dict[str, Any]:
             "smiles_coverage_fraction": round(smiles_coverage_fraction, 6),
         },
         "split_counts": split_counts,
+        "split_assignment_coverage": {
+            "assigned_example_count": len(split_assignment),
+            "assigned_fraction": round((len(split_assignment) / example_count), 6) if example_count else 0.0,
+        },
         "overlap_with_train": overlap,
         "missing_field_counts": missing_field_counts,
         "supervision_blockers": supervision_blockers,
@@ -351,6 +390,7 @@ def export_training_set_quality_report(layout: StorageLayout) -> tuple[Path, Pat
         f"- Summary: {report['summary']}",
         f"- Quality: {report['quality']}",
         f"- Next action: {report['next_action']}",
+        f"- Split assignment coverage: {report['split_assignment_coverage']['assigned_example_count']}/{report['counts']['example_count']}",
         "",
         "## Split counts",
     ]

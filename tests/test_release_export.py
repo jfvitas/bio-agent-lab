@@ -113,3 +113,75 @@ def test_export_release_artifacts_keeps_advisory_override_rows_model_ready() -> 
     assert len(model_ready_rows) == 1
     assert model_ready_rows[0]["pair_identity_key"] == "protein_ligand|1ABC|A|ATP|mutation_unknown:CHEMBL1"
     assert exclusion_rows == []
+
+
+def test_export_release_artifacts_maps_pair_level_split_ids_without_training_examples() -> None:
+    tmp_root = _tmp_dir("release_export_pair_split_ids")
+    layout = build_storage_layout(tmp_root / "storage")
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+
+    pair_key = "protein_ligand|1ABC|A|ATP|wt"
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,structure_file_cif_path\n"
+        "1ABC,Example,/tmp/1ABC.cif\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,source_conflict_summary,source_agreement_band,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,receptor_uniprot_ids,ligand_key,ligand_component_ids,ligand_inchikeys,ligand_types,matching_interface_count,matching_interface_types\n"
+        f"1ABC,{pair_key},BindingDB,Kd,5,nM,0.699,\"BindingDB:Kd=5 nM\",0.699,1,false,,,BindingDB,\"single_source:BindingDB\",A,P12345,ATP,ATP,ATP-KEY,small_molecule,1,protein_ligand\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_issues.csv").write_text(
+        "scope,pdb_id,pair_identity_key,issue_type,details\n",
+        encoding="utf-8",
+    )
+    (layout.splits_dir / "train.txt").write_text(f"{pair_key}|Kd\n", encoding="utf-8")
+    (layout.splits_dir / "metadata.json").write_text(json.dumps({"strategy": "pair_aware_grouped"}), encoding="utf-8")
+
+    paths = export_release_artifacts(layout, repo_root=tmp_root)
+
+    with Path(paths["model_ready_pairs_csv"]).open(newline="", encoding="utf-8") as handle:
+        model_ready_rows = list(csv.DictReader(handle))
+
+    assert len(model_ready_rows) == 1
+    assert model_ready_rows[0]["mutation_strings"] == "wt"
+    assert model_ready_rows[0]["source_agreement_band"] == "not_assessed_single_source"
+    assert model_ready_rows[0]["release_split"] == "train"
+
+
+def test_export_release_artifacts_reports_split_assignment_coverage() -> None:
+    tmp_root = _tmp_dir("release_export_split_assignment_coverage")
+    layout = build_storage_layout(tmp_root / "storage")
+    layout.splits_dir.mkdir(parents=True, exist_ok=True)
+
+    (tmp_root / "master_pdb_repository.csv").write_text(
+        "pdb_id,title,structure_file_cif_path\n"
+        "1ABC,Example,/tmp/1ABC.cif\n"
+        "2DEF,Example,/tmp/2DEF.cif\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_pairs.csv").write_text(
+        "pdb_id,pair_identity_key,source_database,binding_affinity_type,binding_affinity_value,binding_affinity_unit,binding_affinity_log10_standardized,reported_measurements_text,reported_measurement_mean_log10_standardized,reported_measurement_count,source_conflict_flag,source_conflict_summary,source_agreement_band,selected_preferred_source,selected_preferred_source_rationale,receptor_chain_ids,receptor_uniprot_ids,ligand_key,ligand_component_ids,ligand_inchikeys,ligand_types,matching_interface_count,matching_interface_types\n"
+        "1ABC,protein_ligand|1ABC|A|ATP|wt,BindingDB,Kd,5,nM,0.699,\"BindingDB:Kd=5 nM\",0.699,1,false,,,BindingDB,\"single_source:BindingDB\",A,P12345,ATP,ATP,ATP-KEY,small_molecule,1,protein_ligand\n"
+        "2DEF,protein_ligand|2DEF|A|GTP|wt,BindingDB,Kd,8,nM,0.903,\"BindingDB:Kd=8 nM\",0.903,1,false,,,BindingDB,\"single_source:BindingDB\",A,Q99999,GTP,GTP,GTP-KEY,small_molecule,1,protein_ligand\n",
+        encoding="utf-8",
+    )
+    (tmp_root / "master_pdb_issues.csv").write_text(
+        "scope,pdb_id,pair_identity_key,issue_type,details\n",
+        encoding="utf-8",
+    )
+    (layout.splits_dir / "train.txt").write_text("protein_ligand|1ABC|A|ATP|wt|Kd\n", encoding="utf-8")
+    (layout.splits_dir / "metadata.json").write_text(json.dumps({"strategy": "pair_aware_grouped"}), encoding="utf-8")
+
+    paths = export_release_artifacts(layout, repo_root=tmp_root)
+    manifest = json.loads(Path(paths["release_manifest_json"]).read_text(encoding="utf-8"))
+    with Path(paths["split_summary_csv"]).open(newline="", encoding="utf-8") as handle:
+        split_rows = list(csv.DictReader(handle))
+
+    assert manifest["split_readiness"]["assigned_model_ready_pair_count"] == 1
+    assert manifest["split_readiness"]["unassigned_model_ready_pair_count"] == 1
+    assert manifest["split_readiness"]["assignment_coverage_fraction"] == 0.5
+    train_row = next(row for row in split_rows if row["split_name"] == "train")
+    assert train_row["assigned_model_ready_pair_count"] == "1"
+    assert train_row["unassigned_model_ready_pair_count"] == "1"
+    assert train_row["assignment_coverage_fraction"] == "0.5"
